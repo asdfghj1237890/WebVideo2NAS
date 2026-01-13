@@ -165,7 +165,7 @@
       'url.sendToNas': '送到 NAS',
       'url.copy': '複製',
 
-      'job.duration': '耗時：{duration}',
+      'job.duration': '片長：{duration}',
       'job.cancel.title': '取消下載',
       'job.cancel': '取消',
       'job.solution': '建議解法',
@@ -278,7 +278,7 @@
       'url.sendToNas': '发送到 NAS',
       'url.copy': '复制',
 
-      'job.duration': '耗时：{duration}',
+      'job.duration': '时长：{duration}',
       'job.cancel.title': '取消下载',
       'job.cancel': '取消',
       'job.solution': '建议解法',

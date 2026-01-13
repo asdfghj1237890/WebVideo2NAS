@@ -274,12 +274,9 @@ function renderDetectedUrls() {
     return;
   }
 
-  // Prefer higher resolution items first (but keep Now Playing on top).
+  // Keep stable order: prefer higher resolution, then by score, then by detection time.
+  // "Now Playing" badge is just a label, doesn't affect sort order.
   const sortedUrls = detectedUrls.slice().sort((a, b) => {
-    const aNow = a && a.isNowPlaying ? 1 : 0;
-    const bNow = b && b.isNowPlaying ? 1 : 0;
-    if (aNow !== bNow) return bNow - aNow;
-
     const aQ = getMaxQualityNumber(a && a.url);
     const bQ = getMaxQualityNumber(b && b.url);
     if (aQ !== bQ) return bQ - aQ;

@@ -14,6 +14,10 @@ let orphanUrlKeys = new Set();
 // Store captured request headers for m3u8 URLs
 let capturedHeaders = {};
 
+// Track user-clicked video per tab (for accurate "Now Playing" detection)
+// Key: tabId, Value: { videoSrc, videoIndex, videoCount, pageUrl, timestamp, matchedUrl }
+let userClickedVideoByTab = {};
+
 // User settings
 let userSettings = {
   autoDetect: true,
@@ -55,6 +59,35 @@ function scoreUrlInfo(info) {
   return score;
 }
 
+// Check if a detected URL matches user-clicked video
+function matchesUserClickedVideo(detectedUrl, clickedInfo) {
+  if (!clickedInfo || !clickedInfo.videoSrc) return false;
+
+  const detected = String(detectedUrl || '').toLowerCase();
+  const clicked = String(clickedInfo.videoSrc || '').toLowerCase();
+
+  // Direct match
+  if (detected === clicked) return true;
+
+  // For blob: URLs, we can't match directly. The user clicked a video
+  // using MediaSource/blob, so we need to rely on page URL + timing.
+  // This case is handled by the caller checking if ANY video was clicked on this page.
+
+  // Partial match: check if the detected URL's path is contained in clicked or vice versa
+  try {
+    const detectedPath = new URL(detectedUrl).pathname;
+    const clickedPath = new URL(clickedInfo.videoSrc).pathname;
+    // Check if they share the same base filename (common for adaptive streaming)
+    const detectedFile = detectedPath.split('/').pop()?.split('?')[0] || '';
+    const clickedFile = clickedPath.split('/').pop()?.split('?')[0] || '';
+    if (detectedFile && clickedFile && detectedFile === clickedFile) return true;
+  } catch (_) {
+    // URL parsing failed, skip partial matching
+  }
+
+  return false;
+}
+
 function getSortedUrlsForTab(tabId) {
   const list = Array.isArray(currentTabUrls[tabId]) ? currentTabUrls[tabId] : [];
   const scored = list.map((u) => {
@@ -64,44 +97,40 @@ function getSortedUrlsForTab(tabId) {
 
   scored.sort((a, b) => (b.score - a.score) || ((b.timestamp || 0) - (a.timestamp || 0)));
 
-  // Only mark "now playing" when we have a reasonably strong signal.
-  if (scored[0]) {
-    const top = scored[0];
-    const topScore = Number(top.score) || 0;
-    const secondScore = scored[1] ? (Number(scored[1].score) || 0) : -Infinity;
+  // Check for user-clicked video first (most accurate signal)
+  const clickedInfo = userClickedVideoByTab[tabId];
+  const clickAge = clickedInfo ? (Date.now() - (clickedInfo.timestamp || 0)) : Infinity;
+  const isClickRecent = clickAge <= 10 * 60_000; // Click valid for 10 minutes
 
-    // Don't label "now playing" when nothing is actively playing.
-    // Require both recency + an "activity" signal beyond just being seen once.
-    const ageMs = Date.now() - (Number(top.timestamp) || 0);
-    const isRecent = ageMs >= 0 && ageMs <= 30_000;
-    const isRecentManifest = ageMs >= 0 && ageMs <= 5 * 60_000;
+  if (isClickRecent && clickedInfo) {
+    // Method 1: Use matchedUrl if we already associated a URL with this click
+    if (clickedInfo.matchedUrl) {
+      for (const item of scored) {
+        if (item.url === clickedInfo.matchedUrl) {
+          item.isNowPlaying = true;
+          return scored;
+        }
+      }
+    }
 
-    const urlLower = String(top.url || '').toLowerCase();
-    const isManifest = urlLower.includes('.m3u8');
+    // Fallback: Direct src matching (for videos with direct mp4/m3u8 src)
+    if (clickedInfo.videoSrc && !clickedInfo.videoSrc.startsWith('blob:')) {
+      for (const item of scored) {
+        if (matchesUserClickedVideo(item.url, clickedInfo)) {
+          item.isNowPlaying = true;
+          return scored;
+        }
+      }
+    }
 
-    const rt = String(top.requestType || '').toLowerCase();
-    const hits = Number(top.hitCount) || 0;
-    const rangeHits = Number(top.rangeHitCount) || 0;
-    const hasTraditionalSignal = rangeHits > 0 || hits >= 2 || rt === 'media';
-    // HLS VOD manifests are often fetched only once; allow "recent manifest" as a weaker signal.
-    const hasActivitySignal = hasTraditionalSignal || (isManifest && isRecentManifest);
-
-    const isStrongAbsolute = topScore >= 12;
-    const isClearWinner = topScore >= 8 && topScore >= (secondScore + 2);
-    // If we're only relying on the manifest heuristic, allow a lower score threshold
-    // but still require being a clear winner to reduce false positives.
-    const isManifestWinner = isManifest && topScore >= 4 && topScore >= (secondScore + 2);
-
-    // If we're only relying on "recent manifest" (no repeat hits / media / range),
-    // require being a clear winner to reduce false positives on pages with many manifests.
-    const qualifiesByScore = hasTraditionalSignal ? (isStrongAbsolute || isClearWinner) : (isClearWinner || isManifestWinner);
-
-    const recentEnough = hasTraditionalSignal ? isRecent : isRecentManifest;
-    if (recentEnough && hasActivitySignal && qualifiesByScore) {
-      top.isNowPlaying = true;
+    // Last resort: if only one URL, mark it
+    if (scored.length === 1) {
+      scored[0].isNowPlaying = true;
+      return scored;
     }
   }
 
+  // No user click info or no match = no "Now Playing" badge
   return scored;
 }
 
@@ -171,37 +200,40 @@ function getSortedUrlsForTabWithOrphans(tabId, tabUrl) {
 
   scored.sort((a, b) => (b.score - a.score) || ((b.timestamp || 0) - (a.timestamp || 0)));
 
-  // Only mark "now playing" when we have a reasonably strong signal.
-  if (scored[0]) {
-    const top = scored[0];
-    const topScore = Number(top.score) || 0;
-    const secondScore = scored[1] ? (Number(scored[1].score) || 0) : -Infinity;
+  // Check for user-clicked video first (most accurate signal)
+  const clickedInfo = userClickedVideoByTab[tabId];
+  const clickAge = clickedInfo ? (Date.now() - (clickedInfo.timestamp || 0)) : Infinity;
+  const isClickRecent = clickAge <= 10 * 60_000; // Click valid for 10 minutes
 
-    const ageMs = Date.now() - (Number(top.timestamp) || 0);
-    const isRecent = ageMs >= 0 && ageMs <= 30_000;
-    const isRecentManifest = ageMs >= 0 && ageMs <= 5 * 60_000;
+  if (isClickRecent && clickedInfo) {
+    // Method 1: Use matchedUrl if we already associated a URL with this click
+    if (clickedInfo.matchedUrl) {
+      for (const item of scored) {
+        if (item.url === clickedInfo.matchedUrl) {
+          item.isNowPlaying = true;
+          return scored;
+        }
+      }
+    }
 
-    const urlLower = String(top.url || '').toLowerCase();
-    const isManifest = urlLower.includes('.m3u8');
+    // Fallback: Direct src matching (for videos with direct mp4/m3u8 src)
+    if (clickedInfo.videoSrc && !clickedInfo.videoSrc.startsWith('blob:')) {
+      for (const item of scored) {
+        if (matchesUserClickedVideo(item.url, clickedInfo)) {
+          item.isNowPlaying = true;
+          return scored;
+        }
+      }
+    }
 
-    const rt = String(top.requestType || '').toLowerCase();
-    const hits = Number(top.hitCount) || 0;
-    const rangeHits = Number(top.rangeHitCount) || 0;
-    const hasTraditionalSignal = rangeHits > 0 || hits >= 2 || rt === 'media';
-    const hasActivitySignal = hasTraditionalSignal || (isManifest && isRecentManifest);
-
-    const isStrongAbsolute = topScore >= 12;
-    const isClearWinner = topScore >= 8 && topScore >= (secondScore + 2);
-    const isManifestWinner = isManifest && topScore >= 4 && topScore >= (secondScore + 2);
-
-    const qualifiesByScore = hasTraditionalSignal ? (isStrongAbsolute || isClearWinner) : (isClearWinner || isManifestWinner);
-
-    const recentEnough = hasTraditionalSignal ? isRecent : isRecentManifest;
-    if (recentEnough && hasActivitySignal && qualifiesByScore) {
-      top.isNowPlaying = true;
+    // Last resort: if only one URL, mark it
+    if (scored.length === 1) {
+      scored[0].isNowPlaying = true;
+      return scored;
     }
   }
 
+  // No user click info or no match = no "Now Playing" badge
   return scored;
 }
 
@@ -456,6 +488,7 @@ function updateBadge(tabId) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete currentTabUrls[tabId];
   delete currentTabUrlKeys[tabId];
+  delete userClickedVideoByTab[tabId];
 });
 
 // Clear detected URLs when page navigates or reloads
@@ -464,6 +497,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
     // Clear URLs for this tab on navigation/reload
     currentTabUrls[details.tabId] = [];
     currentTabUrlKeys[details.tabId] = new Set();
+    delete userClickedVideoByTab[details.tabId];
     updateBadge(details.tabId);
     chrome.storage.local.set({ detectedUrls: Array.from(detectedUrls) });
   }
@@ -788,8 +822,60 @@ chrome.action.onClicked.addListener(async (tab) => {
   await chrome.sidePanel.open({ tabId: tab.id });
 });
 
-// Listen for messages from sidepanel
+// Listen for messages from sidepanel and content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // Handle user clicking on a video element (from content script)
+  if (request.action === 'userClickedVideo' || request.action === 'videoStartedPlaying') {
+    const tabId = sender.tab?.id;
+    if (tabId != null && tabId >= 0) {
+      const videoIndex = request.videoIndex;
+      
+      // Try to immediately associate with a URL based on video index
+      let matchedUrl = null;
+      
+      // First, try direct src matching
+      if (request.videoSrc && !request.videoSrc.startsWith('blob:')) {
+        const list = currentTabUrls[tabId] || [];
+        for (const item of list) {
+          if (item.url === request.videoSrc) {
+            matchedUrl = item.url;
+            break;
+          }
+        }
+      }
+      
+      // If no direct match, use video index to map to detection order
+      if (!matchedUrl && typeof videoIndex === 'number' && videoIndex >= 0) {
+        const list = currentTabUrls[tabId] || [];
+        // Filter to m3u8 or mp4 URLs in detection order
+        const m3u8Urls = list.filter(u => String(u.url || '').toLowerCase().includes('.m3u8'));
+        const mp4Urls = list.filter(u => String(u.url || '').toLowerCase().includes('.mp4'));
+        const urlsInOrder = m3u8Urls.length > 0 ? m3u8Urls : mp4Urls;
+        
+        if (urlsInOrder.length > 0 && videoIndex < urlsInOrder.length) {
+          matchedUrl = urlsInOrder[videoIndex].url;
+        }
+      }
+      
+      userClickedVideoByTab[tabId] = {
+        videoSrc: request.videoSrc,
+        videoIndex: request.videoIndex,
+        videoCount: request.videoCount,
+        pageUrl: request.pageUrl,
+        timestamp: request.timestamp || Date.now(),
+        matchedUrl: matchedUrl
+      };
+      
+      console.log('User interacted with video in tab', tabId, 
+        '- index:', request.videoIndex, 'of', request.videoCount,
+        '- src:', request.videoSrc || '(blob/MediaSource)',
+        '- matchedUrl:', matchedUrl || '(none)');
+      notifyDetectedUrlsUpdated(tabId);
+    }
+    sendResponse({ success: true });
+    return;
+  }
+
   if (request.action === 'getDetectedUrls') {
     const requestedTabId = (request && typeof request.tabId === 'number') ? request.tabId : null;
 
