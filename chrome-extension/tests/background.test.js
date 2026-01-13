@@ -110,7 +110,7 @@ describe('background.js pure helpers', () => {
     expect(s3).toBeGreaterThan(s2);
   });
 
-  it('getSortedUrlsForTab marks a clear winner as now playing', () => {
+  it('getSortedUrlsForTab does not mark now playing without user click', () => {
     const ctx = loadScriptIntoContext('background.js', {
       chrome: makeChromeStub(),
     });
@@ -137,8 +137,50 @@ describe('background.js pure helpers', () => {
     ])};`);
 
     const sorted = ctx.getSortedUrlsForTab(tabId);
+    // Without user click, no item should be marked as now playing
+    expect(sorted[0].url).toContain('high.mp4');
+    expect(sorted[0].isNowPlaying).toBe(false);
+    expect(sorted[1].isNowPlaying).toBe(false);
+  });
+
+  it('getSortedUrlsForTab marks video as now playing when user clicked', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+    });
+
+    const now = 2_000_000;
+    withFixedNow(ctx, now);
+
+    const tabId = 123;
+    ctx.__eval(`currentTabUrls[${tabId}] = ${JSON.stringify([
+      {
+        url: 'https://cdn.example.com/v/low.m3u8',
+        timestamp: now - 60_000,
+        requestType: 'xmlhttprequest',
+        hitCount: 1,
+        rangeHitCount: 0,
+      },
+      {
+        url: 'https://cdn.example.com/v/high.mp4',
+        timestamp: now - 2_000,
+        requestType: 'media',
+        hitCount: 3,
+        rangeHitCount: 2,
+      },
+    ])};`);
+
+    // Simulate user clicking on the second video (index 1)
+    ctx.__eval(`userClickedVideoByTab[${tabId}] = {
+      videoIndex: 1,
+      videoCount: 2,
+      timestamp: ${now - 1000},
+      matchedUrl: 'https://cdn.example.com/v/high.mp4'
+    };`);
+
+    const sorted = ctx.getSortedUrlsForTab(tabId);
     expect(sorted[0].url).toContain('high.mp4');
     expect(sorted[0].isNowPlaying).toBe(true);
+    expect(sorted[1].isNowPlaying).toBe(false);
   });
 
   it('safeOrigin returns null on invalid URL', () => {
