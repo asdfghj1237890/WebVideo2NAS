@@ -735,6 +735,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [1.8.6] - 2026-01-13
+
+#### Added
+- Implement video interaction tracking in Chrome extension to improve video detection
+
+#### Changed
+- Refactor background tests for video interaction logic
+
+#### Docs
+- Add Traditional Chinese translation (`README.zh-TW.md`)
+- Enhance README with usage and troubleshooting details
+- Clarify permissions and environment variable setup
+- Update safety warnings and directory structure documentation
+
 ### [1.8.5] - 2025-12-16
 
 #### Added
@@ -928,7 +942,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 1.8.5  
+**Version**: 1.8.6  
 **Last Updated**: 2025-12-16  
 **Port**: 52052 (NAS host port → API container :8000)
 
