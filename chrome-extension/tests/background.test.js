@@ -26,6 +26,7 @@ function makeChromeStub() {
     webRequest: {
       onBeforeRequest: { addListener: () => {} },
       onSendHeaders: { addListener: () => {} },
+      onHeadersReceived: { addListener: () => {} },
     },
     action: {
       setBadgeText: () => {},

@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8 and MP4)",
-    version="1.8.6"
+    version="1.8.8"
 )
 
 # CORS middleware
@@ -107,9 +107,13 @@ def _enforce_client_allowlist(request: Request) -> None:
     raise HTTPException(status_code=403, detail="Client IP not allowed")
 
 
+_RATE_LIMIT_MULTIPLIERS = {"read": 6, "write": 1}
+
 def _rate_limit(request: Request, bucket: str) -> None:
     if RATE_LIMIT_PER_MINUTE <= 0:
         return
+    multiplier = _RATE_LIMIT_MULTIPLIERS.get(bucket, 1)
+    limit = RATE_LIMIT_PER_MINUTE * multiplier
     client_ip = _get_client_ip(request)
     window = int(datetime.utcnow().timestamp() // 60)
     key = f"rl:{bucket}:{client_ip}:{window}"
@@ -117,9 +121,8 @@ def _rate_limit(request: Request, bucket: str) -> None:
         count = redis_client.incr(key)
         redis_client.expire(key, 90)
     except Exception:
-        # If Redis is unavailable, skip rate limiting (avoid breaking core API).
         return
-    if count > RATE_LIMIT_PER_MINUTE:
+    if count > limit:
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 
@@ -204,22 +207,25 @@ def get_db():
     finally:
         db.close()
 
-def verify_api_key(request: Request, authorization: Optional[str] = Header(None)):
-    """Verify API key from Authorization header"""
+def _verify_key_common(request: Request, authorization: Optional[str], bucket: str) -> str:
     _enforce_client_allowlist(request)
-    _rate_limit(request, bucket="auth")
+    _rate_limit(request, bucket=bucket)
     if not API_KEY or API_KEY.strip() == "" or API_KEY.strip() == "change-this-key":
         raise HTTPException(status_code=503, detail="Server not configured: API_KEY is not set")
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    # Support both "Bearer TOKEN" and just "TOKEN"
     token = authorization.replace("Bearer ", "").strip()
-    
     if token != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    
     return token
+
+def verify_api_key(request: Request, authorization: Optional[str] = Header(None)):
+    """Verify API key — write-endpoint rate limit (RATE_LIMIT_PER_MINUTE)."""
+    return _verify_key_common(request, authorization, bucket="write")
+
+def verify_api_key_read(request: Request, authorization: Optional[str] = Header(None)):
+    """Verify API key — read-endpoint rate limit (6x write limit)."""
+    return _verify_key_common(request, authorization, bucket="read")
 
 # Routes
 @app.get("/")
@@ -227,7 +233,7 @@ async def root():
     """Root endpoint"""
     return {
         "name": "WebVideo2NAS API",
-        "version": "1.8.6",
+        "version": "1.8.8",
         "status": "running"
     }
 
@@ -316,7 +322,7 @@ async def list_jobs(
     status: Optional[str] = None,
     limit: int = 50,
     db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_api_key_read)
 ):
     """List all jobs with optional status filter"""
     try:
@@ -363,7 +369,7 @@ async def list_jobs(
 async def get_job(
     job_id: str,
     db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_api_key_read)
 ):
     """Get details of a specific job"""
     try:
@@ -430,7 +436,7 @@ async def delete_job(
 @app.get("/api/status", response_model=SystemStatus)
 async def get_status(
     db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_api_key_read)
 ):
     """Get system status"""
     try:

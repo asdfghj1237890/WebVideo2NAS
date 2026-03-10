@@ -8,7 +8,7 @@
 
 **Languages**: **English** (`README.md`) | **繁體中文** (`README.zh-TW.md`)
 
-> Seamlessly capture web video URLs (M3U8 and MP4) from Chrome and download them to your NAS
+> Seamlessly capture web video URLs (M3U8 and MP4) from Chrome and download them to your NAS — even when sites disguise streams with non-standard URLs
 
 > [!IMPORTANT]
 > This project does **not** guarantee every video can be downloaded. Some sites use DRM, expiring URLs, anti-hotlinking, IP restrictions, or change their delivery logic at any time.
@@ -39,7 +39,7 @@
 ## Overview
 
 This system enables you to:
-1. 🔍 Detect M3U8 and MP4 video URLs in Chrome
+1. 🔍 Detect M3U8 and MP4 video URLs in Chrome (including disguised streams)
 2. 📤 Send URLs to your NAS with one click
 3. ⬇️ Automatically download and convert to MP4
 4. 💾 Store videos on your NAS storage
@@ -72,6 +72,7 @@ Chrome Extension → NAS Docker (API + Worker) → Video Storage
 
 ### Chrome Extension
 - ✅ Automatic M3U8 and MP4 URL detection
+- ✅ Deep manifest interception — detects disguised streams (e.g. `.jpg`-wrapped HLS) via fetch/XHR content inspection
 - ✅ One-click send to NAS
 - ✅ Side panel interface for easy access
 - ✅ Real-time download progress
@@ -280,6 +281,7 @@ You can now:
 - ✅ Deploy Docker stack on Synology NAS or any Docker host
 - ✅ Download M3U8 video streams to MP4
 - ✅ Download MP4 videos directly
+- ✅ Detect disguised manifests via JS-level content interception
 - ✅ Use Chrome extension for automatic detection (M3U8 & MP4)
 - ✅ Forward cookies & headers for authenticated streams
 - ✅ Monitor download progress in side panel
@@ -644,6 +646,8 @@ async function detectM3u8Urls(details) {
 WebVideo2NAS/
 ├── chrome-extension/      # Chrome extension source
 │   ├── background.js      # Background service worker
+│   ├── content.js         # Content script (ISOLATED world)
+│   ├── inject.js          # Manifest interceptor (MAIN world)
 │   ├── sidepanel.*        # Extension side panel UI
 │   ├── options/           # Extension options page
 │   ├── icons/             # Extension icons
@@ -734,6 +738,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
+
+### [1.8.8] - 2026-03-11
+
+#### Added
+- **Deep manifest interception** (`inject.js`): New MAIN-world content script that patches `fetch()` and `XMLHttpRequest` to inspect the first bytes of every response for `#EXTM3U` signatures — catches HLS manifests served from arbitrary URLs without `.m3u8` extension or correct MIME type (e.g. sites that disguise streams as `.jpg`)
+- **Response Content-Type detection**: Identify HLS manifests by `Content-Type` header regardless of URL extension
+- `format` hint field in download API — allows the extension to tell the backend the stream type even when the URL has no recognizable extension
+
+#### Changed
+- `sendToNAS()` accepts URLs detected by Content-Type or content interception (not just URL pattern)
+- NAS API validator uses `model_validator` to allow `format` hint to bypass URL pattern check
+
+#### Fixed
+- **Rate limit no longer blocks normal usage**: Read-only endpoints (job list, job status) now use a separate, higher rate-limit bucket so side panel polling no longer starves download requests
 
 ### [1.8.6] - 2026-01-13
 
@@ -942,8 +960,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 1.8.6  
-**Last Updated**: 2025-12-16  
+**Version**: 1.8.8  
+**Last Updated**: 2026-03-11  
 **Port**: 52052 (NAS host port → API container :8000)
 
 ## Star History

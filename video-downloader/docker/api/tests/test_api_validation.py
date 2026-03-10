@@ -41,3 +41,23 @@ def test_download_request_allows_localhost_when_ssrf_guard_disabled(monkeypatch)
     api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
     r = api_main.DownloadRequest(url="http://127.0.0.1/video.mp4")
     assert str(r.url).startswith("http://127.0.0.1")
+
+
+def test_download_request_accepts_format_hint_for_non_standard_url(monkeypatch):
+    api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+    r = api_main.DownloadRequest(
+        url="https://example.com/stream/index.jpg",
+        format="m3u8",
+    )
+    assert r.format == "m3u8"
+
+
+def test_download_request_rejects_non_standard_url_without_format_hint(monkeypatch):
+    api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+    with pytest.raises(Exception):
+        api_main.DownloadRequest(url="https://example.com/stream/index.jpg")
+
+
+def test_rate_limit_read_bucket_has_higher_limit(monkeypatch):
+    api_main = _reload_api_main(monkeypatch, RATE_LIMIT_PER_MINUTE="10")
+    assert api_main._RATE_LIMIT_MULTIPLIERS["read"] > api_main._RATE_LIMIT_MULTIPLIERS["write"]
