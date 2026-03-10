@@ -1,6 +1,6 @@
 // Background Service Worker for Video Detection and Download Management
 
-// Store detected video URLs (m3u8, mp4)
+// Store detected video URLs (m3u8, mpd, mp4)
 let detectedUrls = new Set();
 let currentTabUrls = {};
 let currentTabUrlKeys = {};
@@ -41,7 +41,10 @@ function scoreUrlInfo(info) {
 
   // Prefer manifests / single-file videos over segments.
   if (urlLower.includes('.m3u8')) score += 4;
+  if (urlLower.includes('.mpd')) score += 4;
   if (urlLower.includes('.mp4')) score += 1;
+  const fmt = String(info?.detectedFormat || '').toLowerCase();
+  if (fmt === 'mpd' || fmt === 'm3u8') score += 4;
 
   // Request type hint (Chrome categorizes actual playback as "media" on many sites).
   const rt = String(info?.requestType || '').toLowerCase();
@@ -272,7 +275,7 @@ function isCandidateVideoUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return false;
 
   const urlLower = rawUrl.toLowerCase();
-  if (!(urlLower.includes('.m3u8') || urlLower.includes('.mp4'))) return false;
+  if (!(urlLower.includes('.m3u8') || urlLower.includes('.mpd') || urlLower.includes('.mp4'))) return false;
 
   // Reject obvious non-video resources even if they contain ".mp4" or ".m3u8" in the name.
   // Example: "preview_720p.mp4.jpg" is an image, not a real mp4.
@@ -301,88 +304,122 @@ function isCandidateVideoUrl(rawUrl) {
   return true;
 }
 
-// Listen for web requests to detect video URLs (m3u8, mp4)
+// Register a detected video URL into per-tab and orphan stores.
+// `extra` may carry additional fields like `detectedFormat`.
+function registerDetectedUrl(details, extra) {
+  const isRealTab = (details.tabId != null && typeof details.tabId === 'number' && details.tabId >= 0);
+
+  const urlInfo = {
+    url: details.url,
+    tabId: isRealTab ? details.tabId : -1,
+    timestamp: Date.now(),
+    pageUrl: details.initiator || details.documentUrl,
+    requestType: details.type,
+    frameId: details.frameId,
+    method: details.method,
+    hitCount: 1,
+    rangeHitCount: 0,
+    ...(extra || {})
+  };
+
+  detectedUrls.add(details.url);
+
+  if (isRealTab) {
+    if (!currentTabUrls[details.tabId]) {
+      currentTabUrls[details.tabId] = [];
+    }
+    if (!currentTabUrlKeys[details.tabId]) {
+      currentTabUrlKeys[details.tabId] = new Set();
+    }
+
+    if (!currentTabUrlKeys[details.tabId].has(details.url)) {
+      currentTabUrlKeys[details.tabId].add(details.url);
+      currentTabUrls[details.tabId].push(urlInfo);
+    } else {
+      const list = currentTabUrls[details.tabId];
+      const existing = list.find(item => item && item.url === details.url);
+      if (existing) {
+        existing.timestamp = urlInfo.timestamp;
+        existing.pageUrl = urlInfo.pageUrl;
+        existing.requestType = urlInfo.requestType;
+        existing.frameId = urlInfo.frameId;
+        existing.method = urlInfo.method;
+        existing.hitCount = (Number(existing.hitCount) || 0) + 1;
+        if (extra && extra.detectedFormat && !existing.detectedFormat) {
+          existing.detectedFormat = extra.detectedFormat;
+        }
+        notifyDetectedUrlsUpdated(details.tabId);
+      }
+    }
+  } else {
+    if (!orphanUrlKeys.has(details.url)) {
+      orphanUrlKeys.add(details.url);
+      orphanUrlInfos.push(urlInfo);
+      pruneOrphans();
+    } else {
+      const existing = orphanUrlInfos.find(item => item && item.url === details.url);
+      if (existing) {
+        existing.timestamp = urlInfo.timestamp;
+        existing.pageUrl = urlInfo.pageUrl;
+        existing.requestType = urlInfo.requestType;
+        existing.frameId = urlInfo.frameId;
+        existing.method = urlInfo.method;
+        existing.hitCount = (Number(existing.hitCount) || 0) + 1;
+        if (extra && extra.detectedFormat && !existing.detectedFormat) {
+          existing.detectedFormat = extra.detectedFormat;
+        }
+        pruneOrphans();
+      }
+    }
+  }
+
+  if (isRealTab) updateBadge(details.tabId);
+  chrome.storage.local.set({ detectedUrls: Array.from(detectedUrls) });
+}
+
+// Listen for web requests to detect video URLs by extension (m3u8, mpd, mp4)
 chrome.webRequest.onBeforeRequest.addListener(
   function(details) {
     if (!userSettings.autoDetect) return;
 
     if (isCandidateVideoUrl(details.url)) {
       console.log('Detected video URL:', details.url);
-      
-      const isRealTab = (details.tabId != null && typeof details.tabId === 'number' && details.tabId >= 0);
-
-      // Store URL with tab info (preserve original URL case)
-      const urlInfo = {
-        url: details.url,
-        tabId: isRealTab ? details.tabId : -1,
-        timestamp: Date.now(),
-        pageUrl: details.initiator || details.documentUrl,
-        requestType: details.type,
-        frameId: details.frameId,
-        method: details.method,
-        hitCount: 1,
-        rangeHitCount: 0
-      };
-      
-      // Add to detected URLs
-      // Deduplicate globally by exact URL string
-      detectedUrls.add(details.url);
-      
-      // Store for current tab
-      if (isRealTab) {
-        if (!currentTabUrls[details.tabId]) {
-          currentTabUrls[details.tabId] = [];
-        }
-        if (!currentTabUrlKeys[details.tabId]) {
-          currentTabUrlKeys[details.tabId] = new Set();
-        }
-
-        // Deduplicate per-tab by exact URL string: only show once in sidepanel
-        if (!currentTabUrlKeys[details.tabId].has(details.url)) {
-          currentTabUrlKeys[details.tabId].add(details.url);
-          currentTabUrls[details.tabId].push(urlInfo);
-        } else {
-          // Update the existing entry's metadata (keep ordering stable)
-          const list = currentTabUrls[details.tabId];
-          const existing = list.find(item => item && item.url === details.url);
-          if (existing) {
-            existing.timestamp = urlInfo.timestamp;
-            existing.pageUrl = urlInfo.pageUrl;
-            existing.requestType = urlInfo.requestType;
-            existing.frameId = urlInfo.frameId;
-            existing.method = urlInfo.method;
-            existing.hitCount = (Number(existing.hitCount) || 0) + 1;
-            notifyDetectedUrlsUpdated(details.tabId);
-          }
-        }
-      } else {
-        // Orphan request: keep it so sidepanel can still show m3u8 for SW-based sites.
-        if (!orphanUrlKeys.has(details.url)) {
-          orphanUrlKeys.add(details.url);
-          orphanUrlInfos.push(urlInfo);
-          pruneOrphans();
-        } else {
-          const existing = orphanUrlInfos.find(item => item && item.url === details.url);
-          if (existing) {
-            existing.timestamp = urlInfo.timestamp;
-            existing.pageUrl = urlInfo.pageUrl;
-            existing.requestType = urlInfo.requestType;
-            existing.frameId = urlInfo.frameId;
-            existing.method = urlInfo.method;
-            existing.hitCount = (Number(existing.hitCount) || 0) + 1;
-            pruneOrphans();
-          }
-        }
-      }
-      
-      // Update badge
-      if (isRealTab) updateBadge(details.tabId);
-      
-      // Store in chrome.storage for popup access
-      chrome.storage.local.set({ detectedUrls: Array.from(detectedUrls) });
+      registerDetectedUrl(details);
     }
   },
   { urls: ["<all_urls>"] }
+);
+
+// Detect video manifests by response Content-Type header.
+// Catches DASH/HLS manifests served from URLs without .mpd/.m3u8 extensions
+// (e.g. API endpoints like /api/video/xxx that return MPD XML).
+const MANIFEST_CONTENT_TYPES = {
+  'application/dash+xml': 'mpd',
+  'video/vnd.mpeg.dash.mpd': 'mpd',
+  'application/vnd.apple.mpegurl': 'm3u8',
+  'application/x-mpegurl': 'm3u8',
+  'audio/mpegurl': 'm3u8',
+  'audio/x-mpegurl': 'm3u8',
+};
+
+chrome.webRequest.onHeadersReceived.addListener(
+  function(details) {
+    if (!userSettings.autoDetect) return;
+    if (isCandidateVideoUrl(details.url)) return;
+
+    const ctHeader = (details.responseHeaders || [])
+      .find(h => h.name.toLowerCase() === 'content-type');
+    if (!ctHeader || !ctHeader.value) return;
+
+    const ct = ctHeader.value.toLowerCase().split(';')[0].trim();
+    const format = MANIFEST_CONTENT_TYPES[ct];
+    if (!format) return;
+
+    console.log('Detected video manifest by Content-Type:', details.url, '->', format);
+    registerDetectedUrl(details, { detectedFormat: format });
+  },
+  { urls: ["<all_urls>"] },
+  ["responseHeaders"]
 );
 
 // Capture actual request headers sent by the browser for video URLs
@@ -391,8 +428,8 @@ chrome.webRequest.onSendHeaders.addListener(
   function(details) {
     const urlLower = details.url.toLowerCase();
     
-    // Only capture headers for video URLs
-    if (isCandidateVideoUrl(details.url)) {
+    // Capture headers for video URLs (by extension or Content-Type detection)
+    if (isCandidateVideoUrl(details.url) || getDetectedFormat(details.url)) {
       // Convert headers array to object
       const headersObj = {};
       const SINGLETON_HEADERS = new Set(['User-Agent', 'Referer', 'Origin']);
@@ -516,7 +553,7 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   let url = info.linkUrl || info.pageUrl;
   
-  // Check if it's a video URL (m3u8 or mp4)
+  // Check if it's a video URL (m3u8, mpd, or mp4)
   const urlLower = url ? url.toLowerCase() : '';
   const isVideoUrl = url && isCandidateVideoUrl(url);
   if (isVideoUrl) {
@@ -534,10 +571,25 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
+// Check if a URL was detected via Content-Type (stored in per-tab or orphan lists)
+function getDetectedFormat(url) {
+  for (const tabId of Object.keys(currentTabUrls)) {
+    const list = currentTabUrls[tabId];
+    if (!Array.isArray(list)) continue;
+    const item = list.find(x => x && x.url === url);
+    if (item && item.detectedFormat) return item.detectedFormat;
+  }
+  for (const item of orphanUrlInfos) {
+    if (item && item.url === url && item.detectedFormat) return item.detectedFormat;
+  }
+  return null;
+}
+
 // Send URL to NAS
 async function sendToNAS(url, pageTitle, pageUrl) {
   try {
-    if (!isCandidateVideoUrl(url)) {
+    const formatHint = getDetectedFormat(url);
+    if (!isCandidateVideoUrl(url) && !formatHint) {
       showNotification('Error', 'Not a valid video URL');
       return;
     }
@@ -600,8 +652,11 @@ async function sendToNAS(url, pageTitle, pageUrl) {
         const ku = tryGetUrl(k);
         if (!ku || !entry) continue;
 
-        // Only consider m3u8 captures
-        if (!k.toLowerCase().includes('.m3u8')) continue;
+        // Only consider manifest captures (m3u8/mpd or Content-Type detected)
+        const kl = k.toLowerCase();
+        const isManifestByExt = kl.includes('.m3u8') || kl.includes('.mpd');
+        const isManifestByFormat = !!getDetectedFormat(k);
+        if (!isManifestByExt && !isManifestByFormat) continue;
 
         let score = 0;
         if (tabId != null && entry.tabId === tabId) score += 10;
@@ -645,7 +700,7 @@ async function sendToNAS(url, pageTitle, pageUrl) {
     if (shouldUseBest) {
       captured = best.entry;
       urlToSend = best.url;
-      console.log('Using best captured m3u8 for this tab:', urlToSend);
+      console.log('Using best captured manifest for this tab:', urlToSend);
     }
     
     if (captured && captured.headers) {
@@ -738,6 +793,9 @@ async function sendToNAS(url, pageTitle, pageUrl) {
       referer: pageUrl,
       headers: finalHeaders
     };
+    if (formatHint) {
+      requestBody.format = formatHint;
+    }
     
     console.log('Sending to NAS:');
     console.log('  URL:', requestBody.url);
@@ -824,6 +882,28 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 // Listen for messages from sidepanel and content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // Handle manifest detected by inject.js (fetch/XHR interception)
+  if (request.action === 'manifestDetected') {
+    const tabId = sender.tab?.id;
+    const url = request.url;
+    const format = request.format;
+    if (url && format) {
+      console.log('Manifest detected by content interception:', url, '->', format);
+      const details = {
+        url: url,
+        tabId: (tabId != null && tabId >= 0) ? tabId : -1,
+        initiator: request.pageUrl,
+        documentUrl: request.pageUrl,
+        type: 'xmlhttprequest',
+        frameId: 0,
+        method: 'GET'
+      };
+      registerDetectedUrl(details, { detectedFormat: format });
+    }
+    sendResponse({ success: true });
+    return;
+  }
+
   // Handle user clicking on a video element (from content script)
   if (request.action === 'userClickedVideo' || request.action === 'videoStartedPlaying') {
     const tabId = sender.tab?.id;
@@ -849,8 +929,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const list = currentTabUrls[tabId] || [];
         // Filter to m3u8 or mp4 URLs in detection order
         const m3u8Urls = list.filter(u => String(u.url || '').toLowerCase().includes('.m3u8'));
+        const mpdUrls = list.filter(u => String(u.url || '').toLowerCase().includes('.mpd'));
         const mp4Urls = list.filter(u => String(u.url || '').toLowerCase().includes('.mp4'));
-        const urlsInOrder = m3u8Urls.length > 0 ? m3u8Urls : mp4Urls;
+        const urlsInOrder = m3u8Urls.length > 0 ? m3u8Urls : (mpdUrls.length > 0 ? mpdUrls : mp4Urls);
         
         if (urlsInOrder.length > 0 && videoIndex < urlsInOrder.length) {
           matchedUrl = urlsInOrder[videoIndex].url;

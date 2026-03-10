@@ -129,4 +129,31 @@
     v.addEventListener('play', handlePlay);
   });
 
+  // Forward manifest detection to background
+  function forwardManifest(data) {
+    if (!data || !data.url || !data.format) return;
+    try {
+      chrome.runtime.sendMessage({
+        action: 'manifestDetected',
+        url: data.url,
+        format: data.format,
+        pageUrl: window.location.href,
+        timestamp: Date.now()
+      });
+    } catch (e) {
+      // Extension context may be invalid
+    }
+  }
+
+  // Listen for manifest detections from inject.js (MAIN world)
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (!event.data || event.data.type !== 'WV2NAS_MANIFEST_DETECTED') return;
+    forwardManifest(event.data);
+  });
+
+  // Ask inject.js to re-send any manifests detected before we were ready
+  window.postMessage({ type: 'WV2NAS_CONTENT_READY' }, '*');
+
+
 })();

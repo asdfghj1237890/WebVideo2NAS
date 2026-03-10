@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "WebVideo2NAS",
   "version": "1.8.6",
-  "description": "Send web videos (m3u8, mp4) to your NAS for download",
+  "description": "Send web videos (m3u8, mpd, mp4) to your NAS for download",
   "permissions": [
     "storage",
     "contextMenus",
@@ -19,6 +19,13 @@
     "service_worker": "background.js"
   },
   "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],

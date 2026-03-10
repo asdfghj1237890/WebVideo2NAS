@@ -6,7 +6,7 @@ FastAPI application for managing web video download jobs (M3U8 and MP4)
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, HttpUrl, model_validator
 from typing import Optional, List
 import os
 import logging
@@ -166,17 +166,16 @@ class DownloadRequest(BaseModel):
     referer: Optional[str] = None
     headers: Optional[dict] = None
     source_page: Optional[str] = None
+    format: Optional[str] = None
 
-    @field_validator('url')
-    def validate_video_url(cls, v):
-        url_str = str(v).lower()
-        # Check if URL contains supported video formats
-        is_valid = '.m3u8' in url_str or '.mp4' in url_str
-        if not is_valid:
-            raise ValueError('URL must contain .m3u8 or .mp4')
-        # Optional SSRF protection for public deployments
-        _enforce_ssrf_guard(v)
-        return v
+    @model_validator(mode='after')
+    def validate_video_url(self):
+        url_str = str(self.url).lower()
+        is_valid = '.m3u8' in url_str or '.mpd' in url_str or '.mp4' in url_str
+        if not is_valid and self.format not in ('m3u8', 'mpd', 'mp4'):
+            raise ValueError('URL must contain .m3u8, .mpd, or .mp4 (or provide format hint)')
+        _enforce_ssrf_guard(self.url)
+        return self
 
 class JobResponse(BaseModel):
     id: str
@@ -278,14 +277,17 @@ async def submit_download(
         })
         
         # Insert metadata
-        if request.referer or request.headers or request.source_page:
+        headers_dict = dict(request.headers) if request.headers else {}
+        if request.format:
+            headers_dict['X-WV2NAS-Format'] = request.format
+        if request.referer or headers_dict or request.source_page:
             db.execute(text("""
                 INSERT INTO job_metadata (job_id, referer, headers, source_page)
                 VALUES (:job_id, :referer, :headers, :source_page)
             """), {
                 "job_id": job_id,
                 "referer": request.referer,
-                "headers": json.dumps(request.headers) if request.headers else None,
+                "headers": json.dumps(headers_dict) if headers_dict else None,
                 "source_page": request.source_page
             })
         

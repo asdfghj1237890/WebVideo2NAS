@@ -1,6 +1,6 @@
 """
 WebVideo2NAS - Download Worker
-Worker process that downloads and processes web videos (m3u8, mp4)
+Worker process that downloads and processes web videos (m3u8, mpd, mp4)
 """
 
 import os
@@ -227,7 +227,7 @@ class DownloadWorker:
             return False
     
     def process_job(self, job_id: str):
-        """Process a download job (supports both m3u8 and mp4)"""
+        """Process a download job (supports m3u8, mpd, and mp4)"""
         logger.info(f"Processing job {job_id}")
         
         # Check if job was cancelled before we start
@@ -241,32 +241,196 @@ class DownloadWorker:
             logger.error(f"Job {job_id} not found")
             return
         
-        # Determine download type based on URL
-        # Check for MP4 in various forms:
-        # - URL ending with .mp4
-        # - .mp4? (with query string)
-        # - .mp4& or .mp4% (URL-encoded in query params, e.g., file=%2Fpath%2Fto%2Fvideo.mp4&)
+        # Determine download type: check format hint first, then URL pattern
         from urllib.parse import unquote
         url_lower = job['url'].lower()
-        url_decoded = unquote(url_lower)  # Decode %2F etc.
+        url_decoded = unquote(url_lower)
+        format_hint = (job.get('headers') or {}).get('X-WV2NAS-Format', '').lower()
+
+        is_mpd = format_hint == 'mpd' or '.mpd' in url_lower or '.mpd' in url_decoded
+        is_m3u8 = format_hint == 'm3u8' or ('.m3u8' in url_lower and not is_mpd)
+
         is_direct_download = (
             url_lower.endswith('.mp4') or 
             '.mp4?' in url_lower or
             '.mp4&' in url_lower or
-            # Check decoded URL for .mp4 patterns
             url_decoded.endswith('.mp4') or
             '.mp4?' in url_decoded or
             '.mp4&' in url_decoded or
-            # Check for file= parameter containing .mp4
             ('file=' in url_lower and '.mp4' in url_decoded)
         )
         
-        if is_direct_download:
+        if is_direct_download and not is_mpd and not is_m3u8:
             logger.info(f"Detected as direct download (MP4): {job['url'][:100]}...")
             self._process_direct_download(job_id, job)
+        elif is_mpd:
+            logger.info(f"Detected as DASH stream (MPD){' (via format hint)' if format_hint == 'mpd' else ''}: {job['url'][:100]}...")
+            self._process_mpd_download(job_id, job)
         else:
             self._process_m3u8_download(job_id, job)
     
+    def _process_mpd_download(self, job_id: str, job: dict):
+        """Process DASH/MPD stream download using ffmpeg"""
+        from pathlib import Path
+        import re
+        
+        try:
+            _enforce_ssrf_guard(job["url"])
+
+            self.update_job_status(job_id, "downloading", progress=0)
+            logger.info(f"Starting MPD download: {job['url']}")
+
+            headers = job.get('headers', {}).copy()
+            headers.pop('X-WV2NAS-Format', None)
+
+            headers.pop('Range', None)
+            headers.pop('range', None)
+            if headers.get('Sec-Fetch-Dest') == 'video':
+                headers['Sec-Fetch-Dest'] = 'empty'
+
+            if job.get('referer') and 'Referer' not in headers:
+                headers['Referer'] = job['referer']
+            if job.get('source_page') and 'Origin' not in headers:
+                parsed = urlparse(job['source_page'])
+                headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
+            if 'User-Agent' not in headers:
+                headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+
+            # Build ffmpeg -headers string (each header terminated with \r\n)
+            header_str = ""
+            for k, v in headers.items():
+                if k.lower() in ('host', 'connection', 'content-length', 'accept-encoding'):
+                    continue
+                header_str += f"{k}: {v}\r\n"
+
+            safe_title = "".join(c for c in job['title'] if c.isalnum() or c in (' ', '-', '_')).strip()
+            if not safe_title:
+                safe_title = f"video_{job_id[:8]}"
+
+            output_dir = Path("/downloads/completed")
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            base_name = safe_title
+            output_file = output_dir / f"{base_name}.mp4"
+            counter = 1
+            while output_file.exists():
+                output_file = output_dir / f"{base_name} ({counter}).mp4"
+                counter += 1
+            output_file = str(output_file)
+
+            # Probe duration for progress reporting
+            total_duration = None
+            try:
+                ffprobe_path = shutil.which("ffprobe")
+                if ffprobe_path:
+                    probe_cmd = [ffprobe_path, "-v", "error"]
+                    if header_str:
+                        probe_cmd += ["-headers", header_str]
+                    probe_cmd += [
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        job['url']
+                    ]
+                    probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                    if probe.returncode == 0 and probe.stdout.strip():
+                        total_duration = float(probe.stdout.strip())
+                        logger.info(f"MPD total duration: {total_duration:.1f}s")
+            except Exception as e:
+                logger.warning(f"Failed to probe MPD duration: {e}")
+
+            ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+            cmd = [ffmpeg_path]
+            if header_str:
+                cmd += ["-headers", header_str]
+            cmd += [
+                "-i", job['url'],
+                "-c", "copy",
+                "-y",
+                output_file
+            ]
+
+            logger.info(f"FFmpeg DASH command: {' '.join(cmd[:6])}... -> {output_file}")
+            self.update_job_status(job_id, "downloading", progress=5)
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            last_progress = 5
+            time_pattern = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
+
+            check_interval_sec = 4.0
+            next_check_time = time.monotonic() + check_interval_sec
+            stderr_lines = []
+
+            while True:
+                line = process.stderr.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    stderr_lines.append(line)
+                    match = time_pattern.search(line)
+                    if match and total_duration and total_duration > 0:
+                        h, m, s, cs = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+                        current_time = h * 3600 + m * 60 + s + cs / 100.0
+                        progress = int(5 + (current_time / total_duration) * 85)
+                        progress = min(progress, 90)
+                        if progress > last_progress:
+                            last_progress = progress
+                            self.update_job_status(job_id, "downloading", progress=progress)
+
+                now = time.monotonic()
+                if now >= next_check_time:
+                    next_check_time = now + check_interval_sec
+                    if self.is_job_cancelled(job_id):
+                        logger.info(f"Job {job_id} cancelled during MPD download, killing ffmpeg")
+                        process.kill()
+                        process.wait()
+                        if Path(output_file).exists():
+                            Path(output_file).unlink()
+                        return
+
+            return_code = process.wait()
+
+            if return_code != 0:
+                stderr_text = "".join(stderr_lines[-20:])
+                raise Exception(f"FFmpeg failed (exit {return_code}): {stderr_text}")
+
+            if not Path(output_file).exists() or Path(output_file).stat().st_size == 0:
+                raise Exception("FFmpeg produced empty output")
+
+            if self.is_job_cancelled(job_id):
+                if Path(output_file).exists():
+                    Path(output_file).unlink()
+                return
+
+            file_size = Path(output_file).stat().st_size
+            duration_seconds = self._probe_duration_seconds(output_file)
+            if duration_seconds is not None:
+                self.db.execute(
+                    text("""
+                        INSERT INTO job_metadata (job_id, duration)
+                        VALUES (:job_id, :duration)
+                        ON CONFLICT (job_id)
+                        DO UPDATE SET duration = EXCLUDED.duration
+                    """),
+                    {"job_id": job_id, "duration": duration_seconds},
+                )
+                self.db.commit()
+
+            self.update_job_status(
+                job_id, "completed", progress=100,
+                file_path=output_file, file_size=file_size
+            )
+            logger.info(f"Job {job_id} completed (MPD): {output_file} ({file_size / 1024 / 1024:.2f} MB)")
+
+        except Exception as e:
+            logger.error(f"Job {job_id} MPD download failed: {e}", exc_info=True)
+            self._handle_job_failure(job_id, job, str(e))
+
     def _process_direct_download(self, job_id: str, job: dict):
         """Process direct file download (MP4, etc.)"""
         from pathlib import Path
@@ -281,6 +445,7 @@ class DownloadWorker:
             
             # Prepare headers
             headers = job.get('headers', {}).copy()
+            headers.pop('X-WV2NAS-Format', None)
             
             # Remove headers that could cause issues with fresh downloads
             headers.pop('Range', None)
@@ -636,6 +801,7 @@ class DownloadWorker:
             # Step 1: Parse m3u8 playlist (5%)
             logger.info("Step 1: Parsing m3u8 playlist")
             headers = job.get('headers', {}).copy()
+            headers.pop('X-WV2NAS-Format', None)
 
             # Normalize a few critical header names (case-insensitive) so we don't
             # miss cookies/origin/referer due to casing differences from Chrome capture.

@@ -294,7 +294,11 @@ function renderDetectedUrls() {
     const hasIp = containsIpAddress(urlInfo.url);
     const urlLower = urlInfo.url.toLowerCase();
     // Some sites use paths like "...something.mp4/index.m3u8". Prefer the actual manifest type.
-    const videoType = urlLower.includes('.m3u8') ? 'M3U8' : (urlLower.includes('.mp4') ? 'MP4' : 'VIDEO');
+    const detectedFmt = (urlInfo.detectedFormat || '').toUpperCase();
+    const videoType = urlLower.includes('.m3u8') ? 'M3U8'
+      : urlLower.includes('.mpd') ? 'MPD'
+      : urlLower.includes('.mp4') ? 'MP4'
+      : detectedFmt || 'VIDEO';
     const nowPlayingBadge = urlInfo.isNowPlaying
       ? ` <span class="badge-now-playing">${escapeHtml(t('url.nowPlaying'))}</span>`
       : '';
