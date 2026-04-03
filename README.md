@@ -739,6 +739,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [1.8.9] - 2026-04-03
+
+#### Fixed
+- Fix **HTTP 400 Bad Request** when downloading m3u8 streams from sites that store video playback progress as URL-like cookies (e.g. `https://…/index.m3u8=1234`). These non-standard cookie entries bloated the `Cookie` header beyond server limits; the worker now strips them before sending requests
+
 ### [1.8.8] - 2026-03-11
 
 #### Added
@@ -960,8 +965,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 1.8.8  
-**Last Updated**: 2026-03-11  
+**Version**: 1.8.9  
+**Last Updated**: 2026-04-03  
 **Port**: 52052 (NAS host port → API container :8000)
 
 ## Star History
