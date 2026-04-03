@@ -835,7 +835,22 @@ class DownloadWorker:
                 _pop_header_ci(headers, "Cookie")
                 merged_cookie = "; ".join(str(v).strip() for v in cookie_vals if str(v).strip())
                 if merged_cookie:
-                    headers["Cookie"] = merged_cookie
+                    # Filter out URL-like cookie names (e.g. "https://...=1234")
+                    # which are video-player progress trackers, not auth cookies.
+                    # They can bloat the Cookie header beyond server limits (→ 400).
+                    filtered_pairs = []
+                    for pair in merged_cookie.split("; "):
+                        name = pair.split("=", 1)[0] if "=" in pair else pair
+                        if "://" in name:
+                            continue
+                        filtered_pairs.append(pair)
+                    cleaned = "; ".join(filtered_pairs)
+                    if cleaned:
+                        headers["Cookie"] = cleaned
+                        if len(cleaned) != len(merged_cookie):
+                            logger.info(f"Cookie header trimmed: {len(merged_cookie)} -> {len(cleaned)} bytes (dropped URL-like entries)")
+                    else:
+                        logger.info("All cookies were URL-like tracking entries; sending without Cookie header")
 
             origin_val = _get_header_ci(headers, "Origin")
             if origin_val is not None:
