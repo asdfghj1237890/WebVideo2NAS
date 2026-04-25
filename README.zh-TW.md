@@ -119,7 +119,6 @@ Synology UI：在 Project 點 **Action → Pull**，再 **Restart**。
 
 | 症狀 | 原因 |
 |---|---|
-| `docker compose pull` 回 404 | GHCR package 是 private。owner 要去 https://github.com/asdfghj1237890/WebVideo2NAS/pkgs/container/webvideo2nas 切成 public |
 | `/api/health` 回 **401** | `Authorization: Bearer <API_KEY>` header 漏帶或值跟 `.env` 不符 |
 | Worker container 顯示 **unhealthy** | 1.9.2 之前的 compose template 繼承了 API healthcheck。升級到 ≥ 1.9.2（`docker compose pull`）就好 |
 | Synology 寫不進 `/downloads` | 到 DSM File Station 檢查資料夾權限（Project user 要可讀寫） |

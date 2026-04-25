@@ -226,7 +226,6 @@ Synology UI: open the Project → **Action → Pull** → **Restart**.
 
 | Symptom | Likely cause |
 |---|---|
-| `docker compose pull` returns 404 | GHCR package is private. Owner must flip visibility to public at https://github.com/asdfghj1237890/WebVideo2NAS/pkgs/container/webvideo2nas |
 | `/api/health` returns **401** | `Authorization: Bearer <API_KEY>` header missing or mismatched against `.env` |
 | Worker container shows **unhealthy** | Pre-1.9.2 templates inherit the API healthcheck. Upgrade to ≥ 1.9.2 (`docker compose pull`) — fixed compose disables the inherited check |
 | Synology can't write to `/downloads` | Check folder permissions in DSM File Station (project user needs read/write) |
