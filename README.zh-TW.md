@@ -25,139 +25,105 @@
 
 ## 📦 安裝（Installation）
 
-你會做 3 件事：
-1. **部署後端到 NAS/Server**（Synology 或 非 Synology 擇一）
-2. **安裝 + 設定 Chrome Extension**
-3. **驗證是否正常**
+**前置需求**：Docker 20.10+、Docker Compose v2、2 GB+ RAM。Chrome 端需能透過 LAN 連到 NAS。
 
-### Step 1：部署後端（請選其中一條）
+實際應用以一個 multi-arch container 發佈在 `ghcr.io/asdfghj1237890/webvideo2nas`（linux/amd64 + linux/arm64）。release zip **只含 compose 設定檔**（≈3 KB）。
 
-<details>
-<summary><strong>Synology NAS（DSM / Container Manager）— UI 方式</strong></summary>
-
-#### 1. 安裝 Container Manager
-1. 開啟 **Package Center**
-2. 安裝 **Container Manager**
-
-#### 2. 準備資料夾（DSM UI）
-1. 開啟 **File Station**
-2. 專案資料夾（例）：`/volume1/docker/video-downloader/`
-3. 下載資料夾（例）：`/volume1/<你的共享資料夾名稱>/downloads/completed`
-4. 確認你在 Container Manager 執行 Project 使用的帳號，對這兩個資料夾都有 **讀/寫** 權限
-   - 如果之後出現權限錯誤（寫不進 `/downloads`），回來檢查 DSM 資料夾權限，並先嘗試在下載資料夾手動建立一個測試檔案確認可寫入
-
-#### 3. 下載並解壓縮 release（DSM UI）
-1. 從 GitHub Releases 下載 `WebVideo2NAS-downloader-docker.zip`（≈3 KB — 只含 compose 設定檔，實際的 image 由 GHCR 拉，位置：`ghcr.io/asdfghj1237890/webvideo2nas`）
-2. 用 File Station 上傳到 `/volume1/docker/video-downloader/` 並解壓縮
-3. 解壓後應該會有：`/volume1/docker/video-downloader/docker/`，內含 `docker-compose.synology.yml`、`docker-compose_not_synology.yml`、`init-db.sql`、`.env.example`、`SYNOLOGY_DEPLOY_COMMANDS.md`
-
-#### 4. 建立 `.env`（新手只要改 2 個值）
-在 `/volume1/docker/video-downloader/docker/.env` 建立檔案（DSM 文字編輯器，或在 PC 編輯後上傳）：
+### 1. 取得 compose 檔
 
 ```bash
-DB_PASSWORD=your_secure_password_here
-API_KEY=your_api_key_minimum_32_chars
-MAX_DOWNLOAD_WORKERS=20
-MAX_RETRY_ATTEMPTS=3
-FFMPEG_THREADS=2
-LOG_LEVEL=INFO
-ALLOWED_ORIGINS=chrome-extension://*
-CORS_ALLOW_CREDENTIALS=false
-
-# Security
-RATE_LIMIT_PER_MINUTE=10
-ALLOWED_CLIENT_CIDRS=
-SSRF_GUARD=false
-
-# Optional
-# INSECURE_SKIP_TLS_VERIFY=0
-# SSL_VERIFY=1
+wget https://github.com/asdfghj1237890/WebVideo2NAS/releases/latest/download/WebVideo2NAS-downloader-docker.zip
+unzip WebVideo2NAS-downloader-docker.zip       # → ./docker/
+cd docker
 ```
 
-#### 5. 用 Projects 部署（DSM UI）
-1. 到 `/volume1/docker/video-downloader/docker/`
-2. 把 `docker-compose.synology.yml` 改名成 `docker-compose.yml`
-3. 開啟 **Container Manager → Projects → Create**
-4. 專案資料夾選：`/volume1/docker/video-downloader/docker`
-5. 完成精靈 — Container Manager 會從 GHCR 拉統一 image 並啟動（api + 2 個 worker + db + redis + db_cleanup，全都用同一個 image）
+依平台選對應的 compose 檔：
 
-> **之後升級**：在 Project 點 **Action → Pull**，再 **Restart**。或者用 SSH：`cd /volume1/docker/video-downloader/docker && docker compose pull && docker compose up -d`
+| Host | 指令 |
+|---|---|
+| **Synology NAS** | `mv docker-compose.synology.yml docker-compose.yml` |
+| **其他**（Linux / macOS / Windows Docker） | `mv docker-compose_not_synology.yml docker-compose.yml` |
 
-#### 6. 驗證
-開啟 `http://YOUR_SYNOLOGY_IP:52052/api/health`，應回傳 `{"status":"healthy"}`
+> Synology 的 path 寫死成 `/volume1/...`（DB、Redis、downloads、logs）。如果你的共享資料夾不叫 `nsfw_video`，到 compose 檔的 `volumes:` 區塊改一下。
+
+### 2. 設定 `.env`
+
+```bash
+cp .env.example .env
+```
+
+編輯 `.env`，**兩個必填**值：
+
+| 變數 | 怎麼產 |
+|---|---|
+| `API_KEY` | `openssl rand -base64 32` — 同樣的值要貼到 Chrome extension 設定 |
+| `DB_PASSWORD` | `openssl rand -base64 24` |
+
+其他變數都有合理預設；`.env.example` 有完整註解（rate limit、CORS、worker tuning、IP allowlist、SSRF guard、image tag 鎖版本等）。
+
+### 3. 啟動
+
+```bash
+docker compose pull       # 從 ghcr.io/asdfghj1237890/webvideo2nas:latest 拉
+docker compose up -d
+curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/health
+# → {"status":"healthy"}
+```
+
+> 想鎖版本：`.env` 裡設 `IMAGE_TAG=1.9.2`（預設 `latest`）。
+
+<details>
+<summary><strong>用 Synology Container Manager（DSM UI）取代 SSH</strong></summary>
+
+不想 SSH 的話：
+
+1. **Package Center** 安裝 **Container Manager**（已裝可略）。
+2. **File Station** — 建立 / 確認下列路徑，並讓 Project 使用者有讀寫權限：
+   - `/volume1/docker/video-downloader/`（專案根，zip 解到這裡，`.env` 也放這）
+   - `/volume1/docker/video-downloader/db_data/`（DB 持久化）
+   - `/volume1/docker/video-downloader/redis_data/`（Redis 持久化）
+   - `/volume1/docker/video-downloader/logs/`（log）
+   - `/volume1/nsfw_video/video-downloader/downloads/completed/`（下載完的影片 — 把 `nsfw_video` 改成你的共享資料夾名稱；compose 檔的 `volumes:` 也要相應改）
+3. **上傳 + 解壓** `WebVideo2NAS-downloader-docker.zip` 到 `/volume1/docker/video-downloader/`（解出 `/volume1/docker/video-downloader/docker/`）。
+4. **編輯 `.env`**（DSM Text Editor 或在 PC 編好上傳）— 設 `API_KEY` + `DB_PASSWORD`。
+5. **Container Manager → Projects → Create**：
+   - Project name：`video-downloader`
+   - Path：`/volume1/docker/video-downloader/docker`
+   - Source：選 `docker-compose.synology.yml`
+   - 跑完精靈 — DSM 會自動從 GHCR 拉 image 並啟動。
+6. **驗證**：`http://YOUR_SYNOLOGY_IP:52052/api/health`（帶 `Authorization: Bearer ...`）回 `{"status":"healthy"}`。
 
 </details>
 
-<details>
-<summary><strong>非 Synology / 標準 Docker（Linux / Server）— 指令方式</strong></summary>
+### 4. 安裝 Chrome Extension
 
-#### 1. 下載並解壓縮 release
+1. clone 整個 repo，或從同一個 release 下載 `WebVideo2NAS-chrome-extension.zip` 解壓
+2. `chrome://extensions/` → 開啟 **Developer mode**
+3. **Load unpacked** → 選 `chrome-extension/` 資料夾
+4. 在 extension **Settings** 設定：
+   - **NAS Endpoint**：`http://YOUR_NAS_IP:52052`（NAS/Server 區網 IP，不要填 `localhost`）
+   - **API Key**：跟 `.env` 的 `API_KEY` 一樣
+5. 點 **Test Connection** → 應該顯示 *connected*
+
+### 之後升級
+
 ```bash
-wget https://github.com/asdfghj1237890/WebVideo2NAS/releases/latest/download/WebVideo2NAS-downloader-docker.zip
-unzip WebVideo2NAS-downloader-docker.zip       # 解壓出 docker/...
-cd docker
-mkdir -p ../logs ../downloads/completed
-```
-
-zip 只含 compose 設定（≈3 KB）。統一 image 在 `docker compose up` 時從 `ghcr.io/asdfghj1237890/webvideo2nas` 拉 — 不用本地 build，也不用下載原始碼。
-
-#### 2. 建立 `.env`（新手只要改 2 個值）
-```bash
-API_KEY=$(openssl rand -base64 32)
-DB_PASSWORD=$(openssl rand -base64 24)
-
-# 如果你的環境沒有 openssl，也可以自己手動填入 API_KEY/DB_PASSWORD（用夠長、夠隨機的字串即可）
-cat > .env << EOF
-DB_PASSWORD=${DB_PASSWORD}
-API_KEY=${API_KEY}
-MAX_DOWNLOAD_WORKERS=20
-MAX_RETRY_ATTEMPTS=3
-FFMPEG_THREADS=2
-LOG_LEVEL=INFO
-ALLOWED_ORIGINS=chrome-extension://*
-CORS_ALLOW_CREDENTIALS=false
-RATE_LIMIT_PER_MINUTE=10
-ALLOWED_CLIENT_CIDRS=
-SSRF_GUARD=false
-EOF
-
-echo "你的 API Key：${API_KEY}"
-```
-
-#### 3. 部署與驗證
-```bash
-# 改名讓 docker compose 預設能找到
-mv docker-compose_not_synology.yml docker-compose.yml
-
-docker compose pull          # 從 ghcr.io/asdfghj1237890/webvideo2nas:latest 拉
-docker compose up -d
-curl http://localhost:52052/api/health
-```
-
-要鎖在某個版本（不用 `latest`），在 `.env` 設定 `IMAGE_TAG`（例：`IMAGE_TAG=1.9.2`）。
-
-#### 4. 之後升級
-```bash
+cd /path/to/docker-compose-folder
 docker compose pull
 docker compose up -d
 ```
 
-（其他 Linux 發行版細節請看 `README.md`）
+Synology UI：在 Project 點 **Action → Pull**，再 **Restart**。
 
-</details>
+### 常見問題
 
-### Step 2：安裝 + 設定 Chrome Extension
-1. 打開 `chrome://extensions/`
-2. 開啟 **Developer mode**
-3. **Load unpacked**，選擇 `chrome-extension` 資料夾
-4. 設定：
-   - **NAS Endpoint**：`http://YOUR_NAS_IP:52052`（請填 NAS/Server 的區網 IP；不要填 `localhost`）
-   - **API Key**：填入 `.env` 的 `API_KEY`
-
-### Step 3：如果不會用／出錯
-- 使用方式：看下方「使用方式」或 `README.md` 的 **Usage**
-- 疑難排解：看下方「疑難排解」或 `README.md` 的 **Troubleshooting**
-- 參數設定：看下方「設定」或 `README.md` 的 **Configuration**
+| 症狀 | 原因 |
+|---|---|
+| `docker compose pull` 回 404 | GHCR package 是 private。owner 要去 https://github.com/asdfghj1237890/WebVideo2NAS/pkgs/container/webvideo2nas 切成 public |
+| `/api/health` 回 **401** | `Authorization: Bearer <API_KEY>` header 漏帶或值跟 `.env` 不符 |
+| Worker container 顯示 **unhealthy** | 1.9.2 之前的 compose template 繼承了 API healthcheck。升級到 ≥ 1.9.2（`docker compose pull`）就好 |
+| Synology 寫不進 `/downloads` | 到 DSM File Station 檢查資料夾權限（Project user 要可讀寫） |
+| 其他 | 看下方「疑難排解」 |
 
 ## 使用方式（Usage）
 1. 打開你要下載的影片網站並播放影片

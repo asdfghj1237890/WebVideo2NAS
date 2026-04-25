@@ -133,173 +133,105 @@ webvideo2nas/
 <a id="installation"></a>
 ### 📦 Installation
 
-> Tip: This README contains the full installation guide. Expand the section below if you need the detailed steps.
+**Prerequisites:** Docker 20.10+, Docker Compose v2, 2 GB+ RAM. Chrome must reach the NAS over the LAN.
 
-<details>
-<summary><strong>Full Installation Guide (click to expand)</strong></summary>
+The actual application ships as a single multi-arch container at `ghcr.io/asdfghj1237890/webvideo2nas` (linux/amd64 + linux/arm64). The release zip contains **only the compose file** (~3 KB).
 
-This section contains the full installation guide.
-
-#### Prerequisites
-
-##### Hardware Requirements
-- **NAS/Server**: 2GB+ RAM, 2+ CPU cores, Docker support
-- **Client**: Chrome browser (v88+)
-
-##### Software Requirements
-- Docker 20.10+
-- Docker Compose 2.0+
-- Network connectivity between Chrome and NAS
-
-#### Installation (Easy Mode)
-You will do 3 things:
-1. **Deploy the backend on your NAS/server** (pick Synology or Non-Synology)
-2. **Install + configure the Chrome extension**
-3. **Verify it works**
-
-#### Step 1: Deploy backend (pick ONE)
-
-<details>
-<summary><strong>Synology NAS (DSM / Container Manager) — UI-first</strong></summary>
-
-##### 1. Install Container Manager
-1. Open **Package Center**
-2. Install **Container Manager**
-
-##### 2. Prepare folders (DSM UI)
-1. Open **File Station**
-2. Project folder (example): `/volume1/docker/video-downloader/`
-3. Downloads folder (example): `/volume1/<YOUR_SHARED_FOLDER_NAME>/downloads/completed`
-4. Ensure the account you use in Container Manager has **read/write** permissions to both folders
-   - If you see permission errors later (can’t write to `/downloads`), re-check DSM folder permissions and try creating a test file in the downloads folder.
-
-##### 3. Download & extract release (DSM UI)
-1. Download `WebVideo2NAS-downloader-docker.zip` from GitHub Releases (≈3 KB — only compose files; the actual image is pulled from GHCR at `ghcr.io/asdfghj1237890/webvideo2nas`)
-2. Upload to `/volume1/docker/video-downloader/` with File Station and extract it
-3. You should have: `/volume1/docker/video-downloader/docker/` containing `docker-compose.synology.yml`, `docker-compose_not_synology.yml`, `init-db.sql`, `.env.example`, `SYNOLOGY_DEPLOY_COMMANDS.md`
-
-##### 4. Create `.env` (only 2 values are required)
-Create `/volume1/docker/video-downloader/docker/.env` (DSM text editor or upload from PC):
+#### 1. Get the compose files
 
 ```bash
-DB_PASSWORD=your_secure_password_here
-API_KEY=your_api_key_minimum_32_chars
-MAX_DOWNLOAD_WORKERS=20
-MAX_RETRY_ATTEMPTS=3
-FFMPEG_THREADS=2
-LOG_LEVEL=INFO
-ALLOWED_ORIGINS=chrome-extension://*
-CORS_ALLOW_CREDENTIALS=false
-RATE_LIMIT_PER_MINUTE=10
-ALLOWED_CLIENT_CIDRS=
-SSRF_GUARD=false
+wget https://github.com/asdfghj1237890/WebVideo2NAS/releases/latest/download/WebVideo2NAS-downloader-docker.zip
+unzip WebVideo2NAS-downloader-docker.zip       # → ./docker/
+cd docker
 ```
 
-##### 5. Deploy with Projects (DSM UI)
-1. In `/volume1/docker/video-downloader/docker/`, rename `docker-compose.synology.yml` → `docker-compose.yml`
-2. Open **Container Manager** → **Projects** → **Create**
-3. Select project folder: `/volume1/docker/video-downloader/docker`
-4. Finish the wizard — Container Manager will pull the unified image from GHCR and start the project (api + 2 workers + db + redis + db_cleanup, all from one image)
+Pick the right compose file for your host:
 
-> **Updating later**: re-open the project and click **Action → Pull**, then **Restart**. Or via SSH: `cd /volume1/docker/video-downloader/docker && docker compose pull && docker compose up -d`
+| Host | Run |
+|---|---|
+| **Synology NAS** | `mv docker-compose.synology.yml docker-compose.yml` |
+| **Anything else** (Linux / macOS / Windows Docker) | `mv docker-compose_not_synology.yml docker-compose.yml` |
 
-##### 6. Verify
-Open `http://YOUR_SYNOLOGY_IP:52052/api/health` → should return `{"status":"healthy"}`
+> Synology paths are hard-coded as `/volume1/...` (DB, Redis, downloads, logs). If your shared folder isn't named `nsfw_video`, edit the `volumes:` section accordingly.
+
+#### 2. Set up `.env`
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set the **two required** values:
+
+| Variable | How |
+|---|---|
+| `API_KEY` | `openssl rand -base64 32` — also paste this into the Chrome extension settings |
+| `DB_PASSWORD` | `openssl rand -base64 24` |
+
+All other variables ship with sensible defaults; comments in `.env.example` describe each (rate limiting, CORS, worker tuning, IP allowlist, SSRF guard, image tag pin).
+
+#### 3. Start the stack
+
+```bash
+docker compose pull       # pulls ghcr.io/asdfghj1237890/webvideo2nas:latest
+docker compose up -d
+curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/health
+# → {"status":"healthy"}
+```
+
+> Pin a specific image version: set `IMAGE_TAG=1.9.2` in `.env` (defaults to `latest`).
+
+<details>
+<summary><strong>Synology Container Manager (DSM UI alternative to CLI)</strong></summary>
+
+If you'd rather not SSH:
+
+1. **Package Center** → install **Container Manager** (skip if already installed).
+2. **File Station** — create / verify these paths and grant the project user read/write:
+   - `/volume1/docker/video-downloader/` (project root: extract zip here, place `.env`)
+   - `/volume1/docker/video-downloader/db_data/` (DB persistence)
+   - `/volume1/docker/video-downloader/redis_data/` (Redis persistence)
+   - `/volume1/docker/video-downloader/logs/` (logs)
+   - `/volume1/nsfw_video/video-downloader/downloads/completed/` (downloaded videos — change `nsfw_video` to your shared folder name; edit the compose file's `volumes:` if it differs)
+3. **Upload + extract** `WebVideo2NAS-downloader-docker.zip` to `/volume1/docker/video-downloader/` (gives `/volume1/docker/video-downloader/docker/`).
+4. **Edit `.env`** in DSM Text Editor (or upload from PC) — set `API_KEY` + `DB_PASSWORD`.
+5. **Container Manager → Projects → Create**:
+   - Project name: `video-downloader`
+   - Path: `/volume1/docker/video-downloader/docker`
+   - Source: pick `docker-compose.synology.yml`
+   - Finish the wizard — DSM auto-pulls the image from GHCR and brings everything up.
+6. **Verify**: `http://YOUR_SYNOLOGY_IP:52052/api/health` (with `Authorization: Bearer ...`) returns `{"status":"healthy"}`.
 
 </details>
 
-<details>
-<summary><strong>Non-Synology / Standard Docker — command line</strong></summary>
+#### 4. Install the Chrome extension
 
-##### 1. Download & extract release
+1. Clone the repo, or download `WebVideo2NAS-chrome-extension.zip` from the same release and unzip.
+2. `chrome://extensions/` → enable **Developer mode**.
+3. **Load unpacked** → select the `chrome-extension/` folder.
+4. Open the extension **Settings**:
+   - **NAS Endpoint**: `http://YOUR_NAS_IP:52052` (use the LAN IP, not `localhost`)
+   - **API Key**: same value as `API_KEY` in `.env`
+5. **Test Connection** → should say *connected*.
+
+#### Updating
+
 ```bash
-wget https://github.com/asdfghj1237890/WebVideo2NAS/releases/latest/download/WebVideo2NAS-downloader-docker.zip
-unzip WebVideo2NAS-downloader-docker.zip       # extracts docker/...
-cd docker
-mkdir -p ../logs ../downloads/completed
-```
-
-The zip contains only compose files (~3 KB). The unified image is pulled from `ghcr.io/asdfghj1237890/webvideo2nas` at `up` time — no local build, no source code needed.
-
-##### 2. Create `.env` (only 2 values are required)
-```bash
-API_KEY=$(openssl rand -base64 32)
-DB_PASSWORD=$(openssl rand -base64 24)
-
-## If you don't have openssl, set API_KEY/DB_PASSWORD manually (any strong random strings)
-cat > .env << EOF
-DB_PASSWORD=${DB_PASSWORD}
-API_KEY=${API_KEY}
-MAX_DOWNLOAD_WORKERS=20
-MAX_RETRY_ATTEMPTS=3
-FFMPEG_THREADS=2
-LOG_LEVEL=INFO
-ALLOWED_ORIGINS=chrome-extension://*
-CORS_ALLOW_CREDENTIALS=false
-RATE_LIMIT_PER_MINUTE=10
-ALLOWED_CLIENT_CIDRS=
-SSRF_GUARD=false
-EOF
-
-echo "Your API Key: ${API_KEY}"
-```
-
-##### 3. Deploy & verify
-```bash
-# rename so docker compose picks it up by default
-mv docker-compose_not_synology.yml docker-compose.yml
-
-docker compose pull          # pulls ghcr.io/asdfghj1237890/webvideo2nas:latest
-docker compose up -d
-curl http://localhost:52052/api/health
-```
-
-To pin to a specific version instead of `latest`, set `IMAGE_TAG` in your `.env` (e.g. `IMAGE_TAG=1.9.2`).
-
-##### 4. Updating later
-```bash
+cd /path/to/docker-compose-folder
 docker compose pull
 docker compose up -d
 ```
 
-</details>
+Synology UI: open the Project → **Action → Pull** → **Restart**.
 
-#### Step 2: Install + configure Chrome extension
-1. Open `chrome://extensions/`
-2. Enable **Developer mode**
-3. Click **Load unpacked**
-4. Select the `chrome-extension` folder
-5. Open extension **Settings**:
-   - **NAS Endpoint**: `http://YOUR_NAS_IP:52052` (use your NAS/server LAN IP; not `localhost`)
-   - **API Key**: your `API_KEY` from `.env`
-6. Click **Test Connection** → should show connected
+#### Common issues
 
-<details>
-<summary><strong>(Optional) Custom icons</strong></summary>
-
-Icons should already exist in `chrome-extension/icons/` (icon16.png, icon48.png, icon128.png).
-If you want to replace them, create PNGs with those names and overwrite the files.
-
-</details>
-
-#### Step 3: What to do if something doesn't work
-- **Usage**: see [Usage](#usage)
-- **Troubleshooting**: see [Troubleshooting](#troubleshooting)
-- **Configuration**: see [Configuration](#configuration)
-
-</details>
-
-### Current Status: Core Features Complete ✅
-
-You can now:
-- ✅ Deploy Docker stack on Synology NAS or any Docker host
-- ✅ Download M3U8 video streams to MP4
-- ✅ Download MP4 videos directly
-- ✅ Detect disguised manifests via JS-level content interception
-- ✅ Use Chrome extension for automatic detection (M3U8 & MP4)
-- ✅ Forward cookies & headers for authenticated streams
-- ✅ Monitor download progress in side panel
-- ✅ Manage downloads via REST API
+| Symptom | Likely cause |
+|---|---|
+| `docker compose pull` returns 404 | GHCR package is private. Owner must flip visibility to public at https://github.com/asdfghj1237890/WebVideo2NAS/pkgs/container/webvideo2nas |
+| `/api/health` returns **401** | `Authorization: Bearer <API_KEY>` header missing or mismatched against `.env` |
+| Worker container shows **unhealthy** | Pre-1.9.2 templates inherit the API healthcheck. Upgrade to ≥ 1.9.2 (`docker compose pull`) — fixed compose disables the inherited check |
+| Synology can't write to `/downloads` | Check folder permissions in DSM File Station (project user needs read/write) |
+| Anything else | See [Troubleshooting](#troubleshooting) |
 
 ## Usage
 
