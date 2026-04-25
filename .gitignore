@@ -5,6 +5,9 @@
 
 # Docker
 docker-compose.override.yml
+# Local working compose (operator-specific paths). Tracked templates are
+# docker-compose.synology.yml and docker-compose_not_synology.yml.
+video-downloader/docker/docker-compose.yml
 
 # Python
 __pycache__/
