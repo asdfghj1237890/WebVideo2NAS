@@ -1149,7 +1149,7 @@ def main():
     """Main entry point"""
     logger.info("="*50)
     logger.info("WebVideo2NAS Worker")
-    logger.info("Version: 1.9.1")
+    logger.info("Version: 1.9.2")
     logger.info("="*50)
     
     # Wait for database to be ready

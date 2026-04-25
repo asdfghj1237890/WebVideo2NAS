@@ -134,7 +134,7 @@ docker compose up -d
 curl http://localhost:52052/api/health
 ```
 
-要鎖在某個版本（不用 `latest`），在 `.env` 設定 `IMAGE_TAG`（例：`IMAGE_TAG=1.9.1`）。
+要鎖在某個版本（不用 `latest`），在 `.env` 設定 `IMAGE_TAG`（例：`IMAGE_TAG=1.9.2`）。
 
 #### 4. 之後升級
 ```bash

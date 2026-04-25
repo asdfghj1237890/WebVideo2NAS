@@ -113,6 +113,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # The unified image's Dockerfile HEALTHCHECK probes :8000 (the API).
+      # Worker doesn't listen, so disable the inherited check.
+      disable: true
     networks:
       - video_network
     user: "1026:100"  # Match your Synology user
@@ -142,6 +146,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # The unified image's Dockerfile HEALTHCHECK probes :8000 (the API).
+      # Worker doesn't listen, so disable the inherited check.
+      disable: true
     networks:
       - video_network
     user: "1026:100"  # Match your Synology user

@@ -254,7 +254,7 @@ docker compose up -d
 curl http://localhost:52052/api/health
 ```
 
-To pin to a specific version instead of `latest`, set `IMAGE_TAG` in your `.env` (e.g. `IMAGE_TAG=1.9.1`).
+To pin to a specific version instead of `latest`, set `IMAGE_TAG` in your `.env` (e.g. `IMAGE_TAG=1.9.2`).
 
 ##### 4. Updating later
 ```bash
@@ -757,6 +757,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [1.9.2] - 2026-04-26
+
+#### Fixed
+- Worker containers were marked **unhealthy** because they inherited the unified image's API healthcheck (`curl http://localhost:8000/api/health`) — workers don't listen on port 8000. The compose templates now explicitly disable the inherited healthcheck on `worker` / `worker2` services
+
 ### [1.9.1] - 2026-04-26
 > Note: this is the first release of the unified-image flow; v1.9.0 was reserved by an earlier mis-tagged commit and skipped.
 
@@ -1001,7 +1006,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 1.9.1  
+**Version**: 1.9.2  
 **Last Updated**: 2026-04-03  
 **Port**: 52052 (NAS host port → API container :8000)
 
