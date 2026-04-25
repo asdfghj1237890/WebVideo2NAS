@@ -158,61 +158,30 @@ This document specifies a complete system for capturing web video URLs (m3u8 str
 ### 3.2 NAS Docker Service
 
 #### 3.2.1 Docker Compose Structure
+
+api and worker run from a **single multi-arch image** (`ghcr.io/asdfghj1237890/webvideo2nas`); each service picks its role at startup via the `ROLE` env var. The full templates live in [`video-downloader/docker/docker-compose.synology.yml`](../video-downloader/docker/docker-compose.synology.yml) and [`video-downloader/docker/docker-compose_not_synology.yml`](../video-downloader/docker/docker-compose_not_synology.yml). Skeleton:
+
 ```yaml
-version: '3.8'
 services:
   api:
-    build: ./api
-    ports:
-      - "52052:8000"  # NAS host port 52052 → API container port 8000
-    environment:
-      - API_KEY=${API_KEY}
-      - DATABASE_URL=postgresql://postgres:password@db:5432/m3u8_db
-    volumes:
-      - /nas/downloads:/downloads
-    depends_on:
-      - db
-      - redis
+    image: ghcr.io/asdfghj1237890/webvideo2nas:${IMAGE_TAG:-latest}
+    environment: [ROLE=api, API_KEY=${API_KEY}, DATABASE_URL=postgresql://...@db:5432/video_db, REDIS_URL=redis://redis:6379/0]
+    ports: ["52052:8000"]   # host 52052 → container 8000
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$API_KEY\" http://localhost:8000/api/health"]
 
-  # Worker 1
   worker:
-    build: ./worker
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - DATABASE_URL=postgresql://postgres:password@db:5432/m3u8_db
-      - MAX_DOWNLOAD_WORKERS=10
-    volumes:
-      - /nas/downloads:/downloads
-    depends_on:
-      - redis
-      - db
+    image: ghcr.io/asdfghj1237890/webvideo2nas:${IMAGE_TAG:-latest}
+    environment: [ROLE=worker, ...same db/redis...]
+    healthcheck:
+      disable: true   # worker doesn't bind a port; inherited API healthcheck would always fail
 
-  # Worker 2 (scales processing capacity)
   worker2:
-    build: ./worker
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - DATABASE_URL=postgresql://postgres:password@db:5432/m3u8_db
-      - MAX_DOWNLOAD_WORKERS=10
-    volumes:
-      - /nas/downloads:/downloads
-    depends_on:
-      - redis
-      - db
+    # identical to worker; second instance for parallelism
 
-  redis:
-    image: redis:alpine
-    
-  db:
-    image: postgres:15-alpine
-    environment:
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=m3u8_db
-    volumes:
-      - db_data:/var/lib/postgresql/data
-
-volumes:
-  db_data:
+  db:    { image: postgres:15-alpine }
+  redis: { image: redis:7-alpine }
+  db_cleanup: # postgres:15-alpine container running a periodic job-pruning script
 ```
 
 #### 3.2.2 API Endpoints
@@ -308,20 +277,17 @@ The system deploys **2 independent workers** by default, both pulling from the s
 - Webpack for bundling
 
 ### 4.2 NAS Backend
-- **API Gateway**: 
-  - Option A: FastAPI (Python) - Recommended
-  - Option B: Express.js (Node.js)
-- **Workers**: Python 3.11+ (2 workers by default, scalable)
-  - Libraries: requests, m3u8, asyncio
-  - Multi-worker architecture for parallel processing
-- **FFmpeg**: Latest stable version
-- **Database**: PostgreSQL 15 or SQLite 3
-- **Queue**: Redis 7+ (for worker coordination)
+- **API Gateway**: FastAPI (Python 3.11)
+- **Workers**: Python 3.11; libraries: `requests`, `curl_cffi` (TLS impersonation), `m3u8`, `pycryptodome` (HLS AES-128); 2 workers by default, scalable
+- **FFmpeg**: bundled in the unified image
+- **Database**: PostgreSQL 15
+- **Queue**: Redis 7
 
 ### 4.3 Infrastructure
-- Docker & Docker Compose
-- Optional: Reverse Proxy (Caddy, Traefik) for HTTPS
-- Optional: Portainer for container management
+- Docker + Docker Compose
+- Single multi-arch container image (`linux/amd64`, `linux/arm64`) on GHCR
+- Optional: reverse proxy (Caddy, Traefik) for HTTPS termination
+- Optional: VPN (Tailscale, WireGuard) for remote access
 
 ---
 
@@ -355,43 +321,9 @@ The system deploys **2 independent workers** by default, both pulling from the s
 
 ---
 
-## 6. Implementation Phases
+## 6. Configuration Files
 
-### Phase 1: Core Infrastructure (Week 1)
-- Docker Compose setup
-- Basic API server (health check endpoint)
-- Database schema
-- Redis queue connection
-
-### Phase 2: Download Worker (Week 1-2)
-- M3U8 parser implementation
-- Segment downloader
-- FFmpeg integration
-- Progress tracking
-
-### Phase 3: Chrome Extension (Week 2)
-- URL detection logic
-- Settings page
-- API communication
-- Context menu integration
-
-### Phase 4: Integration & Testing (Week 3)
-- End-to-end testing
-- Error handling refinement
-- Performance optimization
-- Documentation
-
-### Phase 5: Polish & Deployment (Week 4)
-- UI/UX improvements
-- Notification system
-- Setup guides
-- Security hardening
-
----
-
-## 7. Configuration Files
-
-### 7.1 Environment Variables
+### 6.1 Environment Variables
 ```bash
 # .env file
 API_KEY=your-secure-api-key-here
@@ -406,7 +338,7 @@ ALLOWED_ORIGINS=chrome-extension://*
 RATE_LIMIT_PER_MINUTE=10
 ```
 
-### 7.2 Extension Configuration
+### 6.2 Extension Configuration
 ```json
 {
   "nasEndpoint": "https://192.168.1.100:52052",
@@ -419,16 +351,16 @@ RATE_LIMIT_PER_MINUTE=10
 
 ---
 
-## 8. Monitoring & Logging
+## 7. Monitoring & Logging
 
-### 8.1 Metrics to Track
+### 7.1 Metrics to Track
 - Active downloads count
 - Success/failure rate
 - Average download time
 - Disk usage
 - API response time
 
-### 8.2 Logging Strategy
+### 7.2 Logging Strategy
 - **API**: Request/response logs (INFO level)
 - **Worker**: Download progress, errors (DEBUG level)
 - **Storage**: Rotate logs daily, keep 30 days
@@ -436,9 +368,9 @@ RATE_LIMIT_PER_MINUTE=10
 
 ---
 
-## 9. Future Enhancements
+## 8. Future Enhancements
 
-### 9.1 Nice-to-Have Features
+### 8.1 Nice-to-Have Features
 - [ ] Firefox extension support
 - [ ] Batch download queue
 - [ ] Automatic subtitle download
@@ -449,7 +381,7 @@ RATE_LIMIT_PER_MINUTE=10
 - [ ] Webhook notifications (Discord/Telegram)
 - [ ] Automatic media library integration (Plex/Jellyfin)
 
-### 9.2 Advanced Features
+### 8.2 Advanced Features
 - [ ] Multiple NAS support
 - [ ] Distributed download across multiple workers
 - [ ] Built-in video transcoding
@@ -459,20 +391,20 @@ RATE_LIMIT_PER_MINUTE=10
 
 ---
 
-## 10. Testing Strategy
+## 9. Testing Strategy
 
-### 10.1 Unit Tests
+### 9.1 Unit Tests
 - API endpoint handlers
 - M3U8 parser logic
 - Download retry mechanism
 - Filename sanitization
 
-### 10.2 Integration Tests
+### 9.2 Integration Tests
 - Chrome extension → API communication
 - End-to-end download flow
 - Error scenarios (network failure, invalid URLs)
 
-### 10.3 Manual Testing Checklist
+### 9.3 Manual Testing Checklist
 - [ ] Extension detects m3u8 on popular streaming sites
 - [ ] Download completes successfully
 - [ ] Progress updates accurately
@@ -480,42 +412,6 @@ RATE_LIMIT_PER_MINUTE=10
 - [ ] Multiple simultaneous downloads
 - [ ] Resume after container restart
 - [ ] Disk full scenario handling
-
----
-
-## 11. Documentation Deliverables
-
-1. **README.md**: Quick start guide
-2. **INSTALLATION.md**: Step-by-step setup
-3. **API.md**: API endpoint documentation
-4. **TROUBLESHOOTING.md**: Common issues
-5. **ARCHITECTURE.md**: System design details
-6. This specification document
-
----
-
-## 12. Success Criteria
-
-The system is considered complete when:
-- [x] Chrome extension can detect m3u8 URLs on 90% of streaming sites
-- [x] Download success rate > 95% for valid URLs
-- [x] Average download time < 2x video duration
-- [x] User can configure and deploy within 15 minutes
-- [x] System handles 10+ concurrent downloads
-- [x] Complete error logging and recovery
-- [x] Documentation covers all setup and usage scenarios
-
----
-
-## 13. Risk Assessment
-
-| Risk | Probability | Impact | Mitigation |
-|------|------------|--------|------------|
-| M3U8 format variations | High | Medium | Support multiple parser libraries |
-| DRM-protected content | Medium | High | Document limitations clearly |
-| NAS performance limits | Medium | Medium | Implement queue throttling |
-| Chrome API changes | Low | High | Monitor Chrome release notes |
-| Network instability | Medium | Medium | Robust retry logic |
 
 ---
 
@@ -548,32 +444,33 @@ curl -X GET https://nas-ip:52052/api/jobs/12345 \
 
 ```
 webvideo2nas/
-├── chrome-extension/       # Chrome extension
-│   ├── manifest.json
-│   ├── background.js
-│   ├── options/
-│   ├── sidepanel.html
-│   ├── sidepanel.js
-│   ├── sidepanel.css
-│   └── icons/
-├── m3u8-downloader/
-│   └── docker/
-│       ├── api/                # FastAPI service
-│       ├── worker/             # Download worker
-│       ├── docker-compose.yml
+├── chrome-extension/             # Chrome extension (MV3)
+│   ├── background.js             # Service worker
+│   ├── content.js                # ISOLATED-world content script
+│   ├── inject.js                 # MAIN-world manifest interceptor
+│   ├── sidepanel.{html,js,css}   # Side panel UI
+│   ├── options/                  # Options page
+│   ├── icons/
+│   └── manifest.json
+├── video-downloader/
+│   └── docker/                   # Unified container source
+│       ├── Dockerfile            # Single image; entrypoint dispatches by ROLE
+│       ├── entrypoint.sh
+│       ├── requirements.in       # Direct deps (human-maintained)
+│       ├── requirements.txt      # pip-compile output: full transitive pins + SHA256
+│       ├── api/                  # FastAPI source (ROLE=api)
+│       ├── worker/               # Download worker source (ROLE=worker)
+│       ├── tests/                # Upgrade verification scripts
 │       ├── docker-compose.synology.yml
+│       ├── docker-compose_not_synology.yml
+│       ├── init-db.sql
+│       ├── .env.example
 │       └── SYNOLOGY_DEPLOY_COMMANDS.md
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   ├── SPECIFICATION.md
+│   ├── SPECIFICATION.md          # this document
 │   └── README.md
 ├── pics/
-├── README.md
+└── README.md
 ```
-
----
-
-**Document Version**: 1.0  
-**Last Updated**: 2025-12-12  
-**Status**: Ready for Implementation
 

@@ -382,132 +382,37 @@ Indexes:
 
 ## 6. Security Architecture
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Security Layers                            │
-└──────────────────────────────────────────────────────────────┘
+What's actually implemented in the code today:
 
-Layer 1: Network Security
-┌─────────────────────────────────────┐
-│ Chrome Extension                     │
-│ └─→ HTTPS only                      │
-│     └─→ Certificate validation      │
-└───────────┬─────────────────────────┘
-            │ TLS 1.3
-            ↓
-┌─────────────────────────────────────┐
-│ Firewall / Reverse Proxy            │
-│ ├─→ IP whitelist (optional)         │
-│ ├─→ Rate limiting                   │
-│ └─→ DDoS protection                 │
-└───────────┬─────────────────────────┘
-            │
-            ↓
-┌─────────────────────────────────────┐
-│ NAS Internal Network                │
-│ └─→ Docker bridge network           │
-└─────────────────────────────────────┘
+| Layer | Mechanism | Source |
+|---|---|---|
+| Authentication | `Authorization: Bearer <API_KEY>` required on every `/api/*` endpoint, including `/api/health` | `api/main.py:_verify_key_common` |
+| Per-IP rate limit | Configurable via `RATE_LIMIT_PER_MINUTE` (Redis bucket per IP per minute window) | `api/main.py:_rate_limit` |
+| IP allowlist | Optional `ALLOWED_CLIENT_CIDRS` — request rejected if peer not in list | `api/main.py:_enforce_client_allowlist` |
+| URL validation | Pydantic `HttpUrl` (must be http(s)); plus extension/format-hint check | `api/main.py:DownloadRequest` |
+| SSRF guard | Optional `SSRF_GUARD=true` — resolves the URL host and blocks loopback / private / link-local / multicast / reserved ranges | `api/main.py:_enforce_ssrf_guard`, `worker/worker.py` |
+| Filename sanitization | `safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_'))` — strips path separators and dots | `worker/worker.py` |
+| Container hardening | Non-root `appuser` (uid 1026) inside the unified image; matches Synology's default uid:gid | `Dockerfile` |
+| Supply chain | `pip install --require-hashes` against a hash-locked `requirements.txt`; image built with provenance + SBOM via `docker/build-push-action@v6` | `Dockerfile`, `.github/workflows/create-release.yml` |
+| TLS to upstream | Default verify on; opt-out via `INSECURE_SKIP_TLS_VERIFY=1` for sites with broken certs | `worker/ssl_adapter.py` |
 
-Layer 2: Authentication
-┌─────────────────────────────────────┐
-│ Every API Request                   │
-│ Header: Authorization: Bearer TOKEN │
-└───────────┬─────────────────────────┘
-            │
-            ↓
-┌─────────────────────────────────────┐
-│ API Middleware                      │
-│ ├─→ Validate API key                │
-│ ├─→ Check rate limit                │
-│ └─→ Log request                     │
-└───────────┬─────────────────────────┘
-            │
-            ├─→ Valid → Continue
-            └─→ Invalid → 401 Unauthorized
-
-Layer 3: Input Validation
-┌─────────────────────────────────────┐
-│ URL Validation                      │
-│ ├─→ Must start with https://        │
-│ ├─→ Must end with .m3u8             │
-│ └─→ Regex validation                │
-└─────────────────────────────────────┘
-┌─────────────────────────────────────┐
-│ Filename Sanitization               │
-│ ├─→ Remove path traversal (..)      │
-│ ├─→ Remove special chars            │
-│ └─→ Limit length                    │
-└─────────────────────────────────────┘
-
-Layer 4: Execution Isolation
-┌─────────────────────────────────────┐
-│ Docker Containers                   │
-│ ├─→ Non-root user                   │
-│ ├─→ Read-only filesystem            │
-│ ├─→ Limited resources                │
-│ └─→ No privileged mode              │
-└─────────────────────────────────────┘
-```
+> **Not implemented** (would require user action): TLS termination at the API itself (use a reverse proxy or VPN), DDoS protection, read-only container filesystem, mTLS, secrets manager integration. Out of scope for a single-host LAN deployment.
 
 ---
 
 ## 7. Error Handling Flow
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   Error Handling Strategy                    │
-└─────────────────────────────────────────────────────────────┘
+What the worker does today (`worker/worker.py:_handle_job_failure`):
 
-Network Errors
-├─→ Connection timeout
-│   ├─→ Retry: 3 attempts
-│   ├─→ Backoff: exponential (1s, 2s, 4s)
-│   └─→ If all fail → status='failed'
-│
-├─→ 404 Not Found
-│   └─→ No retry → status='failed'
-│
-├─→ 403 Forbidden
-│   └─→ No retry → status='failed'
-│       └─→ error_msg = "Access denied"
-│
-└─→ 500 Server Error
-    └─→ Retry: 2 attempts
-        └─→ If fail → status='failed'
+| Error class | Action |
+|---|---|
+| Job-level exception (parser, network, ffmpeg) | Increment `retry_count`. If `< MAX_RETRY_ATTEMPTS` (default 3): reset to `pending` and `RPUSH` back to Redis. Otherwise mark `failed` and persist `error_message` |
+| User-cancelled (`status='cancelled'`) | No retry, no status update — `cancelled` is sticky once set |
+| Repeated HTTP 403 / 474 segment errors during HLS download | No retry; mark `failed` with "URL expired or blocked" — these are non-recoverable from the worker's side |
+| Anti-hotlinking detection (≥ 5 segments come back as JPEG/PNG/HTML) | No retry; mark `failed` with explicit anti-hotlinking message |
+| Per-segment download failure | Retry within the segment downloader (`max_retries=3`); failures accumulate in `downloader.failed_segments` and trip the thresholds above |
 
-Parsing Errors
-├─→ Invalid m3u8 format
-│   └─→ No retry → status='failed'
-│       └─→ error_msg = "Invalid m3u8"
-│
-└─→ Empty playlist
-    └─→ No retry → status='failed'
-        └─→ error_msg = "No segments found"
-
-Storage Errors
-├─→ Disk full
-│   ├─→ Pause queue
-│   ├─→ Alert admin
-│   └─→ Put job back in queue
-│
-└─→ Permission denied
-    └─→ Fatal error → restart container
-
-FFmpeg Errors
-├─→ Codec error
-│   ├─→ Try alternative command
-│   └─→ If fail → status='failed'
-│
-└─→ Corrupted segment
-    ├─→ Retry segment download
-    └─→ If fail → skip segment (lossy)
-
-All Errors
-└─→ Log to:
-    ├─→ Database (error_msg column)
-    ├─→ File (/logs/app.log)
-    └─→ Optional: Alert (email/telegram)
-```
+All errors are logged to stdout (captured by Docker → host logs) and persisted to the `jobs.error_message` column.
 
 ---
 
@@ -557,145 +462,51 @@ The system deploys **2 independent download workers** by default to maximize thr
 
 ### 8.3 Worker Capacity
 
-**Per-Worker Configuration:**
-```
-MAX_DOWNLOAD_WORKERS=10      # Threads per video for segment downloading
-```
+Each worker container processes **one video at a time** (`MAX_CONCURRENT_DOWNLOADS` was removed in v1.8.0; concurrency now comes from running multiple worker services). Within a video, segment downloads parallelise via `MAX_DOWNLOAD_WORKERS` threads (default 20).
 
-**Total System Capacity (2 Workers):**
-- Maximum parallel videos: 2 × 3 = **6 videos**
-- Maximum download threads: 6 × 10 = **60 threads**
-- Recommended for NAS with 4+ CPU cores and 4GB+ RAM
+**Default 2-worker setup:**
+- Parallel videos: **2** (one per worker container)
+- Per-video segment threads: 20
+- Recommended for NAS with 4+ CPU cores and 4 GB+ RAM
 
 ### 8.4 Scaling Workers
 
-**Add More Workers (docker-compose.yml):**
-```yaml
-worker3:
-  build:
-    context: ./worker
-    dockerfile: Dockerfile
-  container_name: m3u8_worker_3
-  # ... same config as worker1/worker2 ...
-```
+Both compose templates use the unified image; copy the `worker2` block into `worker3`/`worker4`/etc. (with matching `container_name: video_worker_3` and identical env). Or for non-Synology, `docker compose up -d --scale worker=5`.
 
-**Or Scale Existing Service:**
-```bash
-docker-compose up -d --scale worker=5
-```
+**Scaling guidelines:**
 
-**Scaling Guidelines:**
-| NAS Specs | Recommended Workers | Total Capacity |
-|-----------|-------------------|----------------|
-| 2 cores, 2GB RAM | 1 worker | 3 videos |
-| 4 cores, 4GB RAM | 2 workers (default) | 6 videos |
-| 8+ cores, 8GB+ RAM | 3-4 workers | 9-12 videos |
+| NAS specs | Recommended workers | Parallel videos |
+|---|---|---|
+| 2 cores, 2 GB RAM | 1 | 1 |
+| 4 cores, 4 GB RAM | 2 (default) | 2 |
+| 8+ cores, 8 GB+ RAM | 3–4 | 3–4 |
 
 ---
 
-## 9. Performance Optimization
+## 9. Performance Notes
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  Performance Strategies                      │
-└─────────────────────────────────────────────────────────────┘
+What the implementation actually does:
 
-1. Concurrent Processing (Multi-Worker)
-   ┌──────────────────────────────┐
-   │ Worker Pool (2 Workers)      │
-   │ ├─→ 10 threads per video     │
-   │ ├─→ 3 videos per worker      │
-   │ ├─→ 6 videos total capacity  │
-   │ └─→ 60 active threads max    │
-   └──────────────────────────────┘
+- **Per-video parallelism**: HLS segments download via a `ThreadPoolExecutor` of size `MAX_DOWNLOAD_WORKERS` (default 20) per worker container. MP4 direct downloads probe `Range` support and split into 4 parallel byte-range streams when the file is ≥ 32 MB and the origin honours `bytes=0-0` with HTTP 206.
+- **Worker scaling**: each worker container processes one video at a time. Add more `worker*` services to scale horizontally; Redis `BLPOP` distributes jobs without coordination.
+- **DB indexes** ([init-db.sql](../video-downloader/docker/init-db.sql)): `idx_jobs_status`, `idx_jobs_created_at`. Status polling and listing don't full-scan.
+- **Connection reuse**: each worker keeps a single `requests.Session` (or `curl_cffi` `BrowserSession` for TLS impersonation) for the playlist + key + segments to preserve cookies and the JA3 fingerprint.
+- **Storage**: HLS segments land in `tempfile.mkdtemp()`, ffmpeg merges into `/downloads/completed/`, then the temp dir is deleted. MP4 multi-part downloads write `.partNN` files alongside the output then assemble in order.
 
-2. Caching
-   ┌──────────────────────────────┐
-   │ Redis Cache                  │
-   │ ├─→ Job status (TTL: 1 hour) │
-   │ ├─→ System stats (TTL: 30s)  │
-   │ └─→ Hit rate target: >80%    │
-   └──────────────────────────────┘
-
-3. Database Optimization
-   ┌──────────────────────────────┐
-   │ Indexes                      │
-   │ ├─→ status (for filtering)   │
-   │ ├─→ created_at (for sorting) │
-   │ └─→ Query time: <50ms        │
-   └──────────────────────────────┘
-
-4. Network Optimization
-   ┌──────────────────────────────┐
-   │ Connection Pooling           │
-   │ ├─→ Reuse HTTP connections   │
-   │ ├─→ Keep-alive enabled       │
-   │ └─→ Pool size: 20            │
-   └──────────────────────────────┘
-
-5. Storage Optimization
-   ┌──────────────────────────────┐
-   │ Direct Write                 │
-   │ ├─→ No temp files (if poss.) │
-   │ ├─→ Stream to disk           │
-   │ └─→ Reduce I/O operations    │
-   └──────────────────────────────┘
-
-Expected Performance:
-  - 1080p video (1GB): ~10-15 minutes
-  - Throughput: 4-8 MB/s per worker
-  - Concurrent downloads: 6 (with 2 workers)
-  - CPU usage: 50-70% during merge
-  - RAM usage: ~500MB per video, ~1GB per worker
-```
+Rough throughput on a 4-core / 4 GB Synology DS920+ class device: 1080p HLS video (~1 GB) typically completes in 5–15 minutes, dominated by origin bandwidth rather than CPU.
 
 ---
 
 ## 10. Monitoring & Observability
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Monitoring Stack                          │
-└─────────────────────────────────────────────────────────────┘
+What's available out of the box:
 
-Logs
-├─→ Application Logs
-│   ├─→ Format: JSON
-│   ├─→ Level: INFO (production)
-│   ├─→ Rotation: Daily
-│   └─→ Retention: 30 days
-│
-├─→ Access Logs (FastAPI)
-│   └─→ Format: JSON
-│
-└─→ Error Logs
-    └─→ Level: ERROR, CRITICAL
+- **stdout/stderr logs** from each container — `docker compose logs -f api` / `worker` / `worker2`. Log level controlled by `LOG_LEVEL` env (default `INFO`). The format is plain `%(asctime)s - %(name)s - %(levelname)s - %(message)s` (not structured JSON).
+- **Health endpoint** `GET /api/health` — checks DB and Redis connectivity. Used by Docker `HEALTHCHECK` (which sends the API key via Authorization header).
+- **System status** `GET /api/status` — returns `{active_downloads, queue_length, total_jobs}`.
+- **Job-level state** in PostgreSQL `jobs` table — every status transition is persisted (`pending` → `downloading` → `completed`/`failed`/`cancelled`).
 
-Metrics to Track
-├─→ Download Metrics
-│   ├─→ Success rate
-│   ├─→ Average duration
-│   ├─→ Queue length
-│   └─→ Active downloads
-│
-├─→ System Metrics
-│   ├─→ CPU usage
-│   ├─→ RAM usage
-│   ├─→ Disk usage
-│   └─→ Network throughput
-│
-└─→ API Metrics
-    ├─→ Request count
-    ├─→ Response time (p50, p95, p99)
-    ├─→ Error rate
-    └─→ Rate limit hits
-
-Alerting Rules
-├─→ Disk >90% → Alert
-├─→ Error rate >5% → Alert
-├─→ Queue >50 jobs → Warning
-└─→ Worker down → Critical
-```
+> **Future / opt-in**: structured JSON logging, Prometheus metrics endpoint, alert rules (disk full, queue backlog, worker down), log shipping. None are wired up — drop-in via a sidecar (Promtail + Loki) or a custom middleware would be the natural extensions.
 
 ---
 
@@ -722,17 +533,20 @@ Internet
 │ │ Docker Host                     │ │
 │ │                                 │ │
 │ │ docker-compose.yml              │ │
-│ │ ├─→ api (FastAPI)               │ │
-│ │ │   └─→ Port 52052               │ │
-│ │ ├─→ worker1 (Python)            │ │
-│ │ ├─→ worker2 (Python)            │ │
-│ │ ├─→ db (PostgreSQL)             │ │
-│ │ └─→ redis                       │ │
+│ │  (image: ghcr.io/.../webvideo2nas)│
+│ │ ├─→ api      (ROLE=api)         │ │
+│ │ │   └─→ Port 52052              │ │
+│ │ ├─→ worker   (ROLE=worker)      │ │
+│ │ ├─→ worker2  (ROLE=worker)      │ │
+│ │ ├─→ db       (PostgreSQL 15)    │ │
+│ │ ├─→ redis    (Redis 7)          │ │
+│ │ └─→ db_cleanup                  │ │
 │ │                                 │ │
 │ │ Volumes:                        │ │
-│ │ ├─→ /volume1/downloads          │ │
-│ │ ├─→ /volume1/docker/m3u8-downloader/db_data     │ │
-│ │ └─→ /volume1/docker/m3u8-downloader/logs        │ │
+│ │ ├─→ /volume1/nsfw_video/...     │ │
+│ │ ├─→ /volume1/docker/video-downloader/db_data    │ │
+│ │ ├─→ /volume1/docker/video-downloader/redis_data │ │
+│ │ └─→ /volume1/docker/video-downloader/logs       │ │
 │ └─────────────────────────────────┘ │
 └─────────────────────────────────────┘
 
@@ -755,15 +569,5 @@ Chrome    NAS
 
 ---
 
-## Summary
-
-This architecture provides:
-- ✅ **Scalability**: Queue-based design supports multiple workers
-- ✅ **Reliability**: Retry logic, error handling, persistence
-- ✅ **Security**: Multi-layer authentication and validation
-- ✅ **Observability**: Comprehensive logging and monitoring
-- ✅ **Performance**: Concurrent downloads, caching, optimizations
-- ✅ **Maintainability**: Clear separation of concerns, documented
-
-For implementation details, see the root [README.md](../README.md) and [SPECIFICATION.md](SPECIFICATION.md).
+For deployment instructions and configuration, see the project [README.md](../README.md). For API contracts and database schema, see [SPECIFICATION.md](SPECIFICATION.md).
 
