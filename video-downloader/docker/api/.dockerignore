@@ -1,8 +1,0 @@
-# Exclude tests and Python caches from image build context
-tests/
-__pycache__/
-.pytest_cache/
-*.pyc
-*.pyo
-*.pyd
-*.log

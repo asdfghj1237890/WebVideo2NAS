@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8 and MP4)",
-    version="1.8.9"
+    version="1.9.1"
 )
 
 # CORS middleware
@@ -233,28 +233,28 @@ async def root():
     """Root endpoint"""
     return {
         "name": "WebVideo2NAS API",
-        "version": "1.8.9",
+        "version": "1.9.1",
         "status": "running"
     }
 
 @app.get("/api/health")
 async def health_check(request: Request, authorization: Optional[str] = Header(None)):
-    """Health check endpoint"""
+    """
+    Health check endpoint. Always requires API_KEY — the in-container Docker
+    HEALTHCHECK is configured to send it via Authorization header. The previous
+    "skip auth for localhost" shortcut was bypassable by spoofing
+    X-Forwarded-For: 127.0.0.1 from any reachable client.
+    """
+    verify_api_key(request=request, authorization=authorization)
     try:
-        # Avoid exposing internal status to the public internet.
-        # Allow localhost checks (Docker healthcheck) without auth; require API key otherwise.
-        client_ip = _get_client_ip(request)
-        if client_ip not in ("127.0.0.1", "::1"):
-            verify_api_key(request=request, authorization=authorization)
-
         # Check database
         db = SessionLocal()
         db.execute(text("SELECT 1"))
         db.close()
-        
+
         # Check Redis
         redis_client.ping()
-        
+
         return {"status": "healthy"}
     except Exception as e:
         logger.error(f"Health check failed: {e}")

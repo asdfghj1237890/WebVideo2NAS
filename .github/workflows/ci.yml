@@ -25,17 +25,18 @@ jobs:
         run: uv python install 3.11
 
       - name: Install Python test dependencies
+        # requirements.txt has SHA256 hashes, so pip enforces --require-hashes
+        # for that install. pytest is a dev-only extra and goes separately.
         run: |
           uv venv --python 3.11
-          uv pip install pytest \
-            -r video-downloader/docker/worker/requirements.txt \
-            -r video-downloader/docker/api/requirements.txt
+          uv pip install -r video-downloader/docker/requirements.txt
+          uv pip install pytest==9.0.3
 
-      - name: Run Python unit tests (worker + api)
+      - name: Run Python unit tests (api + worker)
         run: |
           uv run pytest -q \
-            video-downloader/docker/worker/tests \
-            video-downloader/docker/api/tests
+            video-downloader/docker/api/tests \
+            video-downloader/docker/worker/tests
 
   chrome-extension-unit:
     runs-on: ubuntu-latest
@@ -81,6 +82,9 @@ jobs:
           RATE_LIMIT_PER_MINUTE=0
           SSRF_GUARD=false
           EOF
+
+      - name: Build unified image locally (for compose to use instead of GHCR)
+        run: docker compose -f docker-compose_not_synology.yml build api
 
       - name: Start API stack (db/redis/api)
         run: docker compose -f docker-compose_not_synology.yml up -d db redis api

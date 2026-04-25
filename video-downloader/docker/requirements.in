@@ -1,0 +1,37 @@
+# Combined requirements for the unified WebVideo2NAS image (api + worker).
+# The image switches role at startup based on the ROLE env var (see entrypoint.sh).
+# Direct dependencies only — pip-compile produces requirements.txt with full
+# transitive pins + SHA256 hashes for supply-chain integrity.
+
+# --- Shared (api + worker) ---
+sqlalchemy==2.0.49
+psycopg2-binary==2.9.12
+redis==7.4.0
+python-dotenv==1.2.2
+
+# --- API only ---
+# FastAPI and web server
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+python-multipart==0.0.26
+# DB migrations
+alembic==1.18.4
+# Data validation
+pydantic==2.13.3
+pydantic-settings==2.14.0
+# HTTP client
+httpx==0.28.1
+# Pin transitive dependency to pick up security fixes
+starlette==0.49.1
+
+# --- Worker only ---
+# HTTP clients
+requests==2.33.1
+# Brotli decompression for requests
+brotli==1.2.0
+# Browser-like HTTP client with TLS fingerprint impersonation (anti-bot bypass)
+curl_cffi==0.15.0
+# M3U8 parsing
+m3u8==6.0.0
+# Encryption (AES-128 for HLS)
+pycryptodome==3.23.0

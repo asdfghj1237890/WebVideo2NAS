@@ -47,9 +47,9 @@
    - 如果之後出現權限錯誤（寫不進 `/downloads`），回來檢查 DSM 資料夾權限，並先嘗試在下載資料夾手動建立一個測試檔案確認可寫入
 
 #### 3. 下載並解壓縮 release（DSM UI）
-1. 從 GitHub Releases 下載 `WebVideo2NAS-downloader-docker.zip`
-2. 用 File Station 上傳到 `/volume1/docker/` 並解壓縮
-3. 解壓後應該會有：`/volume1/docker/video-downloader/docker/`
+1. 從 GitHub Releases 下載 `WebVideo2NAS-downloader-docker.zip`（≈3 KB — 只含 compose 設定檔，實際的 image 由 GHCR 拉，位置：`ghcr.io/asdfghj1237890/webvideo2nas`）
+2. 用 File Station 上傳到 `/volume1/docker/video-downloader/` 並解壓縮
+3. 解壓後應該會有：`/volume1/docker/video-downloader/docker/`，內含 `docker-compose.synology.yml`、`docker-compose_not_synology.yml`、`init-db.sql`、`.env.example`、`SYNOLOGY_DEPLOY_COMMANDS.md`
 
 #### 4. 建立 `.env`（新手只要改 2 個值）
 在 `/volume1/docker/video-downloader/docker/.env` 建立檔案（DSM 文字編輯器，或在 PC 編輯後上傳）：
@@ -79,7 +79,9 @@ SSRF_GUARD=false
 2. 把 `docker-compose.synology.yml` 改名成 `docker-compose.yml`
 3. 開啟 **Container Manager → Projects → Create**
 4. 專案資料夾選：`/volume1/docker/video-downloader/docker`
-5. 完成精靈並啟動 Project
+5. 完成精靈 — Container Manager 會從 GHCR 拉統一 image 並啟動（api + 2 個 worker + db + redis + db_cleanup，全都用同一個 image）
+
+> **之後升級**：在 Project 點 **Action → Pull**，再 **Restart**。或者用 SSH：`cd /volume1/docker/video-downloader/docker && docker compose pull && docker compose up -d`
 
 #### 6. 驗證
 開啟 `http://YOUR_SYNOLOGY_IP:52052/api/health`，應回傳 `{"status":"healthy"}`
@@ -92,12 +94,12 @@ SSRF_GUARD=false
 #### 1. 下載並解壓縮 release
 ```bash
 wget https://github.com/asdfghj1237890/WebVideo2NAS/releases/latest/download/WebVideo2NAS-downloader-docker.zip
-mkdir -p docker
+unzip WebVideo2NAS-downloader-docker.zip       # 解壓出 docker/...
 cd docker
-unzip ../WebVideo2NAS-downloader-docker.zip
-cd video-downloader/docker
 mkdir -p ../logs ../downloads/completed
 ```
+
+zip 只含 compose 設定（≈3 KB）。統一 image 在 `docker compose up` 時從 `ghcr.io/asdfghj1237890/webvideo2nas` 拉 — 不用本地 build，也不用下載原始碼。
 
 #### 2. 建立 `.env`（新手只要改 2 個值）
 ```bash
@@ -124,8 +126,20 @@ echo "你的 API Key：${API_KEY}"
 
 #### 3. 部署與驗證
 ```bash
-docker-compose up -d
+# 改名讓 docker compose 預設能找到
+mv docker-compose_not_synology.yml docker-compose.yml
+
+docker compose pull          # 從 ghcr.io/asdfghj1237890/webvideo2nas:latest 拉
+docker compose up -d
 curl http://localhost:52052/api/health
+```
+
+要鎖在某個版本（不用 `latest`），在 `.env` 設定 `IMAGE_TAG`（例：`IMAGE_TAG=1.9.1`）。
+
+#### 4. 之後升級
+```bash
+docker compose pull
+docker compose up -d
 ```
 
 （其他 Linux 發行版細節請看 `README.md`）

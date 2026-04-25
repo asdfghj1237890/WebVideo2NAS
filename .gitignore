@@ -31,6 +31,8 @@ MANIFEST
 venv/
 ENV/
 env/
+.venv/
+.venv-*/
 
 # Node
 node_modules/

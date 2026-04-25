@@ -1,0 +1,28 @@
+# Exclude tests, dev artifacts, and Python caches from image build context
+api/tests/
+worker/tests/
+api/.venv-*/
+worker/.venv-*/
+.venv-*/
+**/__pycache__/
+**/.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Exclude old per-service Dockerfiles & lockfiles (replaced by docker/Dockerfile)
+api/Dockerfile
+api/requirements.in
+api/requirements.txt
+api/.dockerignore
+worker/Dockerfile
+worker/requirements.in
+worker/requirements.txt
+worker/.dockerignore
+
+# Documentation & compose files don't belong in the image
+*.md
+docker-compose*.yml
+init-db.sql
+test-api.sh

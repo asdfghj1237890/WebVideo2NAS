@@ -61,3 +61,24 @@ def test_download_request_rejects_non_standard_url_without_format_hint(monkeypat
 def test_rate_limit_read_bucket_has_higher_limit(monkeypatch):
     api_main = _reload_api_main(monkeypatch, RATE_LIMIT_PER_MINUTE="10")
     assert api_main._RATE_LIMIT_MULTIPLIERS["read"] > api_main._RATE_LIMIT_MULTIPLIERS["write"]
+
+
+def test_health_endpoint_requires_auth_even_for_localhost(monkeypatch):
+    """Regression: previously /api/health skipped auth when client IP looked
+    like localhost, which was bypassable via X-Forwarded-For: 127.0.0.1.
+    Auth is now mandatory regardless of source IP."""
+    from fastapi.testclient import TestClient
+
+    api_main = _reload_api_main(monkeypatch, API_KEY="test-key-not-the-default-placeholder")
+    with TestClient(api_main.app) as client:
+        # No auth → 401
+        r = client.get("/api/health")
+        assert r.status_code == 401, r.text
+
+        # Spoofed XFF used to grant auth-free access; should still be 401
+        r = client.get("/api/health", headers={"X-Forwarded-For": "127.0.0.1"})
+        assert r.status_code == 401, r.text
+
+        # Wrong key → 401
+        r = client.get("/api/health", headers={"Authorization": "Bearer wrong"})
+        assert r.status_code == 401, r.text

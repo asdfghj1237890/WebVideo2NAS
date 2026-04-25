@@ -50,16 +50,15 @@ services:
     networks:
       - video_network
 
-  # API Gateway (FastAPI)
+  # API Gateway (FastAPI) — uses the unified image with ROLE=api
   api:
-    build:
-      context: ./api
-      dockerfile: Dockerfile
+    image: ghcr.io/asdfghj1237890/webvideo2nas:${IMAGE_TAG:-latest}
     container_name: video_api
     restart: unless-stopped
     env_file:
       - .env
     environment:
+      - ROLE=api
       - API_KEY=${API_KEY:-change-this-key}
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-postgres_password}@db:5432/video_db
       - REDIS_URL=redis://redis:6379/0
@@ -78,7 +77,9 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      # /api/health now requires API_KEY. CMD-SHELL form so $API_KEY expands
+      # from the container env at probe time.
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$API_KEY\" http://localhost:8000/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -87,16 +88,15 @@ services:
       - video_network
     user: "1026:100"  # Match your Synology user
 
-  # Download Worker 1
+  # Download Worker 1 — same image, ROLE=worker
   worker:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile
+    image: ghcr.io/asdfghj1237890/webvideo2nas:${IMAGE_TAG:-latest}
     container_name: video_worker_1
     restart: unless-stopped
     env_file:
       - .env
     environment:
+      - ROLE=worker
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-postgres_password}@db:5432/video_db
       - REDIS_URL=redis://redis:6379/0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -117,16 +117,15 @@ services:
       - video_network
     user: "1026:100"  # Match your Synology user
 
-  # Download Worker 2
+  # Download Worker 2 — same image, ROLE=worker
   worker2:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile
+    image: ghcr.io/asdfghj1237890/webvideo2nas:${IMAGE_TAG:-latest}
     container_name: video_worker_2
     restart: unless-stopped
     env_file:
       - .env
     environment:
+      - ROLE=worker
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-postgres_password}@db:5432/video_db
       - REDIS_URL=redis://redis:6379/0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

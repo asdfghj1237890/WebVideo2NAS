@@ -174,9 +174,9 @@ You will do 3 things:
    - If you see permission errors later (can’t write to `/downloads`), re-check DSM folder permissions and try creating a test file in the downloads folder.
 
 ##### 3. Download & extract release (DSM UI)
-1. Download `WebVideo2NAS-downloader-docker.zip` from GitHub Releases
-2. Upload to `/volume1/docker/` with File Station and extract it
-3. You should have: `/volume1/docker/video-downloader/docker/`
+1. Download `WebVideo2NAS-downloader-docker.zip` from GitHub Releases (≈3 KB — only compose files; the actual image is pulled from GHCR at `ghcr.io/asdfghj1237890/webvideo2nas`)
+2. Upload to `/volume1/docker/video-downloader/` with File Station and extract it
+3. You should have: `/volume1/docker/video-downloader/docker/` containing `docker-compose.synology.yml`, `docker-compose_not_synology.yml`, `init-db.sql`, `.env.example`, `SYNOLOGY_DEPLOY_COMMANDS.md`
 
 ##### 4. Create `.env` (only 2 values are required)
 Create `/volume1/docker/video-downloader/docker/.env` (DSM text editor or upload from PC):
@@ -199,7 +199,9 @@ SSRF_GUARD=false
 1. In `/volume1/docker/video-downloader/docker/`, rename `docker-compose.synology.yml` → `docker-compose.yml`
 2. Open **Container Manager** → **Projects** → **Create**
 3. Select project folder: `/volume1/docker/video-downloader/docker`
-4. Finish the wizard and start the project
+4. Finish the wizard — Container Manager will pull the unified image from GHCR and start the project (api + 2 workers + db + redis + db_cleanup, all from one image)
+
+> **Updating later**: re-open the project and click **Action → Pull**, then **Restart**. Or via SSH: `cd /volume1/docker/video-downloader/docker && docker compose pull && docker compose up -d`
 
 ##### 6. Verify
 Open `http://YOUR_SYNOLOGY_IP:52052/api/health` → should return `{"status":"healthy"}`
@@ -212,12 +214,12 @@ Open `http://YOUR_SYNOLOGY_IP:52052/api/health` → should return `{"status":"he
 ##### 1. Download & extract release
 ```bash
 wget https://github.com/asdfghj1237890/WebVideo2NAS/releases/latest/download/WebVideo2NAS-downloader-docker.zip
-mkdir -p docker
+unzip WebVideo2NAS-downloader-docker.zip       # extracts docker/...
 cd docker
-unzip ../WebVideo2NAS-downloader-docker.zip
-cd video-downloader/docker
 mkdir -p ../logs ../downloads/completed
 ```
+
+The zip contains only compose files (~3 KB). The unified image is pulled from `ghcr.io/asdfghj1237890/webvideo2nas` at `up` time — no local build, no source code needed.
 
 ##### 2. Create `.env` (only 2 values are required)
 ```bash
@@ -244,8 +246,20 @@ echo "Your API Key: ${API_KEY}"
 
 ##### 3. Deploy & verify
 ```bash
-docker-compose up -d
+# rename so docker compose picks it up by default
+mv docker-compose_not_synology.yml docker-compose.yml
+
+docker compose pull          # pulls ghcr.io/asdfghj1237890/webvideo2nas:latest
+docker compose up -d
 curl http://localhost:52052/api/health
+```
+
+To pin to a specific version instead of `latest`, set `IMAGE_TAG` in your `.env` (e.g. `IMAGE_TAG=1.9.1`).
+
+##### 4. Updating later
+```bash
+docker compose pull
+docker compose up -d
 ```
 
 </details>
@@ -653,10 +667,14 @@ WebVideo2NAS/
 │   ├── icons/             # Extension icons
 │   └── manifest.json      # Extension manifest
 ├── video-downloader/      # NAS downloader
-│   └── docker/            # Docker services
-│       ├── api/           # FastAPI service
-│       ├── worker/        # Download worker
-│       ├── docker-compose.yml
+│   └── docker/            # Unified container (api + worker)
+│       ├── Dockerfile     # one image; entrypoint.sh dispatches by ROLE env
+│       ├── requirements.in   # source of truth for direct deps
+│       ├── requirements.txt  # pip-compile output: full transitive pins + SHA256
+│       ├── api/           # FastAPI source (ROLE=api)
+│       ├── worker/        # Download worker source (ROLE=worker)
+│       ├── tests/         # upgrade verification scripts
+│       ├── docker-compose_not_synology.yml
 │       ├── docker-compose.synology.yml
 │       └── init-db.sql
 ├── docs/                  # Architecture/specs/docs
@@ -738,6 +756,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
+
+### [1.9.1] - 2026-04-26
+> Note: this is the first release of the unified-image flow; v1.9.0 was reserved by an earlier mis-tagged commit and skipped.
+
+#### Changed
+- **Unified Docker image**: api + worker now ship as a single multi-arch image (`linux/amd64` + `linux/arm64`) at `ghcr.io/asdfghj1237890/webvideo2nas`. Services dispatch by `ROLE` env var (`api` / `worker`)
+- **GHCR distribution**: release zip slimmed to ~3 KB (compose + init-db.sql + .env.example only) — users `docker compose pull` instead of building from source
+- **Hash-locked Python deps**: `requirements.txt` regenerated via `pip-compile --generate-hashes`; `pip install --require-hashes` blocks supply-chain swaps
+- Sequential release workflow: GitHub Release is gated on the matching GHCR image being live, so `docker compose pull` immediately after the release email never 404s
+
+#### Security
+- **Fix `/api/health` auth bypass via spoofed `X-Forwarded-For: 127.0.0.1`**: the endpoint now requires the API key for all callers; the in-container Docker `HEALTHCHECK` sends it via Authorization header
+
+#### Removed
+- Dropped unused dependencies `aiohttp` and `aiofiles` (never imported by api or worker code)
+
+#### Build
+- Multi-arch image build with provenance attestation + SBOM (`docker/build-push-action@v6`)
 
 ### [1.8.9] - 2026-04-03
 
@@ -965,7 +1001,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 1.8.9  
+**Version**: 1.9.1  
 **Last Updated**: 2026-04-03  
 **Port**: 52052 (NAS host port → API container :8000)
 
