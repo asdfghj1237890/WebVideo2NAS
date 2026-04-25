@@ -32,7 +32,6 @@
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
 - [License](#license)
-- [Documentation](#documentation)
 - [Changelog](#changelog)
 - [Support](#support)
 
@@ -244,214 +243,47 @@ Synology UI: open the Project → **Action → Pull** → **Restart**.
 
 ## Configuration
 
-### Environment Variables (.env)
-```bash
-API_KEY=change-this-to-a-very-long-secure-key-minimum-32-chars
-DB_PASSWORD=ChangeThisPassword123!
+### Environment Variables
 
-# Logging
-LOG_LEVEL=INFO
+The full list with inline comments lives in [`.env.example`](video-downloader/docker/.env.example). The two **required** values are `API_KEY` and `DB_PASSWORD`; everything else has sensible defaults. The handful you'll most likely tune:
 
-# CORS (API)
-ALLOWED_ORIGINS=chrome-extension://*
-# Optional: allow credentials (requires explicit origins; wildcard will be rejected)
-CORS_ALLOW_CREDENTIALS=false
-
-# Worker tuning (per-video parallelism)
-MAX_DOWNLOAD_WORKERS=20
-MAX_RETRY_ATTEMPTS=3
-FFMPEG_THREADS=2
-
-# DB cleanup (db_cleanup service)
-# How often to prune finished jobs (seconds). Default: 3600 (1 hour)
-#CLEANUP_INTERVAL_SECONDS=3600
-
-# Security
-# Per-client rate limit for protected endpoints (0 disables)
-RATE_LIMIT_PER_MINUTE=10
-# Restrict who can call the API (comma-separated CIDRs)
-ALLOWED_CLIENT_CIDRS=
-# Basic SSRF guard for /api/download (blocks private/loopback/link-local/reserved destinations)
-SSRF_GUARD=false
-
-# Optional (insecure): TLS verification controls for tricky servers
-# INSECURE_SKIP_TLS_VERIFY=0
-# SSL_VERIFY=1
-```
+| Variable | Default | Effect |
+|---|---|---|
+| `IMAGE_TAG` | `latest` | Pin to a specific release (e.g. `1.9.2`) instead of tracking latest |
+| `LOG_LEVEL` | `INFO` | `DEBUG` for verbose troubleshooting; `WARNING` to quiet down |
+| `MAX_DOWNLOAD_WORKERS` | `20` | Per-worker thread pool for HLS segment downloads |
+| `FFMPEG_THREADS` | `2` | Threads ffmpeg uses during merge |
+| `RATE_LIMIT_PER_MINUTE` | `10` | Per-IP API rate limit (0 disables) |
+| `ALLOWED_CLIENT_CIDRS` | _(empty)_ | Comma-separated CIDRs permitted to call the API; empty = no restriction |
+| `SSRF_GUARD` | `false` | `true` blocks downloads targeting private/loopback/link-local hosts |
+| `CLEANUP_INTERVAL_SECONDS` | `3600` | How often `db_cleanup` prunes finished jobs (keeps latest 100) |
 
 ### Worker Scaling
-The system runs **2 workers** by default for parallel processing:
-- **Total capacity**: Up to 2 videos simultaneously (1 per worker)
-- **Scale up**: Add more workers in `docker-compose.yml` for higher throughput
-- **Scale down**: Remove `worker2` service for lower-spec NAS devices
+
+The default compose runs **2 download workers**. For higher throughput copy the `worker2` block into `worker3` / `worker4` / etc. For lower-spec hosts delete the `worker2` service.
 
 ### Extension Settings
-- **NAS Endpoint**: `https://192.168.1.100:52052`
-- **API Key**: Your configured API key
-- **Auto Detect**: Enable automatic M3U8/MP4 detection
-- **Notifications**: Enable completion notifications
 
-> **Note**: Click the extension icon to open the side panel for managing detected videos and monitoring downloads.
+In `chrome://extensions/` → **WebVideo2NAS** → **Settings**:
+- **NAS Endpoint**: `http://YOUR_NAS_IP:52052` (LAN IP, not `localhost`)
+- **API Key**: same value as `API_KEY` in `.env`
+- **Auto Detect**: surfaces M3U8/MP4 URLs as you browse
+- **Notifications**: completion alerts
 
 ## Security
 
-### Quick Security Notes
-
-⚠️ **Important Security Considerations:**
-- Use HTTPS with valid SSL certificate
-- Keep API key secret
-- Consider using VPN/Tailscale for remote access
-- Implement rate limiting
-- Regularly update Docker images
-
-<details>
-<summary><strong>Full Security Policy (click to expand)</strong></summary>
-
-### Supported Versions
-
-Currently, the following versions are being supported with security updates:
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
-| < 1.0   | :x:                |
+⚠️ **Important:**
+- **Don't expose this service directly to the public internet.** Keep it on your LAN, or behind a VPN (Tailscale, WireGuard, etc.).
+- Keep `API_KEY` secret. Generate strong: `openssl rand -base64 32`. Never commit `.env`.
+- For tighter access control, set `ALLOWED_CLIENT_CIDRS` to your LAN range and `SSRF_GUARD=true`.
+- Pin `IMAGE_TAG` to a specific version and review the changelog before upgrading.
+- Out of scope: DRM bypass, public-internet hosting, multi-tenant deployments.
 
 ### Reporting a Vulnerability
 
-If you discover a security vulnerability within WebVideo2NAS, please follow these steps:
+Please open a [GitHub Security Advisory](https://github.com/asdfghj1237890/WebVideo2NAS/security/advisories/new). **Do not** open a public issue.
 
-#### Do NOT
-
-- **Do not** open a public GitHub issue
-- **Do not** disclose the vulnerability publicly until it has been addressed
-
-#### Please DO
-
-1. **Email** the maintainers privately (create a security advisory on GitHub)
-2. **Provide** detailed information about the vulnerability:
-   - Type of issue (e.g., authentication bypass, SQL injection, XSS)
-   - Full paths of affected source files
-   - Location of the affected code (tag/branch/commit)
-   - Step-by-step instructions to reproduce the issue
-   - Proof-of-concept or exploit code (if possible)
-   - Impact of the vulnerability
-
-#### What to Expect
-
-- **Acknowledgment**: Within 48 hours
-- **Initial Assessment**: Within 5 business days
-- **Status Update**: Every 7 days until resolved
-- **Fix Release**: Depends on severity (Critical: 7 days, High: 14 days, Medium: 30 days)
-
-### Security Best Practices
-
-#### For Users
-
-1. **API Key Security**
-   - Generate strong API keys (minimum 32 characters)
-   - Use `openssl rand -base64 32` to generate secure keys
-   - Never commit `.env` files to version control
-   - Rotate API keys periodically
-
-2. **Network Security**
-   - Use HTTPS in production (not HTTP)
-   - Configure proper firewall rules
-   - Limit API access to trusted networks
-   - Consider using VPN or Tailscale for remote access
-
-3. **Docker Security**
-   - Keep Docker images updated
-   - Run containers as non-root users when possible
-   - Limit container capabilities
-   - Use Docker secrets for sensitive data
-
-4. **Database Security**
-   - Use strong database passwords
-   - Restrict database access to localhost
-   - Regular database backups
-   - Enable PostgreSQL SSL connections in production
-
-#### For Developers
-
-1. **Code Security**
-   - Validate all user inputs
-   - Use parameterized queries (already implemented)
-   - Sanitize file paths
-   - Implement rate limiting (already implemented)
-
-2. **Dependency Security**
-   - Regularly update dependencies
-   - Use `pip audit` to check for vulnerable packages
-   - Review dependencies before adding new ones
-
-3. **Testing**
-   - Test with various malicious inputs
-   - Check for path traversal vulnerabilities
-   - Verify authentication on all endpoints
-   - Test CORS configuration
-
-### Known Security Considerations
-
-#### Current Implementation
-
-1. **Authentication**: API Key-based (Bearer token)
-   - Simple but effective for private NAS deployments
-   - Consider OAuth2 for multi-user scenarios
-
-2. **CORS**: Configured for Chrome extensions
-   - Default: `chrome-extension://*`
-   - Adjust for your specific needs
-
-3. **Rate Limiting**: Basic implementation
-   - Default: 10 requests per minute
-   - Configurable via environment variables
-
-4. **File System Access**:
-   - Limited to configured download directories
-   - No user-provided file paths accepted
-
-#### Limitations
-
-1. **DRM Content**: This tool cannot and should not be used to bypass DRM
-2. **Copyright**: Users are responsible for ensuring legal rights to download content
-3. **Public Exposure**: Not designed for public internet exposure without additional security layers
-
-### Recommended Production Setup
-
-```bash
-# Strong credentials
-API_KEY=$(openssl rand -base64 32)
-DB_PASSWORD=$(openssl rand -base64 24)
-
-# Network restrictions
-ALLOWED_ORIGINS=chrome-extension://your-extension-id
-
-# Monitoring
-LOG_LEVEL=INFO
-```
-
-### Security Checklist
-
-Before deploying to production:
-
-- [ ] Change default passwords
-- [ ] Generate strong API keys
-- [ ] Configure HTTPS with valid certificate
-- [ ] Set up firewall rules
-- [ ] Enable rate limiting
-- [ ] Configure proper CORS
-- [ ] Review and restrict file system access
-- [ ] Set up log monitoring
-- [ ] Regular security updates
-- [ ] Backup strategy in place
-
-### Contact
-
-For security concerns, please use GitHub Security Advisories feature or contact the maintainers directly.
-
-**Last Updated**: 2025-12-12
-
-</details>
+When reporting, include: type of issue, affected file path / commit, reproduction steps, and (if possible) PoC and impact assessment.
 
 ## Limitations
 
@@ -462,221 +294,45 @@ For security concerns, please use GitHub Security Advisories feature or contact 
 
 ## Troubleshooting
 
+For first-run / install issues see the [Common issues table](#common-issues) at the end of Installation.
+
 ### Extension can't connect to NAS
-- Verify NAS IP and port
-- Check firewall rules
-- Ensure Docker service is running: `docker-compose ps`
+- `http://YOUR_NAS_IP:52052` — use the LAN IP, not `localhost`
+- `docker compose ps` — confirm `video_api` is `Up` and `(healthy)`
+- Synology / Linux firewall blocking 52052?
 
 ### Download fails
-- Check logs: `docker-compose logs worker`
-- Verify video URL is accessible
-- Check disk space on NAS
-- For authenticated streams, ensure cookies are being captured
+- `docker compose logs -f worker` — failure reason is usually one error line
+- For authenticated streams: confirm the extension captured cookies for the manifest's domain (extension Settings → check the captured-headers panel)
+- HTTP 403/474 from segment downloads usually means the URL has expired — re-detect from a fresh page load
+- Disk full? `df -h /downloads`
 
 ### Slow downloads
-- Reduce concurrent downloads in .env
-- Check NAS CPU/RAM usage
-- Verify network bandwidth
+- Lower `MAX_DOWNLOAD_WORKERS` in `.env` (NAS CPU saturated)
+- The site may be throttling; check segment download rate in worker logs
+- Network: verify NAS upload bandwidth from another LAN device
 
 ## Contributing
 
-Thank you for your interest in contributing! This document provides guidelines and instructions for contributing to this project.
+PRs welcome.
 
-<details>
-<summary><strong>Contributing Guide (click to expand)</strong></summary>
+1. Fork → branch (`feature/...` or `fix/...`)
+2. Run the test suite locally — same as CI:
+   - Python: `bash video-downloader/docker/tests/run_upgrade_check.sh`
+   - Extension: `cd chrome-extension && npm test`
+3. Open a PR against `main` with a clear description and link any related issue
 
-### Getting Started
+**Code style:** Python follows PEP 8 + type hints; JavaScript is ES6+ with `const`/`let` and async/await. Match the surrounding file. No formatter is enforced.
 
-1. **Read the Documentation**
-   - [README.md](README.md) - Project overview
-   - [docs/SPECIFICATION.md](docs/SPECIFICATION.md) - Technical specification
-   - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - System architecture
+**Project layout:** see [Project Structure](#project-structure) above. Architecture docs and API specs live in [`docs/`](docs/).
 
-2. **Set Up Development Environment**
-   - Docker & Docker Compose
-   - Python 3.11+
-   - Chrome browser with Developer mode
-   - Code editor of your choice
+**Reporting issues:** open a [GitHub Issue](https://github.com/asdfghj1237890/WebVideo2NAS/issues) with reproduction steps, expected vs actual behavior, and environment details (OS, Docker version, NAS model). For security issues see [Reporting a Vulnerability](#reporting-a-vulnerability) — do **not** open a public issue.
 
-### Development Workflow
-
-#### 1. Fork and Clone
-```bash
-git clone https://github.com/yourusername/webvideo2nas.git
-cd webvideo2nas
-```
-
-#### 2. Create a Branch
-```bash
-git checkout -b feature/your-feature-name
-# or
-git checkout -b fix/your-bug-fix
-```
-
-#### 3. Make Changes
-- Follow existing code style
-- Write clear, descriptive commit messages
-- Keep commits focused and atomic
-- Add tests for new features
-- Update documentation as needed
-
-#### 4. Test Your Changes
-
-**Backend (Docker Services):**
-```bash
-cd video-downloader/docker
-docker-compose up --build
-# Test API endpoints
-./test-api.sh
-```
-
-**Chrome Extension:**
-```bash
-cd chrome-extension
-# Load unpacked extension in Chrome
-# Test functionality manually
-```
-
-#### 5. Submit Pull Request
-- Push your branch to your fork
-- Create a pull request to the main repository
-- Describe your changes clearly
-- Reference any related issues
-
-### Code Style Guidelines
-
-#### Python
-- Follow PEP 8
-- Use type hints where appropriate
-- Keep functions focused and small
-- Add docstrings for classes and public methods
-
-Example:
-```python
-def download_segment(url: str, timeout: int = 30) -> bytes:
-    """
-    Download a single HLS segment.
-    
-    Args:
-        url: The segment URL
-        timeout: Request timeout in seconds
-        
-    Returns:
-        The segment content as bytes
-        
-    Raises:
-        DownloadError: If download fails
-    """
-    pass
-```
-
-#### JavaScript
-- Use ES6+ features
-- Use `const` and `let`, avoid `var`
-- Use async/await for asynchronous operations
-- Keep functions focused and small
-
-Example:
-```javascript
-async function detectM3u8Urls(details) {
-  const url = details.url.toLowerCase();
-  if (url.includes('.m3u8')) {
-    await notifyUrlDetected(details.url);
-  }
-}
-```
-
-### Project Structure
-
-```
-WebVideo2NAS/
-├── chrome-extension/      # Chrome extension source
-│   ├── background.js      # Background service worker
-│   ├── content.js         # Content script (ISOLATED world)
-│   ├── inject.js          # Manifest interceptor (MAIN world)
-│   ├── sidepanel.*        # Extension side panel UI
-│   ├── options/           # Extension options page
-│   ├── icons/             # Extension icons
-│   └── manifest.json      # Extension manifest
-├── video-downloader/      # NAS downloader
-│   └── docker/            # Unified container (api + worker)
-│       ├── Dockerfile     # one image; entrypoint.sh dispatches by ROLE env
-│       ├── requirements.in   # source of truth for direct deps
-│       ├── requirements.txt  # pip-compile output: full transitive pins + SHA256
-│       ├── api/           # FastAPI source (ROLE=api)
-│       ├── worker/        # Download worker source (ROLE=worker)
-│       ├── tests/         # upgrade verification scripts
-│       ├── docker-compose_not_synology.yml
-│       ├── docker-compose.synology.yml
-│       └── init-db.sql
-├── docs/                  # Architecture/specs/docs
-└── pics/                  # Diagrams
-```
-
-### What to Contribute
-
-#### High Priority
-- M3U8 parser improvements
-- FFmpeg integration enhancements
-- Chrome extension features
-- Bug fixes
-- Performance optimizations
-- Documentation improvements
-
-#### Medium Priority
-- Unit tests
-- Integration tests
-- Error handling improvements
-- Logging enhancements
-- UI/UX improvements
-
-#### Nice to Have
-- Additional NAS platform support
-- Advanced retry strategies
-- Download resume capability
-- Bandwidth throttling
-- Scheduled downloads
-
-### Reporting Issues
-
-When reporting issues, please include:
-- Clear description of the problem
-- Steps to reproduce
-- Expected behavior
-- Actual behavior
-- Environment details (OS, Docker version, NAS model, etc.)
-- Relevant logs or error messages
-
-### Code Review Process
-
-1. Maintainers will review your pull request
-2. Address any feedback or requested changes
-3. Once approved, your PR will be merged
-4. Your contribution will be acknowledged in release notes
-
-### Questions?
-
-- Check existing issues and discussions
-- Read the documentation thoroughly
-- Ask questions in GitHub Discussions
-
-### License
-
-By contributing, you agree that your contributions will be licensed under the MIT License.
-
-</details>
+By contributing you agree to license your work under the MIT License.
 
 ## License
 
-MIT License - See LICENSE file for details
-
-## Documentation
-
-- 📖 [Installation Guide](#installation) - Complete setup instructions
-- 🏗️ [Technical Documentation](docs/) - Architecture, specifications, and implementation details
-- 🔒 [Security Policy](#security) - Security guidelines and reporting
-- 🤝 [Contributing](#contributing) - How to contribute
-- 📝 [Changelog](#changelog) - Version history
+MIT License — see [LICENSE](LICENSE).
 
 <a id="changelog"></a>
 ## Changelog
