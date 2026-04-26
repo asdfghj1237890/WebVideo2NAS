@@ -4,63 +4,131 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WebVideo2NAS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="sidepanel.css">
 </head>
 <body>
-  <div class="sidepanel-wrapper">
-    <div class="container">
-    <!-- Header -->
-    <div class="header">
-      <div id="connectionStatus" class="connection-status">
-        <span id="statusIcon" class="status-icon">⏳</span>
-        <span id="statusText" class="status-text">Checking...</span>
-      </div>
-      <div class="header-actions">
-        <button id="refreshBtn" class="icon-btn" title="Refresh">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
-          </svg>
-        </button>
-        <button id="settingsBtn" class="icon-btn" title="Settings">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
-            <circle cx="12" cy="12" r="3"/>
-          </svg>
-        </button>
-      </div>
-    </div>
+  <div class="frame">
+    <div class="ambient" aria-hidden="true"></div>
+    <div class="frame-inner">
 
-    <!-- Detected URLs Section -->
-    <div class="section">
-      <div class="section-header">
-        <h2 id="detectedVideosTitle">Detected Videos</h2>
+      <!-- Header -->
+      <header class="wv-header">
+        <div class="brand-block">
+          <div class="brand">WebVideo2NAS</div>
+          <div class="status-row">
+            <div id="connectionStatus" class="conn-chip checking" title="">
+              <span id="statusIcon" class="conn-dot" aria-hidden="true"></span>
+              <span id="statusText" class="conn-text">Checking...</span>
+            </div>
+            <span id="detectedCountBadge" class="count-badge" hidden>
+              <span class="pulse-dot" aria-hidden="true"></span>
+              <span id="detectedCountText">0 on page</span>
+            </span>
+          </div>
+        </div>
+        <div class="header-right">
+          <button id="themeToggleBtn" class="icon-btn theme-toggle" type="button" title="Toggle theme">
+            <span class="icon-slot icon-sun-slot" aria-hidden="true">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="8" cy="8" r="2.6" fill="currentColor"/>
+                <path d="M8 0.5v2M8 13.5v2M15.5 8h-2M2.5 8h-2M13.3 2.7l-1.4 1.4M4.1 11.9l-1.4 1.4M13.3 13.3l-1.4-1.4M4.1 4.1L2.7 2.7"/>
+              </svg>
+            </span>
+            <span class="icon-slot icon-moon-slot" aria-hidden="true">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M13.5 10A6 6 0 1 1 6 2.5a4.8 4.8 0 0 0 7.5 7.5z" fill="currentColor" fill-opacity="0.15"/>
+              </svg>
+            </span>
+          </button>
+          <button id="refreshBtn" class="icon-btn" type="button" title="Refresh">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 3v4h-4M2 13V9h4M3 7a5 5 0 0 1 9-2M13 9a5 5 0 0 1-9 2"/>
+            </svg>
+          </button>
+          <button id="settingsBtn" class="icon-btn" type="button" title="Settings">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 4h6M11 4h3M2 8h3M8 8h6M2 12h8M13 12h1"/>
+              <circle cx="9.5" cy="4" r="1.4" fill="currentColor"/>
+              <circle cx="6.5" cy="8" r="1.4" fill="currentColor"/>
+              <circle cx="11.5" cy="12" r="1.4" fill="currentColor"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- Toolbar (only visible in many-mode) -->
+      <div id="toolbar" class="toolbar" hidden>
+        <div class="search">
+          <span class="search-icon" aria-hidden="true">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="7" cy="7" r="4"/><path d="M10 10l3.5 3.5"/>
+            </svg>
+          </span>
+          <input id="searchInput" class="search-input" type="text" placeholder="filter…" autocomplete="off">
+        </div>
+        <div id="qualityChips" class="chips"></div>
       </div>
 
-      <div id="detectedUrlsList" class="url-list">
-        <div class="empty-state">
-          <p id="detectedEmptyTitle">🔍 No videos detected yet</p>
-          <p id="detectedEmptyHint" class="hint">Browse to a video streaming site</p>
+      <!-- Body: two independently scrolling panes -->
+      <div class="body">
+        <div class="pane detected-pane wv2n-scroll">
+          <div class="section-label">
+            <span id="detectedVideosTitle">Detected on this page</span>
+            <span id="detectedCountSuffix" class="count-suffix"></span>
+          </div>
+          <div id="detectedUrlsList" class="grid">
+            <div class="empty-state">
+              <p id="detectedEmptyTitle">No videos detected yet</p>
+              <p id="detectedEmptyHint" class="hint">Browse to a video streaming site</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="pane-divider" aria-hidden="true"></div>
+
+        <div class="pane recent-pane wv2n-scroll">
+          <div class="section-label" id="recentHeader">
+            <span id="recentDownloadsTitle">Recent on NAS</span>
+            <button class="view-all" id="sortBtn" type="button" title="">
+              <span id="sortBtnLabel">newest</span>
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                   stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 3v10M5 3L3 5M5 3l2 2M11 13V3M11 13l-2-2M11 13l2-2"/>
+              </svg>
+            </button>
+          </div>
+          <div id="recentJobsList" class="jobs">
+            <div class="empty-state">
+              <p id="jobsEmptyTitle">No recent downloads on NAS</p>
+            </div>
+          </div>
         </div>
       </div>
-    </div>
 
-    <!-- Recent Jobs Section -->
-    <div class="section">
-      <div class="section-header">
-        <h2 id="recentDownloadsTitle">Recent Downloads on NAS</h2>
-      </div>
-
-      <div id="recentJobsList" class="job-list">
-        <div class="empty-state">
-          <p id="jobsEmptyTitle">📥 No recent downloads on NAS</p>
+      <!-- Bulk action bar (only in many-mode) -->
+      <div id="bulkBar" class="bulk-bar" hidden>
+        <div class="bulk-grow">
+          <div id="bulkLine1" class="bulk-line1">0 detected</div>
+          <div id="bulkLine2" class="bulk-line2"></div>
         </div>
+        <button id="bulkBtn" class="bulk-btn" type="button">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+               stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 8h10M9 4l4 4-4 4"/>
+          </svg>
+          <span id="bulkBtnText">Send all</span>
+        </button>
       </div>
-    </div>
 
-    <!-- Footer -->
-    <div class="footer">
     </div>
-  </div>
   </div>
 
   <script src="i18n.js"></script>

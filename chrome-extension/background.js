@@ -18,6 +18,16 @@ let capturedHeaders = {};
 // Key: tabId, Value: { videoSrc, videoIndex, videoCount, pageUrl, timestamp, matchedUrl }
 let userClickedVideoByTab = {};
 
+// Cached thumbnails per tab from content.js
+// Key: tabId, Value: { pageUrl, pageThumbnail, posters: [{ poster, src, index }] }
+let pageThumbnailsByTab = {};
+
+// Cached video duration / live status per URL
+// Key: url, Value: { duration: number|null, isLive: bool, ts: number }
+let videoMetaByUrl = {};
+let videoMetaProbing = new Set();
+const VIDEO_META_MAX_ENTRIES = 500;
+
 // User settings
 let userSettings = {
   autoDetect: true,
@@ -142,6 +152,149 @@ function safeOrigin(u) {
     return new URL(u).origin;
   } catch (_) {
     return null;
+  }
+}
+
+// Attach a thumbnail (poster match → page og:image) to each URL row.
+function enrichWithThumbnails(rows, tabId) {
+  const cache = pageThumbnailsByTab[tabId];
+  const posters = (cache && Array.isArray(cache.posters)) ? cache.posters : [];
+  const fallback = (cache && cache.pageThumbnail) || null;
+  return rows.map((row) => {
+    if (!row || !row.url) return row;
+    let next = row;
+
+    // --- thumbnail ---
+    if (cache) {
+      let thumb = null;
+      for (const p of posters) {
+        if (!p || !p.poster) continue;
+        if (p.src && p.src === row.url) { thumb = p.poster; break; }
+      }
+      if (!thumb && fallback) thumb = fallback;
+      if (thumb) next = { ...next, thumbnail: thumb };
+    }
+
+    // --- duration / live ---
+    const meta = videoMetaByUrl[row.url];
+    if (meta) {
+      if (meta.isLive) next = { ...next, isLive: true };
+      else if (meta.duration != null) next = { ...next, duration: meta.duration };
+    }
+    return next;
+  });
+}
+
+// ---- Duration / live probe (m3u8 + mpd) ----
+function rememberVideoMeta(url, value, tabId) {
+  videoMetaByUrl[url] = { ...value, ts: Date.now() };
+  // Bound the cache: simple FIFO trim by insertion order.
+  const keys = Object.keys(videoMetaByUrl);
+  if (keys.length > VIDEO_META_MAX_ENTRIES) {
+    const drop = keys.slice(0, keys.length - VIDEO_META_MAX_ENTRIES);
+    for (const k of drop) delete videoMetaByUrl[k];
+  }
+  if (tabId != null && tabId >= 0) {
+    notifyDetectedUrlsUpdated(tabId);
+  }
+}
+
+function parseISO8601Duration(s) {
+  // Subset: PT[H][M][S], floats allowed on seconds.
+  const m = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(String(s || ''));
+  if (!m) return null;
+  return (parseFloat(m[1] || 0) * 3600) + (parseFloat(m[2] || 0) * 60) + parseFloat(m[3] || 0);
+}
+
+async function probeM3u8(url, depth) {
+  if (depth > 1) return null;
+  let res;
+  try { res = await fetch(url, { credentials: 'omit', cache: 'no-store' }); }
+  catch (_) { return null; }
+  if (!res.ok) return null;
+  const text = await res.text();
+  const lines = text.split(/\r?\n/);
+
+  // Master playlist? — descend into the first variant.
+  const streamIdx = lines.findIndex(l => l.startsWith('#EXT-X-STREAM-INF'));
+  if (streamIdx >= 0) {
+    let pick = null;
+    for (let i = streamIdx; i < lines.length - 1; i++) {
+      if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+        pick = (lines[i + 1] || '').trim();
+        if (pick && !pick.startsWith('#')) break;
+      }
+    }
+    if (!pick) return null;
+    let absolute;
+    try { absolute = new URL(pick, url).href; } catch (_) { return null; }
+    return probeM3u8(absolute, depth + 1);
+  }
+
+  // Media playlist — sum #EXTINF; require ENDLIST for VOD, otherwise treat as live.
+  const hasEndlist = lines.some(l => l.startsWith('#EXT-X-ENDLIST'));
+  let total = 0;
+  for (const line of lines) {
+    const m = /^#EXTINF:([0-9]+(?:\.[0-9]+)?)/.exec(line);
+    if (m) total += parseFloat(m[1]);
+  }
+  if (!hasEndlist) return { duration: null, isLive: true };
+  if (total <= 0) return null;
+  return { duration: total, isLive: false };
+}
+
+async function probeMpd(url) {
+  let res;
+  try { res = await fetch(url, { credentials: 'omit', cache: 'no-store' }); }
+  catch (_) { return null; }
+  if (!res.ok) return null;
+  const text = await res.text();
+  // Live profile? Most live MPDs have type="dynamic".
+  const isLive = /\btype\s*=\s*["']dynamic["']/.test(text);
+  if (isLive) return { duration: null, isLive: true };
+  const m = /\bmediaPresentationDuration\s*=\s*["']([^"']+)["']/.exec(text);
+  if (!m) return null;
+  const d = parseISO8601Duration(m[1]);
+  if (d == null || d <= 0) return null;
+  return { duration: d, isLive: false };
+}
+
+async function probeVideoMeta(row, tabId) {
+  if (!row || !row.url) return;
+  const url = row.url;
+  // hasOwnProperty so a stored "failed" entry still counts as cached.
+  if (Object.prototype.hasOwnProperty.call(videoMetaByUrl, url)) return;
+  if (videoMetaProbing.has(url)) return;
+
+  const lower = url.toLowerCase();
+  const fmt = String(row.detectedFormat || '').toLowerCase();
+  let probeFn = null;
+  if (lower.includes('.m3u8') || fmt === 'm3u8') probeFn = () => probeM3u8(url, 0);
+  else if (lower.includes('.mpd') || fmt === 'mpd') probeFn = () => probeMpd(url);
+  else return; // mp4 etc. — no cheap probe
+
+  videoMetaProbing.add(url);
+  try {
+    const result = await probeFn();
+    if (result) {
+      console.log('[WV2N probe] duration =', result.duration, 'live =', result.isLive, '←', url);
+      rememberVideoMeta(url, result, tabId);
+    } else {
+      console.log('[WV2N probe] no duration found ←', url);
+      // Negative cache so we don't refetch on every refresh.
+      videoMetaByUrl[url] = { duration: null, isLive: false, ts: Date.now() };
+    }
+  } catch (e) {
+    console.log('[WV2N probe] failed:', e && e.message, '←', url);
+    videoMetaByUrl[url] = { duration: null, isLive: false, ts: Date.now() };
+  } finally {
+    videoMetaProbing.delete(url);
+  }
+}
+
+function scheduleProbesForRows(rows, tabId) {
+  for (const row of rows) {
+    if (row && row.url) probeVideoMeta(row, tabId);
   }
 }
 
@@ -526,6 +679,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete currentTabUrls[tabId];
   delete currentTabUrlKeys[tabId];
   delete userClickedVideoByTab[tabId];
+  delete pageThumbnailsByTab[tabId];
 });
 
 // Clear detected URLs when page navigates or reloads
@@ -535,6 +689,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
     currentTabUrls[details.tabId] = [];
     currentTabUrlKeys[details.tabId] = new Set();
     delete userClickedVideoByTab[details.tabId];
+    delete pageThumbnailsByTab[details.tabId];
     updateBadge(details.tabId);
     chrome.storage.local.set({ detectedUrls: Array.from(detectedUrls) });
   }
@@ -882,6 +1037,20 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 // Listen for messages from sidepanel and content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // Handle thumbnails scraped from the page (og:image + <video poster>)
+  if (request.action === 'pageThumbnails') {
+    const tabId = sender.tab?.id;
+    if (tabId != null && tabId >= 0) {
+      pageThumbnailsByTab[tabId] = {
+        pageUrl: request.pageUrl || '',
+        pageThumbnail: request.pageThumbnail || null,
+        posters: Array.isArray(request.videoPosters) ? request.videoPosters : [],
+      };
+    }
+    sendResponse({ success: true });
+    return;
+  }
+
   // Handle manifest detected by inject.js (fetch/XHR interception)
   if (request.action === 'manifestDetected') {
     const tabId = sender.tab?.id;
@@ -965,7 +1134,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.tabs.get(requestedTabId, (tab) => {
         // If the tab no longer exists, fall back to per-tab list only.
         const tabUrl = tab && tab.url ? tab.url : '';
-        sendResponse({ urls: getSortedUrlsForTabWithOrphans(requestedTabId, tabUrl) });
+        const urls = enrichWithThumbnails(
+          getSortedUrlsForTabWithOrphans(requestedTabId, tabUrl),
+          requestedTabId
+        );
+        scheduleProbesForRows(urls, requestedTabId);
+        sendResponse({ urls });
       });
       return true;
     }
@@ -975,7 +1149,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if (tabs[0]) {
         chrome.tabs.get(tabs[0].id, (tab) => {
           const tabUrl = tab && tab.url ? tab.url : (tabs[0].url || '');
-          const urls = getSortedUrlsForTabWithOrphans(tabs[0].id, tabUrl);
+          const urls = enrichWithThumbnails(
+            getSortedUrlsForTabWithOrphans(tabs[0].id, tabUrl),
+            tabs[0].id
+          );
+          scheduleProbesForRows(urls, tabs[0].id);
           sendResponse({ urls });
         });
       } else {

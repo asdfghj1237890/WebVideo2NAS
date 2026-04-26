@@ -4,211 +4,362 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WebVideo2NAS Settings</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="options.css">
 </head>
 <body>
-  <div class="container">
-    <header>
-      <h1>
-        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="logo-icon">
-          <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect>
-          <line x1="7" y1="2" x2="7" y2="22"></line>
-          <line x1="17" y1="2" x2="17" y2="22"></line>
-          <line x1="2" y1="12" x2="22" y2="12"></line>
-          <line x1="2" y1="7" x2="7" y2="7"></line>
-          <line x1="2" y1="17" x2="7" y2="17"></line>
-          <line x1="17" y1="17" x2="22" y2="17"></line>
-          <line x1="17" y1="7" x2="22" y2="7"></line>
+  <div class="frame">
+
+    <!-- Terminal title bar -->
+    <header class="title-bar">
+      <div class="win-dots" aria-hidden="true">
+        <span class="dot-r"></span>
+        <span class="dot-y"></span>
+        <span class="dot-g"></span>
+      </div>
+      <div class="filename">
+        <span>~/.config/webvideo2nas/</span><span class="accent" id="titleFilename">connection.toml</span><span> — webvideo2nas</span>
+      </div>
+      <button id="themeToggleBtn" class="theme-toggle" type="button" title="Toggle theme">
+        <svg id="themeIconSun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;">
+          <circle cx="12" cy="12" r="4"/>
+          <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
         </svg>
-        WebVideo2NAS
-      </h1>
-      <p id="optionsSubtitle" class="subtitle">Configure your NAS connection and extension preferences</p>
+        <svg id="themeIconMoon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>
+        </svg>
+      </button>
     </header>
 
-    <div class="layout-grid">
-      <!-- Main Column: Settings -->
-      <div class="main-column">
-        
-        <!-- NAS Config Card -->
-        <div class="card">
-          <h2 id="nasConfigTitle">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 17l6-6-6-6"/>
-              <path d="M12 19h8"/>
-              <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
-              <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
-              <line x1="6" y1="6" x2="6.01" y2="6"/>
-              <line x1="6" y1="18" x2="6.01" y2="18"/>
+    <!-- Body: sidebar + main editor pane -->
+    <div class="body">
+
+      <!-- SIDEBAR -->
+      <aside class="sidebar">
+        <div class="brand-row">
+          <span class="brand-mark" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="6" rx="1.5"/>
+              <rect x="3" y="14" width="18" height="6" rx="1.5"/>
+              <circle cx="7" cy="7" r="0.6" fill="currentColor"/>
+              <circle cx="7" cy="17" r="0.6" fill="currentColor"/>
             </svg>
-            NAS Configuration
-          </h2>
-          
-          <div class="form-group">
-            <label for="nasEndpoint">
-              <span id="nasEndpointLabel">NAS Endpoint URL</span>
-              <span class="required">*</span>
-            </label>
-            <input 
-              type="text" 
-              id="nasEndpoint" 
-              placeholder="http://192.168.1.100:52052"
-              autocomplete="off"
-            >
-            <p id="nasEndpointHelp" class="help-text">
-              Format: <code>http://YOUR_NAS_IP:PORT</code><br>
-              Example: <code>http://192.168.50.181:52052</code>
-            </p>
+          </span>
+          <div class="brand-text">
+            <div class="name">WebVideo2NAS</div>
+            <div class="ver">v<span id="extVersion">-</span></div>
           </div>
-
-          <div class="form-group">
-            <label for="apiKey">
-              <span id="apiKeyLabel">API Key</span>
-              <span class="required">*</span>
-            </label>
-            <input 
-              type="password" 
-              id="apiKey" 
-              placeholder="Enter your API key"
-              autocomplete="off"
-            >
-            <p id="apiKeyHelp" class="help-text">
-              Find this in your NAS <code>.env</code> file
-            </p>
-          </div>
-
-          <div class="form-actions">
-            <button id="testBtn" class="btn-secondary">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="11" cy="11" r="8"/>
-                <path d="m21 21-4.35-4.35"/>
-              </svg>
-              <span id="testBtnText">Test Connection</span>
-            </button>
-            <button id="saveBtn" class="btn-primary">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
-                <polyline points="17 21 17 13 7 13 7 21"/>
-                <polyline points="7 3 7 8 15 8"/>
-              </svg>
-              <span id="saveBtnText">Save Settings</span>
-            </button>
-          </div>
-
-          <div id="statusMessage" class="status-message" style="display: none;"></div>
         </div>
 
-        <!-- Preferences Card -->
-        <div class="card">
-          <h2 id="downloadPreferencesTitle">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="3"></circle>
-              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-            </svg>
-            Preferences
-          </h2>
+        <div class="sidebar-section-label">── files ──</div>
 
-          <div class="form-group">
-            <label id="uiLanguageLabel" for="uiLanguage">Side Panel language</label>
-            <select id="uiLanguage">
-              <option value="">Auto (browser language)</option>
-              <option value="zh-TW">中文（繁體）</option>
-              <option value="zh-CN">中文（简体）</option>
-              <option value="en">English</option>
-              <option value="ja">日本語</option>
-              <option value="ko">한국어</option>
-              <option value="fr">Français</option>
-              <option value="es">Español</option>
-              <option value="pt">Português</option>
-            </select>
-            <p id="uiLanguageHelp" class="help-text">Applies to the Side Panel UI.</p>
-          </div>
-          
-          <div class="form-group checkbox-group">
-            <input type="checkbox" id="autoDetect" checked>
-            <div class="checkbox-content">
-              <label for="autoDetect" id="autoDetectLabel">Auto-detect video URLs</label>
-              <p id="autoDetectHelp" class="help-text">
-                Automatically detect M3U8 and MP4 URLs when browsing
-              </p>
-            </div>
-          </div>
+        <nav class="nav" id="navList">
+          <button class="nav-item active" type="button" data-nav="connection">
+            <span class="nav-arrow">▸</span>
+            <span class="nav-icon">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+                <polyline points="14 3 14 9 20 9"/>
+              </svg>
+            </span>
+            <span class="nav-label">connection.toml</span>
+          </button>
 
-          <div class="form-group checkbox-group">
-            <input type="checkbox" id="showNotifications" checked>
-            <div class="checkbox-content">
-              <label for="showNotifications" id="showNotificationsLabel">Show notifications</label>
-              <p id="showNotificationsHelp" class="help-text">
-                Show notifications when download is submitted
-              </p>
-            </div>
+          <button class="nav-item" type="button" data-nav="profiles">
+            <span class="nav-arrow">▸</span>
+            <span class="nav-icon">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/>
+                <polyline points="3 3 3 8 8 8"/>
+                <path d="M12 7v5l3 2"/>
+              </svg>
+            </span>
+            <span class="nav-label">profiles.toml</span>
+            <span class="nav-count" id="profileCount">1</span>
+          </button>
+
+          <button class="nav-item" type="button" data-nav="prefs">
+            <span class="nav-arrow">▸</span>
+            <span class="nav-icon">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+                <polyline points="14 3 14 9 20 9"/>
+              </svg>
+            </span>
+            <span class="nav-label">prefs.toml</span>
+          </button>
+
+          <button class="nav-item" type="button" data-nav="about">
+            <span class="nav-arrow">▸</span>
+            <span class="nav-icon">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9"/>
+                <path d="M12 8h.01M11 12h1v4h1"/>
+              </svg>
+            </span>
+            <span class="nav-label">about</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-fill"></div>
+
+        <!-- Sidebar footer: ping status -->
+        <div class="sidebar-footer">
+          <div class="label">── status ──</div>
+          <div id="pingRow" class="ping-row idle">
+            <span class="ping-dot" aria-hidden="true">
+              <span class="ring"></span>
+              <span class="ring delayed"></span>
+              <span class="core"></span>
+            </span>
+            <span class="label" id="pingLabel">not tested</span>
+          </div>
+          <div class="nas-name" id="pingHost"></div>
+        </div>
+      </aside>
+
+      <!-- MAIN -->
+      <main class="main">
+        <div class="editor-row">
+          <!-- Line gutter -->
+          <div class="gutter" id="gutter" aria-hidden="true"></div>
+
+          <!-- Code editor content -->
+          <div class="editor" id="editor">
+
+            <!-- ====== connection.toml ====== -->
+            <section class="pane active" data-pane="connection">
+              <div class="comment"># WebVideo2NAS — connection</div>
+              <div class="comment"># edit values inline · click :w to save</div>
+              <div class="spacer"></div>
+
+              <div class="section-head">[connection]</div>
+
+              <div class="kv">
+                <span class="key">endpoint</span>
+                <span class="eq">=</span>
+                <span class="kv-edit">
+                  <span class="quote">"</span>
+                  <input id="nasEndpoint" class="input" type="text"
+                         placeholder="http://192.168.1.100:52052" autocomplete="off">
+                  <span class="quote">"</span>
+                </span>
+                <button id="testBtn" class="inline-btn" type="button">
+                  <span id="testBtnText">test</span>
+                </button>
+              </div>
+
+              <div class="kv">
+                <span class="key">api_key</span>
+                <span class="eq">=</span>
+                <span class="kv-edit">
+                  <span class="quote">"</span>
+                  <input id="apiKey" class="input masked" type="text"
+                         placeholder="sk_..." autocomplete="off">
+                  <span class="quote">"</span>
+                </span>
+                <button id="apiKeyToggleBtn" class="inline-btn" type="button">
+                  <span id="apiKeyToggleText">show</span>
+                </button>
+                <button id="apiKeyCopyBtn" class="inline-btn" type="button">
+                  <span id="apiKeyCopyText">copy</span>
+                </button>
+              </div>
+
+              <div class="kv">
+                <span class="key">timeout_ms</span>
+                <span class="eq">=</span>
+                <span class="val readonly">5000</span>
+                <span class="comment-inline"># read-only</span>
+              </div>
+
+              <div class="kv">
+                <span class="key">verify_tls</span>
+                <span class="eq">=</span>
+                <span class="val readonly">false</span>
+                <span class="comment-inline"># local network</span>
+              </div>
+
+              <div class="spacer"></div>
+              <div class="comment"># live status — read-only</div>
+
+              <div class="kv">
+                <span class="key">last_ping</span>
+                <span class="eq">=</span>
+                <span id="lastPingRow" class="ping-row idle">
+                  <span class="ping-dot" aria-hidden="true">
+                    <span class="ring"></span>
+                    <span class="ring delayed"></span>
+                    <span class="core"></span>
+                  </span>
+                  <span class="label" id="lastPingLabel">not tested</span>
+                </span>
+                <span id="lastPingNote" class="comment-inline"></span>
+              </div>
+
+              <div class="kv">
+                <span class="key">server_version</span>
+                <span class="eq">=</span>
+                <span class="val readonly" id="serverVersion">"unknown"</span>
+                <span class="comment-inline"># read-only</span>
+              </div>
+            </section>
+
+            <!-- ====== profiles.toml ====== -->
+            <section class="pane" data-pane="profiles">
+              <div class="comment"># Saved NAS connections</div>
+              <div class="comment"># click [profile.id] header to make active</div>
+              <div class="spacer"></div>
+
+              <div id="profilesList"></div>
+
+              <div class="spacer"></div>
+              <button id="addProfileBtn" class="inline-btn" type="button">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 5v14M5 12h14"/>
+                </svg>
+                <span id="addProfileText">[profile.new] — save current as profile</span>
+              </button>
+            </section>
+
+            <!-- ====== prefs.toml ====== -->
+            <section class="pane" data-pane="prefs">
+              <div class="comment"># UI behavior &amp; locale</div>
+              <div class="spacer"></div>
+
+              <div class="section-head">[detection]</div>
+              <div class="kv">
+                <span class="key">auto_detect</span>
+                <span class="eq">=</span>
+                <button id="autoDetect" class="toggle-btn" type="button" data-value="true">true</button>
+                <span class="comment-inline" id="autoDetectComment"># scan M3U8 / MP4 on page load</span>
+              </div>
+
+              <div class="spacer"></div>
+              <div class="section-head">[notifications]</div>
+              <div class="kv">
+                <span class="key">desktop</span>
+                <span class="eq">=</span>
+                <button id="showNotifications" class="toggle-btn" type="button" data-value="true">true</button>
+                <span class="comment-inline" id="notifComment"># toast on queued / completed</span>
+              </div>
+
+              <div class="spacer"></div>
+              <div class="section-head">[locale]</div>
+              <div class="kv">
+                <span class="key">language</span>
+                <span class="eq">=</span>
+                <select id="uiLanguage" class="toml-select">
+                  <option value="">"auto"</option>
+                  <option value="zh-TW">"zh-TW"</option>
+                  <option value="zh-CN">"zh-CN"</option>
+                  <option value="en">"en"</option>
+                  <option value="ja">"ja"</option>
+                  <option value="ko">"ko"</option>
+                  <option value="fr">"fr"</option>
+                  <option value="es">"es"</option>
+                  <option value="pt">"pt"</option>
+                </select>
+                <span class="comment-inline" id="langComment"># side panel ui</span>
+              </div>
+            </section>
+
+            <!-- ====== about ====== -->
+            <section class="pane" data-pane="about">
+              <div class="comment"># WebVideo2NAS — about</div>
+              <div class="spacer"></div>
+
+              <div class="section-head">[meta]</div>
+              <div class="kv">
+                <span class="key">version</span>
+                <span class="eq">=</span>
+                <span class="val readonly" id="aboutVersion">"-"</span>
+                <span class="comment-inline"># read-only</span>
+              </div>
+              <div class="kv">
+                <span class="key">author</span>
+                <span class="eq">=</span>
+                <span class="val readonly">"WebVideo2NAS Team"</span>
+              </div>
+              <div class="kv">
+                <span class="key">license</span>
+                <span class="eq">=</span>
+                <span class="val readonly">"MIT"</span>
+              </div>
+              <div class="kv">
+                <span class="key">repo</span>
+                <span class="eq">=</span>
+                <span class="val readonly">"github.com/asdfghj1237890/WebVideo2NAS"</span>
+              </div>
+
+              <div class="spacer"></div>
+              <div class="section-head">[howto]</div>
+              <div class="comment"># 1. <span id="howToUseStep1">Configure NAS endpoint</span></div>
+              <div class="comment"># 2. <span id="howToUseStep2">Browse video website</span></div>
+              <div class="comment"># 3. <span id="howToUseStep3">URLs detected automatically</span></div>
+              <div class="comment"># 4. <span id="howToUseStep4">Open extension icon</span></div>
+              <div class="comment"># 5. <span id="howToUseStep5">Click "Send to NAS"</span></div>
+
+              <div class="spacer"></div>
+              <div class="section-head">[troubleshooting]</div>
+              <div class="comment"># <span id="troubleshoot1">Check NAS is reachable on your network</span></div>
+              <div class="comment"># <span id="troubleshoot2">Verify API port (default 52052) is open</span></div>
+              <div class="comment"># <span id="troubleshoot3">API Key must match the value in NAS .env</span></div>
+              <div class="comment"># <span id="troubleshoot4">Allow the port through your firewall</span></div>
+
+              <div class="spacer"></div>
+              <a id="repoLink" class="btn-link" href="https://github.com/asdfghj1237890/WebVideo2NAS"
+                 target="_blank" rel="noopener noreferrer">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M9 19c-4 1.3-4-2-6-2m12 4v-3.4a3 3 0 0 0-.8-2.3c2.7-.3 5.5-1.3 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.3 4.3 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.7 11.7 0 0 0-6 0C6.5 2.6 5.5 3 5.5 3a4.3 4.3 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.3c0 4.7 2.8 5.7 5.5 6a3 3 0 0 0-.8 2.3V21"/>
+                </svg>
+                <span id="repoLinkText">open in browser</span>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M5 12h14M13 6l6 6-6 6"/>
+                </svg>
+              </a>
+            </section>
+
           </div>
         </div>
-      </div>
 
-      <!-- Sidebar: Info & Help -->
-      <div class="sidebar-column">
-        <div class="card">
-          <h2 id="aboutTitle">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="10"></circle>
-              <line x1="12" y1="16" x2="12" y2="12"></line>
-              <line x1="12" y1="8" x2="12.01" y2="8"></line>
+        <!-- Status bar -->
+        <footer class="status-bar" id="statusBar">
+          <span class="filename">● <span id="statusFilename">connection.toml</span></span>
+          <span>UTF-8</span>
+          <span>TOML</span>
+          <span>LF</span>
+          <span class="unsaved" id="unsavedIndicator">● <span id="unsavedCount">0</span> unsaved</span>
+          <span class="status-toast hidden" id="statusToast"></span>
+          <span class="grow"></span>
+          <button id="saveBtn" class="cmd-btn cmd-save" type="button" disabled>
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4 12 10 18 20 6"/>
             </svg>
-            About
-          </h2>
-          
-          <div class="info-meta">
-            <p>
-              <strong id="aboutVersionLabel">Version:</strong>
-              <span id="extVersion">-</span>
-            </p>
-            <p>
-              <strong id="aboutAuthorLabel">Author:</strong>
-              <span id="aboutAuthorValue">WebVideo2NAS Team</span>
-            </p>
-          </div>
-
-          <p id="aboutDescription" class="help-text" style="margin-top: 12px; margin-bottom: 20px;">
-            This extension allows you to send web videos (M3U8 streams, MP4 files) directly to your NAS for download.
-          </p>
-          
-          <div class="info-item">
-            <h3 id="howToUseTitle">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path>
-                <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path>
-              </svg>
-              How to use
-            </h3>
-            <ol>
-              <li><span id="howToUseStep1">Configure NAS endpoint</span></li>
-              <li><span id="howToUseStep2">Browse video website</span></li>
-              <li><span id="howToUseStep3">URLs detected automatically</span></li>
-              <li><span id="howToUseStep4">Open extension icon</span></li>
-              <li><span id="howToUseStep5">Click "Send to NAS"</span></li>
-            </ol>
-          </div>
-
-          <div class="info-item" style="margin-top: 20px; padding-top: 20px; border-top: 1px dashed var(--border);">
-            <h3 id="needHelpTitle">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
-              </svg>
-              Troubleshooting
-            </h3>
-            <p id="needHelpBody" class="help-text">
-              • Check NAS accessibility<br>
-              • Verify API port (52052)<br>
-              • Check API Key matches .env<br>
-              • Check Firewall
-            </p>
-          </div>
-        </div>
-        
-        <footer>
-          <p id="footerText">WebVideo2NAS © 2025</p>
+            :w&nbsp;<span class="hint" id="saveHint">save</span>
+          </button>
+          <button id="discardBtn" class="cmd-btn cmd-discard" type="button" disabled>
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M6 6l12 12M18 6L6 18"/>
+            </svg>
+            :q&nbsp;<span class="hint" id="discardHint">discard</span>
+          </button>
         </footer>
-      </div>
+      </main>
     </div>
   </div>
 

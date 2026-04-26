@@ -3,198 +3,272 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Generate Chrome Extension Icons</title>
+  <title>WebVideo2NAS · Icon Generator</title>
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #4A90E2 0%, #50C9C3 100%);
-      color: white;
-      padding: 40px;
-      text-align: center;
+    :root {
+      --bg0: oklch(13% 0.008 250);
+      --bg1: oklch(17% 0.008 250);
+      --bg2: oklch(21% 0.008 250);
+      --text: oklch(96% 0.005 250);
+      --text-mid: oklch(72% 0.01 250);
+      --text-dim: oklch(52% 0.01 250);
+      --accent: oklch(78% 0.13 155);
+      --border: rgba(255,255,255,0.08);
     }
-    .container {
-      max-width: 800px;
-      margin: 0 auto;
-      background: white;
-      padding: 40px;
-      border-radius: 12px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 32px;
+      background: var(--bg0); color: var(--text);
+      font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 14px; line-height: 1.6;
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 720px; margin: 0 auto;
+      background: var(--bg1);
+      border: 1px solid var(--border); border-radius: 12px;
+      padding: 28px;
     }
     h1 {
-      color: #4A90E2;
-      margin-bottom: 30px;
+      margin: 0 0 6px; font-size: 18px; font-weight: 700;
+      letter-spacing: -0.01em;
     }
-    .icons-preview {
-      display: flex;
-      justify-content: center;
-      gap: 30px;
-      margin: 30px 0;
-      flex-wrap: wrap;
+    .sub {
+      color: var(--text-dim); margin-bottom: 24px; font-size: 13px;
     }
-    .icon-wrapper {
-      text-align: center;
+    .preview {
+      display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-end;
+      padding: 20px; background: var(--bg2);
+      border: 1px solid var(--border); border-radius: 8px;
+      margin-bottom: 20px;
     }
-    .icon-wrapper canvas {
-      border: 2px solid #e0e0e0;
-      border-radius: 8px;
-      margin-bottom: 10px;
+    .item { text-align: center; }
+    .item canvas {
+      display: block; margin: 0 auto 8px;
+      border: 1px dashed rgba(255,255,255,0.06); border-radius: 8px;
+      background: transparent;
     }
-    .icon-wrapper p {
-      color: #666;
-      font-size: 14px;
-      margin: 0;
+    .item .label {
+      font-size: 11px; color: var(--text-dim);
+    }
+    .actions {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px;
     }
     button {
-      background: linear-gradient(135deg, #4A90E2 0%, #50C9C3 100%);
-      color: white;
-      border: none;
-      border-radius: 8px;
-      padding: 12px 32px;
-      font-size: 16px;
-      font-weight: 500;
+      font-family: inherit; font-size: 12px; font-weight: 600;
+      padding: 8px 14px; border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: transparent; color: var(--text);
       cursor: pointer;
-      margin: 10px;
-      transition: transform 0.2s;
+      transition: background 140ms, border-color 140ms;
     }
-    button:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 4px 12px rgba(74, 144, 226, 0.4);
+    button:hover { background: rgba(255,255,255,0.06); border-color: var(--accent); }
+    button.primary {
+      background: var(--accent); color: var(--bg0); border-color: var(--accent);
     }
+    button.primary:hover { filter: brightness(1.08); }
     .instructions {
-      background: #f5f5f5;
-      padding: 20px;
-      border-radius: 8px;
-      margin-top: 30px;
-      text-align: left;
-      color: #333;
+      font-size: 12px; color: var(--text-dim);
+      background: var(--bg2);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 14px 18px;
     }
-    .instructions h3 {
-      color: #4A90E2;
-      margin-top: 0;
-    }
-    .instructions ol {
-      margin-left: 20px;
-      line-height: 1.8;
+    .instructions ol { margin: 8px 0 0 18px; padding: 0; line-height: 1.7; }
+    .instructions code {
+      background: rgba(255,255,255,0.06); padding: 1px 6px; border-radius: 3px;
+      color: var(--accent);
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <h1>🎬 Chrome Extension Icon Generator</h1>
-    <p style="color: #666; margin-bottom: 20px;">Generate blue-cyan gradient icons for WebVideo2NAS</p>
-    
-    <div class="icons-preview">
-      <div class="icon-wrapper">
-        <canvas id="icon128" width="128" height="128"></canvas>
-        <p>128 x 128</p>
-      </div>
-      <div class="icon-wrapper">
-        <canvas id="icon48" width="48" height="48"></canvas>
-        <p>48 x 48</p>
-      </div>
-      <div class="icon-wrapper">
-        <canvas id="icon16" width="16" height="16"></canvas>
-        <p>16 x 16</p>
-      </div>
+  <div class="wrap">
+    <h1>WebVideo2NAS · icon generator</h1>
+    <p class="sub">Renders the dark + mint server icons used by the extension.</p>
+
+    <div class="preview">
+      <div class="item"><canvas id="c128" width="128" height="128"></canvas><div class="label">128 × 128</div></div>
+      <div class="item"><canvas id="c48"  width="48"  height="48"></canvas><div class="label">48 × 48</div></div>
+      <div class="item"><canvas id="c16"  width="16"  height="16"></canvas><div class="label">16 × 16</div></div>
     </div>
 
-    <button onclick="downloadIcon('icon128', 'icon128.png')">Download 128x128</button>
-    <button onclick="downloadIcon('icon48', 'icon48.png')">Download 48x48</button>
-    <button onclick="downloadIcon('icon16', 'icon16.png')">Download 16x16</button>
-    <br>
-    <button onclick="downloadAll()" style="background: linear-gradient(135deg, #50C9C3 0%, #4A90E2 100%);">Download All Icons</button>
+    <div class="actions">
+      <button onclick="dl('c128','icon128.png')">download 128</button>
+      <button onclick="dl('c48','icon48.png')">download 48</button>
+      <button onclick="dl('c16','icon16.png')">download 16</button>
+      <button class="primary" onclick="dlAll()">download all</button>
+    </div>
 
     <div class="instructions">
-      <h3>📝 Instructions:</h3>
+      <strong style="color: var(--text)"># instructions</strong>
       <ol>
-        <li>Click each "Download" button to save the icon files</li>
-        <li>Save the files to the <code>chrome-extension/icons/</code> folder</li>
-        <li>Replace the existing icon files (icon128.png, icon48.png, icon16.png)</li>
-        <li>Reload your Chrome extension to see the new icons</li>
+        <li>Click <code>download all</code> and save the 3 files to <code>chrome-extension/icons/</code></li>
+        <li>Replace the existing <code>icon16.png</code>, <code>icon48.png</code>, <code>icon128.png</code></li>
+        <li>Reload the extension at <code>chrome://extensions/</code></li>
       </ol>
+      <p style="margin: 12px 0 0">Or run <code>node icons/generate.mjs</code> from the project root if you have <code>sharp</code> installed.</p>
     </div>
   </div>
 
   <script>
-    function drawIcon(canvas) {
-      const ctx = canvas.getContext('2d');
-      const size = canvas.width;
-      const scale = size / 128;
-
-      // Clear canvas
-      ctx.clearRect(0, 0, size, size);
-
-      // Draw gradient background
-      const gradient = ctx.createLinearGradient(0, 0, size, size);
-      gradient.addColorStop(0, '#4A90E2');
-      gradient.addColorStop(1, '#50C9C3');
-
-      // Create rounded rectangle path
-      const cornerRadius = size * 0.22;
-      ctx.beginPath();
-      ctx.moveTo(cornerRadius, 0);
-      ctx.lineTo(size - cornerRadius, 0);
-      ctx.arcTo(size, 0, size, cornerRadius, cornerRadius);
-      ctx.lineTo(size, size - cornerRadius);
-      ctx.arcTo(size, size, size - cornerRadius, size, cornerRadius);
-      ctx.lineTo(cornerRadius, size);
-      ctx.arcTo(0, size, 0, size - cornerRadius, cornerRadius);
-      ctx.lineTo(0, cornerRadius);
-      ctx.arcTo(0, 0, cornerRadius, 0, cornerRadius);
-      ctx.closePath();
-      ctx.fillStyle = gradient;
-      ctx.fill();
-
-      // Draw 🎬 emoji icon
-      const centerX = size / 2;
-      const centerY = size / 2;
-      
-      // Set emoji font size based on icon size
-      const fontSize = size * 0.6;
-      ctx.font = `${fontSize}px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      
-      // Draw emoji
-      ctx.fillText('🎬', centerX, centerY);
-    }
-
-    function roundRect(ctx, x, y, width, height, radius) {
-      ctx.beginPath();
-      ctx.moveTo(x + radius, y);
-      ctx.lineTo(x + width - radius, y);
-      ctx.arcTo(x + width, y, x + width, y + radius, radius);
-      ctx.lineTo(x + width, y + height - radius);
-      ctx.arcTo(x + width, y + height, x + width - radius, y + height, radius);
-      ctx.lineTo(x + radius, y + height);
-      ctx.arcTo(x, y + height, x, y + height - radius, radius);
-      ctx.lineTo(x, y + radius);
-      ctx.arcTo(x, y, x + radius, y, radius);
-      ctx.closePath();
-      ctx.fill();
-    }
-
-    function downloadIcon(canvasId, filename) {
-      const canvas = document.getElementById(canvasId);
-      const link = document.createElement('a');
-      link.download = filename;
-      link.href = canvas.toDataURL('image/png');
-      link.click();
-    }
-
-    function downloadAll() {
-      setTimeout(() => downloadIcon('icon128', 'icon128.png'), 100);
-      setTimeout(() => downloadIcon('icon48', 'icon48.png'), 300);
-      setTimeout(() => downloadIcon('icon16', 'icon16.png'), 500);
-    }
-
-    // Draw all icons on page load
-    window.onload = function() {
-      drawIcon(document.getElementById('icon128'));
-      drawIcon(document.getElementById('icon48'));
-      drawIcon(document.getElementById('icon16'));
+    const COLORS = {
+      bg:      '#161819',
+      bgGrad1: '#1b1d1f',
+      bgGrad2: '#101213',
+      border:  'rgba(255,255,255,0.08)',
+      glow:    'rgba(101, 210, 156, 0.16)',
+      accent:  '#65d29c',  // ≈ oklch(78% 0.13 155)
+      accent2: '#3aa172',  // dimmer mint for ticks
     };
+
+    function roundRect(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.arcTo(x + w, y, x + w, y + r, r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+      ctx.lineTo(x + r, y + h);
+      ctx.arcTo(x, y + h, x, y + h - r, r);
+      ctx.lineTo(x, y + r);
+      ctx.arcTo(x, y, x + r, y, r);
+      ctx.closePath();
+    }
+
+    function drawBg(ctx, size, cornerR) {
+      // Diagonal dark gradient
+      const g = ctx.createLinearGradient(0, 0, size, size);
+      g.addColorStop(0, COLORS.bgGrad1);
+      g.addColorStop(1, COLORS.bgGrad2);
+      roundRect(ctx, 0, 0, size, size, cornerR);
+      ctx.fillStyle = g;
+      ctx.fill();
+
+      // Mint glow (skip for tiny icons)
+      if (size >= 48) {
+        const rg = ctx.createRadialGradient(size * 0.5, size * 0.42, 0, size * 0.5, size * 0.42, size * 0.6);
+        rg.addColorStop(0, COLORS.glow);
+        rg.addColorStop(1, 'rgba(101,210,156,0)');
+        roundRect(ctx, 0, 0, size, size, cornerR);
+        ctx.fillStyle = rg;
+        ctx.fill();
+      }
+
+      // Hairline border
+      roundRect(ctx, 0.5, 0.5, size - 1, size - 1, cornerR - 0.5);
+      ctx.strokeStyle = COLORS.border;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    function drawArrow(ctx, cx, top, height, headW, lineWidth) {
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.strokeStyle = COLORS.accent;
+      ctx.lineWidth = lineWidth;
+      // Shaft
+      ctx.beginPath();
+      ctx.moveTo(cx, top);
+      ctx.lineTo(cx, top + height);
+      ctx.stroke();
+      // Head
+      ctx.beginPath();
+      ctx.moveTo(cx - headW, top + height - headW);
+      ctx.lineTo(cx, top + height);
+      ctx.lineTo(cx + headW, top + height - headW);
+      ctx.stroke();
+    }
+
+    function draw128(canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, 128, 128);
+      drawBg(ctx, 128, 28);
+
+      // Download arrow (top, mint)
+      drawArrow(ctx, 64, 18, 34, 14, 6);
+
+      // Two rack tiers (shifted down to make room)
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.strokeStyle = COLORS.accent;
+      ctx.lineWidth = 4;
+      roundRect(ctx, 22, 62, 84, 22, 5); ctx.stroke();
+      roundRect(ctx, 22, 90, 84, 22, 5); ctx.stroke();
+
+      // LEDs
+      ctx.fillStyle = COLORS.accent;
+      ctx.beginPath(); ctx.arc(35, 73,  3, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(35, 101, 3, 0, Math.PI * 2); ctx.fill();
+
+      // Drive ticks
+      ctx.strokeStyle = COLORS.accent2;
+      ctx.lineWidth = 2.4;
+      ctx.beginPath(); ctx.moveTo(56, 73);  ctx.lineTo(92, 73);  ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(56, 101); ctx.lineTo(92, 101); ctx.stroke();
+    }
+
+    function draw48(canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, 48, 48);
+      drawBg(ctx, 48, 10);
+
+      // Download arrow
+      drawArrow(ctx, 24, 7, 12.5, 5, 2.4);
+
+      // Two rack tiers
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.strokeStyle = COLORS.accent;
+      ctx.lineWidth = 2;
+      roundRect(ctx, 9, 23, 30, 9, 2); ctx.stroke();
+      roundRect(ctx, 9, 34, 30, 9, 2); ctx.stroke();
+
+      ctx.fillStyle = COLORS.accent;
+      ctx.beginPath(); ctx.arc(13.5, 27.5, 1.4, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(13.5, 38.5, 1.4, 0, Math.PI * 2); ctx.fill();
+
+      ctx.strokeStyle = COLORS.accent2;
+      ctx.lineWidth = 1.3;
+      ctx.beginPath(); ctx.moveTo(20, 27.5); ctx.lineTo(34, 27.5); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(20, 38.5); ctx.lineTo(34, 38.5); ctx.stroke();
+    }
+
+    function draw16(canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, 16, 16);
+
+      // Solid bg only at 16 (no gradient/glow — too noisy)
+      roundRect(ctx, 0, 0, 16, 16, 3.5);
+      ctx.fillStyle = COLORS.bg;
+      ctx.fill();
+
+      // Tiny download arrow
+      drawArrow(ctx, 8, 2, 5, 2, 1.2);
+
+      // One rack tier
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.strokeStyle = COLORS.accent;
+      ctx.lineWidth = 1;
+      roundRect(ctx, 2.5, 9, 11, 4.5, 1); ctx.stroke();
+
+      ctx.fillStyle = COLORS.accent;
+      ctx.beginPath(); ctx.arc(4.4, 11.25, 0.75, 0, Math.PI * 2); ctx.fill();
+    }
+
+    function dl(id, name) {
+      const c = document.getElementById(id);
+      const a = document.createElement('a');
+      a.download = name;
+      a.href = c.toDataURL('image/png');
+      a.click();
+    }
+    function dlAll() {
+      setTimeout(() => dl('c128', 'icon128.png'), 50);
+      setTimeout(() => dl('c48',  'icon48.png'),  250);
+      setTimeout(() => dl('c16',  'icon16.png'),  450);
+    }
+
+    window.addEventListener('load', () => {
+      draw128(document.getElementById('c128'));
+      draw48(document.getElementById('c48'));
+      draw16(document.getElementById('c16'));
+    });
   </script>
 </body>
 </html>
-

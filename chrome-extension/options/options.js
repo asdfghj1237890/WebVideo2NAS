@@ -1,249 +1,656 @@
-// Options Page Script for WebVideo2NAS
+// Options Page Script for WebVideo2NAS — terminal/dotfile UI.
 
-document.addEventListener('DOMContentLoaded', async () => {
-  const i18n = (typeof window !== 'undefined' && window.WV2N_I18N) ? window.WV2N_I18N : null;
-  const t = (key, vars) => (i18n ? i18n.t(key, vars) : key);
-  const tHtml = (key, vars) => (i18n ? i18n.tHtml(key, vars) : t(key, vars));
+const NAV_FILES = {
+  connection: 'connection.toml',
+  profiles:   'profiles.toml',
+  prefs:      'prefs.toml',
+  about:      'about',
+};
 
-  function applyUiLanguage(uiLanguageRaw) {
-    if (!i18n) return;
-    const uiLanguage = uiLanguageRaw === 'zh' ? 'zh-TW' : (uiLanguageRaw || '');
-    i18n.setLanguage((uiLanguage || '').trim());
-    localizeStaticText();
+let currentNav = 'connection';
+let theme = 'dark';
+let savedSnapshot = { nasEndpoint: '', apiKey: '' }; // last persisted (for dirty + discard)
+
+// Profiles state (loaded from chrome.storage.sync)
+let profiles = [];           // [{ id, name, endpoint, apiKey }]
+let activeProfileId = null;
+
+function newProfileId() {
+  return 'p_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+}
+
+function activeProfile() {
+  return profiles.find(p => p.id === activeProfileId) || null;
+}
+
+let i18n = null;
+function t(key, vars) { return i18n ? i18n.t(key, vars) : key; }
+function tHtml(key, vars) { return i18n ? i18n.tHtml(key, vars) : t(key, vars); }
+
+// ---------- DOM helpers ----------
+function $(id) { return document.getElementById(id); }
+function setText(id, text) { const el = $(id); if (el) el.textContent = text; }
+
+// ---------- Theme ----------
+function applyTheme(next) {
+  theme = next === 'light' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', theme);
+  const sun = $('themeIconSun');
+  const moon = $('themeIconMoon');
+  if (sun && moon) {
+    // Show the icon you'd switch TO (not the current mode).
+    sun.style.display  = theme === 'dark'  ? 'none'  : 'block';
+    moon.style.display = theme === 'light' ? 'none'  : 'block';
   }
+}
 
-  function setText(id, text) {
-    const el = document.getElementById(id);
-    if (el) el.textContent = text;
-  }
+async function setTheme(next) {
+  applyTheme(next);
+  try { await chrome.storage.sync.set({ uiTheme: theme }); } catch (_) {}
+}
 
-  function setHtml(id, html) {
-    const el = document.getElementById(id);
-    if (el) el.innerHTML = html;
-  }
+// ---------- Nav ----------
+function switchNav(id) {
+  if (!NAV_FILES[id]) return;
+  currentNav = id;
 
-  function localizeStaticText() {
-    document.title = t('options.pageTitle');
-    setText('optionsSubtitle', t('options.subtitle'));
-
-    setText('nasConfigTitle', t('options.nasConfig.title'));
-    setText('nasEndpointLabel', t('options.nasEndpoint.label'));
-    setHtml('nasEndpointHelp', t('options.nasEndpoint.helpHtml'));
-
-    setText('apiKeyLabel', t('options.apiKey.label'));
-    setHtml('apiKeyHelp', t('options.apiKey.helpHtml'));
-
-    setText('testBtnText', t('options.btn.test'));
-    setText('saveBtnText', t('options.btn.save'));
-
-    setText('downloadPreferencesTitle', t('options.downloadPreferences.title'));
-    setText('uiLanguageLabel', t('options.uiLanguage.label'));
-    setText('uiLanguageHelp', t('options.uiLanguage.help'));
-
-    const autoOption = document.querySelector('#uiLanguage option[value=""]');
-    if (autoOption) autoOption.textContent = t('options.uiLanguage.auto');
-
-    setText('autoDetectLabel', t('options.autoDetect.label'));
-    setText('autoDetectHelp', t('options.autoDetect.help'));
-    setText('showNotificationsLabel', t('options.showNotifications.label'));
-    setText('showNotificationsHelp', t('options.showNotifications.help'));
-
-    setText('aboutTitle', t('options.about.title'));
-    setText('aboutVersionLabel', t('options.about.version'));
-    setText('aboutAuthorLabel', t('options.about.author'));
-    setText('aboutAuthorValue', t('options.about.authorValue'));
-    setText('aboutDescription', t('options.about.description'));
-
-    setText('howToUseTitle', t('options.howToUse.title'));
-    setText('howToUseStep1', t('options.howToUse.step1'));
-    setText('howToUseStep2', t('options.howToUse.step2'));
-    setText('howToUseStep3', t('options.howToUse.step3'));
-    setText('howToUseStep4', t('options.howToUse.step4'));
-    setText('howToUseStep5', t('options.howToUse.step5'));
-
-    setText('needHelpTitle', t('options.needHelp.title'));
-    setHtml('needHelpBody', t('options.needHelp.bodyHtml'));
-
-    setText('footerText', t('options.footer'));
-  }
-
-  // Display extension version (keep in sync with manifest.json)
-  const versionEl = document.getElementById('extVersion');
-  if (versionEl) {
-    versionEl.textContent = chrome.runtime.getManifest().version || '-';
-  }
-
-  // Load saved settings (includes uiLanguage)
-  const settings = await chrome.storage.sync.get([
-    'nasEndpoint',
-    'apiKey',
-    'autoDetect',
-    'showNotifications',
-    'uiLanguage'
-  ]);
-
-  // Apply language first, then render page copy.
-  applyUiLanguage(settings.uiLanguage);
-
-  // Populate inputs
-  document.getElementById('nasEndpoint').value = settings.nasEndpoint || '';
-  document.getElementById('apiKey').value = settings.apiKey || '';
-  document.getElementById('autoDetect').checked = settings.autoDetect !== false;
-  document.getElementById('showNotifications').checked = settings.showNotifications !== false;
-  const uiLanguage = settings.uiLanguage === 'zh' ? 'zh-TW' : (settings.uiLanguage || '');
-  document.getElementById('uiLanguage').value = uiLanguage;
-  
-  // Setup event listeners
-  document.getElementById('saveBtn').addEventListener('click', saveSettings);
-  document.getElementById('testBtn').addEventListener('click', testConnection);
-  
-  // Auto-save checkboxes
-  document.getElementById('autoDetect').addEventListener('change', savePreferences);
-  document.getElementById('showNotifications').addEventListener('change', savePreferences);
-  document.getElementById('uiLanguage').addEventListener('change', async () => {
-    await savePreferences();
-    applyUiLanguage((document.getElementById('uiLanguage').value || '').trim());
+  document.querySelectorAll('.nav-item').forEach(b => {
+    b.classList.toggle('active', b.dataset.nav === id);
+  });
+  document.querySelectorAll('.pane').forEach(p => {
+    p.classList.toggle('active', p.dataset.pane === id);
   });
 
-  // Keep these helpers accessible to functions below
-  window.__WV2N_OPTIONS_I18N__ = { t, tHtml, applyUiLanguage };
-});
+  const filename = NAV_FILES[id];
+  setText('titleFilename', filename);
+  setText('statusFilename', filename);
+  recomputeGutter();
+}
 
-// Save settings
+// ---------- Line gutter ----------
+function recomputeGutter() {
+  const editor = $('editor');
+  const gutter = $('gutter');
+  if (!editor || !gutter) return;
+  // Count the number of "lines" in the active pane based on its scroll height.
+  // Each row in the design is 22px; we compute lines from height.
+  const activePane = editor.querySelector('.pane.active');
+  if (!activePane) return;
+  const lines = Math.max(20, Math.ceil(activePane.scrollHeight / 22) + 4);
+  // Build gutter content lazily — only rebuild if line count changed.
+  if (gutter.dataset.lines === String(lines)) return;
+  gutter.dataset.lines = String(lines);
+  gutter.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  for (let i = 1; i <= lines; i++) {
+    const d = document.createElement('div');
+    d.textContent = String(i);
+    frag.appendChild(d);
+  }
+  gutter.appendChild(frag);
+}
+
+// ---------- Toggle helpers (true/false buttons) ----------
+function setToggle(id, value) {
+  const el = $(id);
+  if (!el) return;
+  el.dataset.value = value ? 'true' : 'false';
+  el.textContent = value ? 'true' : 'false';
+}
+function getToggle(id) {
+  const el = $(id);
+  return el ? el.dataset.value === 'true' : true;
+}
+
+// ---------- Dirty tracking ----------
+function isDirty() {
+  const ep = $('nasEndpoint').value.trim();
+  const ak = $('apiKey').value.trim();
+  return ep !== savedSnapshot.nasEndpoint || ak !== savedSnapshot.apiKey;
+}
+function unsavedFieldCount() {
+  const ep = $('nasEndpoint').value.trim();
+  const ak = $('apiKey').value.trim();
+  let n = 0;
+  if (ep !== savedSnapshot.nasEndpoint) n++;
+  if (ak !== savedSnapshot.apiKey) n++;
+  return n;
+}
+function refreshDirtyIndicator() {
+  const dirty = isDirty();
+  const bar = $('statusBar');
+  if (bar) bar.classList.toggle('dirty', dirty);
+  setText('unsavedCount', String(unsavedFieldCount()));
+  $('saveBtn').disabled = !dirty;
+  $('discardBtn').disabled = !dirty;
+}
+
+// ---------- Toast (status bar) ----------
+let toastTimer = null;
+function showStatus(message, type) {
+  const el = $('statusToast');
+  if (!el) return;
+  el.textContent = message;
+  el.className = `status-toast ${type || 'info'}`;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  if (type !== 'error') {
+    toastTimer = setTimeout(() => el.classList.add('hidden'), 4000);
+  }
+}
+
+// ---------- Ping state ----------
+function setPingState(rowId, state, label) {
+  const row = $(rowId);
+  if (!row) return;
+  row.classList.remove('idle', 'pinging', 'ok', 'err');
+  row.classList.add(state);
+  const labelEl = row.querySelector('.label');
+  if (labelEl) labelEl.textContent = label;
+}
+
+// ---------- i18n: localize all dynamic text ----------
+function localizeStaticText() {
+  document.title = t('options.pageTitle');
+
+  // inline buttons
+  setText('testBtnText', t('options.btn.testInline') || 'test');
+  setText('apiKeyToggleText', getToggleVisibleLabel());
+  setText('apiKeyCopyText', t('options.btn.copy') || 'copy');
+  setText('saveHint', t('options.cmd.saveHint'));
+  setText('discardHint', t('options.cmd.discardHint'));
+
+  // about steps
+  setText('howToUseStep1', t('options.howToUse.step1'));
+  setText('howToUseStep2', t('options.howToUse.step2'));
+  setText('howToUseStep3', t('options.howToUse.step3'));
+  setText('howToUseStep4', t('options.howToUse.step4'));
+  setText('howToUseStep5', t('options.howToUse.step5'));
+
+  setText('troubleshoot1', t('options.troubleshoot.s1'));
+  setText('troubleshoot2', t('options.troubleshoot.s2'));
+  setText('troubleshoot3', t('options.troubleshoot.s3'));
+  setText('troubleshoot4', t('options.troubleshoot.s4'));
+
+  setText('repoLinkText', t('options.repo.openInBrowser'));
+
+  // language select "auto" label
+  const autoOption = document.querySelector('#uiLanguage option[value=""]');
+  if (autoOption) {
+    const auto = t('options.uiLanguage.auto') || 'Auto';
+    autoOption.textContent = `"auto"  ${auto}`;
+  }
+
+  // Inline comments next to toggles
+  setText('autoDetectComment', '# ' + (t('options.autoDetect.help') || ''));
+  setText('notifComment', '# ' + (t('options.showNotifications.help') || ''));
+  setText('langComment', '# ' + (t('options.uiLanguage.help') || ''));
+
+  // Profiles
+  setText('addProfileText', t('options.profiles.addBtn') || '[profile.new] — save current as profile');
+}
+
+function getToggleVisibleLabel() {
+  // Reflects what the button will DO when clicked.
+  const masked = $('apiKey').classList.contains('masked');
+  return masked ? (t('options.btn.show') || 'show') : (t('options.btn.hide') || 'hide');
+}
+
+function applyUiLanguage(uiLanguageRaw) {
+  if (i18n) {
+    const uiLanguage = uiLanguageRaw === 'zh' ? 'zh-TW' : (uiLanguageRaw || '');
+    i18n.setLanguage((uiLanguage || '').trim());
+  }
+  localizeStaticText();
+}
+
+// ---------- Profiles ----------
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s == null ? '' : String(s);
+  return div.innerHTML;
+}
+
+function parseHostPort(endpoint) {
+  try {
+    const u = new URL(endpoint);
+    return { host: u.hostname, port: u.port || (u.protocol === 'https:' ? '443' : '80') };
+  } catch (_) {
+    return { host: '', port: '' };
+  }
+}
+
+async function persistProfiles() {
+  await chrome.storage.sync.set({ nasProfiles: profiles, activeProfileId });
+}
+
+async function migrateOrLoadProfiles(stored) {
+  profiles = Array.isArray(stored.nasProfiles) ? stored.nasProfiles.slice() : [];
+  activeProfileId = stored.activeProfileId || null;
+
+  // Migrate: if no profiles but legacy nasEndpoint exists, create a default profile
+  if (profiles.length === 0 && stored.nasEndpoint) {
+    const id = newProfileId();
+    profiles = [{
+      id,
+      name: t('options.profiles.defaultName') || 'Default',
+      endpoint: stored.nasEndpoint,
+      apiKey: stored.apiKey || '',
+    }];
+    activeProfileId = id;
+    await persistProfiles();
+  }
+
+  // Ensure activeProfileId points to a real profile
+  if (profiles.length > 0 && !profiles.some(p => p.id === activeProfileId)) {
+    activeProfileId = profiles[0].id;
+    await chrome.storage.sync.set({ activeProfileId });
+  }
+}
+
+function renderProfilesPane() {
+  const list = $('profilesList');
+  if (!list) return;
+
+  if (profiles.length === 0) {
+    list.innerHTML = `<div class="comment"># No saved profiles yet — fill in connection.toml then click [+ profile.new]</div>`;
+    setText('profileCount', '0');
+    return;
+  }
+  setText('profileCount', String(profiles.length));
+
+  const html = profiles.map(p => {
+    const isActive = p.id === activeProfileId;
+    const { host, port } = parseHostPort(p.endpoint);
+    const safeName = escapeHtml(p.name || 'unnamed');
+    const safeId = escapeHtml(p.id);
+    const safeEndpoint = escapeHtml(p.endpoint || '');
+    const safeHost = escapeHtml(host);
+    const safePort = escapeHtml(port);
+    const activateLabel = t('options.profiles.activate') || 'activate';
+    const deleteLabel = t('options.profiles.delete') || 'delete';
+    return `
+      <div class="profile-block">
+        <div class="profile-head${isActive ? ' active' : ''}" data-pid="${safeId}" data-action="activate">
+          <span>[profile.${safeId.replace(/^p_/, '').slice(0, 10)}]</span>
+          ${isActive ? `<span class="marker">← ${escapeHtml(t('options.profiles.activeMark') || 'active')}</span>` : ''}
+          <span class="actions">
+            ${!isActive ? `<button class="inline-btn" type="button" data-action="activate" data-pid="${safeId}">${escapeHtml(activateLabel)}</button>` : ''}
+            <button class="inline-btn" type="button" data-action="delete" data-pid="${safeId}">${escapeHtml(deleteLabel)}</button>
+          </span>
+        </div>
+        <div class="kv">
+          <span class="key">name</span>
+          <span class="eq">=</span>
+          <span class="val${isActive ? '' : ' readonly'}">"${safeName}"</span>
+        </div>
+        <div class="kv">
+          <span class="key">endpoint</span>
+          <span class="eq">=</span>
+          <span class="val readonly" title="${safeEndpoint}">"${escapeHtml(p.endpoint || '')}"</span>
+        </div>
+        <div class="kv">
+          <span class="key">host</span>
+          <span class="eq">=</span>
+          <span class="val readonly">"${safeHost}"</span>
+        </div>
+        <div class="kv">
+          <span class="key">port</span>
+          <span class="eq">=</span>
+          <span class="val readonly">${safePort}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+  list.innerHTML = html;
+
+  // Wire up clicks
+  list.querySelectorAll('[data-action="activate"]').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      switchActiveProfile(el.dataset.pid);
+    });
+  });
+  list.querySelectorAll('[data-action="delete"]').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteProfile(el.dataset.pid);
+    });
+  });
+
+  recomputeGutter();
+}
+
+async function switchActiveProfile(id) {
+  const p = profiles.find(x => x.id === id);
+  if (!p) return;
+  activeProfileId = id;
+  // Push the profile's credentials into the live fields + storage so background
+  // / sidepanel pick them up immediately.
+  $('nasEndpoint').value = p.endpoint || '';
+  $('apiKey').value      = p.apiKey   || '';
+  savedSnapshot = { nasEndpoint: p.endpoint || '', apiKey: p.apiKey || '' };
+  await chrome.storage.sync.set({
+    nasEndpoint: p.endpoint || '',
+    apiKey:      p.apiKey   || '',
+    activeProfileId,
+  });
+  refreshDirtyIndicator();
+  try { setText('pingHost', new URL(p.endpoint).host); } catch (_) {}
+  setPingState('pingRow',     'idle', t('options.ping.idle') || 'not tested');
+  setPingState('lastPingRow', 'idle', t('options.ping.idle') || 'not tested');
+  setText('lastPingNote', '');
+  renderProfilesPane();
+  showStatus(t('options.profiles.switched', { name: p.name }) || `Switched to ${p.name}`, 'success');
+}
+
+async function deleteProfile(id) {
+  const p = profiles.find(x => x.id === id);
+  if (!p) return;
+  const confirmMsg = (t('options.profiles.confirmDelete', { name: p.name })
+    || `Delete profile "${p.name}"?`);
+  if (!window.confirm(confirmMsg)) return;
+
+  profiles = profiles.filter(x => x.id !== id);
+
+  // If the active profile was deleted, switch to the first remaining one
+  if (activeProfileId === id) {
+    if (profiles.length > 0) {
+      await switchActiveProfile(profiles[0].id);
+    } else {
+      activeProfileId = null;
+    }
+  }
+  await persistProfiles();
+  renderProfilesPane();
+  showStatus(t('options.profiles.deleted', { name: p.name }) || `Deleted "${p.name}"`, 'info');
+}
+
+async function addCurrentAsProfile() {
+  const ep = $('nasEndpoint').value.trim();
+  const ak = $('apiKey').value.trim();
+  if (!ep || !ak) {
+    showStatus(t('options.profiles.fillFirst') || 'Fill endpoint + api_key on connection.toml first', 'error');
+    switchNav('connection');
+    return;
+  }
+  const defaultName = (() => {
+    try { return new URL(ep).hostname; } catch (_) { return 'profile'; }
+  })();
+  const promptMsg = t('options.profiles.namePrompt') || 'Name for this profile:';
+  const name = (window.prompt(promptMsg, defaultName) || '').trim();
+  if (!name) return;
+
+  const id = newProfileId();
+  profiles.push({ id, name, endpoint: ep, apiKey: ak });
+  activeProfileId = id;
+  await persistProfiles();
+  renderProfilesPane();
+  showStatus(t('options.profiles.created', { name }) || `Saved profile "${name}"`, 'success');
+}
+
+// ---------- Save / Discard ----------
 async function saveSettings() {
-  const t = (window.__WV2N_OPTIONS_I18N__ && window.__WV2N_OPTIONS_I18N__.t) ? window.__WV2N_OPTIONS_I18N__.t : (k => k);
-  const nasEndpoint = document.getElementById('nasEndpoint').value.trim();
-  const apiKey = document.getElementById('apiKey').value.trim();
-  
-  // Validation
-  if (!nasEndpoint) {
-    showStatus(t('options.status.enterNasEndpoint'), 'error');
-    return;
-  }
-  
-  if (!apiKey) {
-    showStatus(t('options.status.enterApiKey'), 'error');
-    return;
-  }
-  
-  // Validate URL format
+  if (!isDirty()) return;
+
+  const nasEndpoint = $('nasEndpoint').value.trim();
+  const apiKey      = $('apiKey').value.trim();
+
+  if (!nasEndpoint) { showStatus(t('options.status.enterNasEndpoint'), 'error'); return; }
+  if (!apiKey)      { showStatus(t('options.status.enterApiKey'),      'error'); return; }
+
+  // Validate URL
   try {
     const url = new URL(nasEndpoint);
-    if (!url.protocol.startsWith('http')) {
-      throw new Error('Invalid protocol');
-    }
-  } catch (error) {
+    if (!url.protocol.startsWith('http')) throw new Error('Invalid protocol');
+  } catch (_) {
     showStatus(t('options.status.invalidUrl'), 'error');
     return;
   }
-  
-  // Remove trailing slash
+
   const cleanEndpoint = nasEndpoint.replace(/\/$/, '');
-  
-  // Save to storage
-  await chrome.storage.sync.set({
-    nasEndpoint: cleanEndpoint,
-    apiKey: apiKey
-  });
-  
+
+  // Also push the new values into the active profile (if any) so profiles stay in sync.
+  const ap = activeProfile();
+  if (ap) {
+    ap.endpoint = cleanEndpoint;
+    ap.apiKey   = apiKey;
+    await persistProfiles();
+    renderProfilesPane();
+  }
+
+  await chrome.storage.sync.set({ nasEndpoint: cleanEndpoint, apiKey });
+
+  $('nasEndpoint').value = cleanEndpoint;
+  savedSnapshot = { nasEndpoint: cleanEndpoint, apiKey };
+  refreshDirtyIndicator();
   showStatus(t('options.status.saved'), 'success');
-  
-  // Automatically test connection after save
-  setTimeout(testConnection, 500);
+
+  // Auto-test after save (non-blocking).
+  setTimeout(testConnection, 400);
 }
 
-// Save preferences
+function discardChanges() {
+  $('nasEndpoint').value = savedSnapshot.nasEndpoint || '';
+  $('apiKey').value      = savedSnapshot.apiKey      || '';
+  refreshDirtyIndicator();
+  showStatus(t('options.status.reverted') || 'Reverted to saved values', 'info');
+}
+
+// ---------- Preferences (auto-saved on change) ----------
 async function savePreferences() {
-  const autoDetect = document.getElementById('autoDetect').checked;
-  const showNotifications = document.getElementById('showNotifications').checked;
-  const uiLanguage = (document.getElementById('uiLanguage').value || '').trim();
-  
-  await chrome.storage.sync.set({
-    autoDetect: autoDetect,
-    showNotifications: showNotifications,
-    uiLanguage: uiLanguage
-  });
+  const autoDetect       = getToggle('autoDetect');
+  const showNotifications = getToggle('showNotifications');
+  const uiLanguage       = ($('uiLanguage').value || '').trim();
+  await chrome.storage.sync.set({ autoDetect, showNotifications, uiLanguage });
 }
 
-// Test NAS connection
+// ---------- Test connection ----------
 async function testConnection() {
-  const t = (window.__WV2N_OPTIONS_I18N__ && window.__WV2N_OPTIONS_I18N__.t) ? window.__WV2N_OPTIONS_I18N__.t : (k => k);
-  const nasEndpoint = document.getElementById('nasEndpoint').value.trim();
-  const apiKey = document.getElementById('apiKey').value.trim();
-  
+  const nasEndpoint = $('nasEndpoint').value.trim();
+  const apiKey      = $('apiKey').value.trim();
+
   if (!nasEndpoint || !apiKey) {
     showStatus(t('options.status.enterBoth'), 'error');
     return;
   }
-  
-  showStatus(t('options.status.testing'), 'info');
-  
+
+  setPingState('pingRow',     'pinging', t('options.ping.pinging') || 'pinging…');
+  setPingState('lastPingRow', 'pinging', t('options.ping.pinging') || 'pinging…');
+  setText('lastPingNote', '');
+  $('testBtn').disabled = true;
+  setText('testBtnText', t('options.btn.testing') || 'pinging…');
+
+  const t0 = performance.now();
   try {
-    // Test health endpoint
-    const response = await fetch(`${nasEndpoint}/api/health`, {
+    // health validates auth; root carries the version (no auth needed). Run in parallel.
+    const healthP = fetch(`${nasEndpoint}/api/health`, {
       method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`
-      }
+      headers: { 'Authorization': `Bearer ${apiKey}` },
     });
-    
+    const rootP = fetch(`${nasEndpoint}/`).catch(() => null);
+    const response = await healthP;
+
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
-    
     const data = await response.json();
-    
-    if (data.status === 'healthy') {
-      showStatus(t('options.status.connectionOk'), 'success');
-      
-      // Also test the status endpoint
-      const statusResponse = await fetch(`${nasEndpoint}/api/status`, {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`
+    const ms = Math.max(1, Math.round(performance.now() - t0));
+
+    if (data.status === 'healthy' || data.status === 'running') {
+      setPingState('pingRow',     'ok', `${ms} ms`);
+      setPingState('lastPingRow', 'ok', `${ms} ms`);
+
+      // Pull server version from the root endpoint (best effort).
+      let version = null;
+      try {
+        const rootRes = await rootP;
+        if (rootRes && rootRes.ok) {
+          const rootJson = await rootRes.json();
+          if (rootJson && rootJson.version) version = String(rootJson.version);
         }
-      });
-      
-      if (statusResponse.ok) {
-        const statusData = await statusResponse.json();
-        showStatus(
-          t('options.status.connectedWithStats', { active: statusData.active_downloads, queue: statusData.queue_length }),
-          'success'
-        );
+      } catch (_) { /* ignore */ }
+
+      const note = document.createElement('span');
+      note.className = 'comment-inline fade-up';
+      note.textContent = version
+        ? `# 200 OK · v${version} · ${ms}ms RTT`
+        : `# 200 OK · ${ms}ms RTT`;
+      const noteSlot = $('lastPingNote');
+      if (noteSlot) {
+        noteSlot.textContent = '';
+        noteSlot.appendChild(note);
       }
+      if (version) setText('serverVersion', `"${version}"`);
+      showStatus(t('options.status.connectionOk'), 'success');
+
+      // Sidebar host hint
+      try {
+        const u = new URL(nasEndpoint);
+        setText('pingHost', u.host);
+      } catch (_) {}
     } else {
       throw new Error(t('options.status.unexpectedResponse'));
     }
-    
   } catch (error) {
     console.error('Connection test failed:', error);
-    
-    let errorMessage = t('options.status.connectionFailedPrefix');
-    
-    if (error.message.includes('Failed to fetch')) {
-      errorMessage += t('options.status.cannotReach');
-    } else if (error.message.includes('401')) {
-      errorMessage += t('options.status.invalidApiKey');
-    } else if (error.message.includes('404')) {
-      errorMessage += t('options.status.apiNotFound');
+    let label = t('options.ping.unreachable') || 'unreachable';
+    let toast = t('options.status.connectionFailedPrefix');
+    if (String(error.message).includes('Failed to fetch')) {
+      toast += t('options.status.cannotReach');
+    } else if (String(error.message).includes('401')) {
+      toast += t('options.status.invalidApiKey');
+      label = '401';
+    } else if (String(error.message).includes('404')) {
+      toast += t('options.status.apiNotFound');
+      label = '404';
     } else {
-      errorMessage += error.message;
+      toast += error.message;
     }
-    
-    showStatus(errorMessage, 'error');
+    setPingState('pingRow',     'err', label);
+    setPingState('lastPingRow', 'err', label);
+    showStatus(toast, 'error');
+  } finally {
+    $('testBtn').disabled = false;
+    setText('testBtnText', t('options.btn.testInline') || 'test');
   }
 }
 
-// Show status message
-function showStatus(message, type) {
-  const statusEl = document.getElementById('statusMessage');
-  statusEl.textContent = message;
-  statusEl.className = `status-message ${type}`;
-  statusEl.style.display = 'block';
-  
-  // Auto-hide success messages after 5 seconds
-  if (type === 'success') {
+// ---------- API key show/hide/copy ----------
+function toggleApiKeyMask() {
+  const el = $('apiKey');
+  el.classList.toggle('masked');
+  setText('apiKeyToggleText', getToggleVisibleLabel());
+}
+
+async function copyApiKey() {
+  const v = $('apiKey').value;
+  if (!v) return;
+  try {
+    await navigator.clipboard.writeText(v);
+    setText('apiKeyCopyText', t('options.btn.copied') || 'copied');
+    $('apiKeyCopyBtn').classList.add('copied');
     setTimeout(() => {
-      statusEl.style.display = 'none';
-    }, 5000);
+      setText('apiKeyCopyText', t('options.btn.copy') || 'copy');
+      $('apiKeyCopyBtn').classList.remove('copied');
+    }, 1400);
+  } catch (e) {
+    showStatus(t('options.status.copyFailed') || 'Copy failed', 'error');
   }
 }
+
+// ---------- Init ----------
+document.addEventListener('DOMContentLoaded', async () => {
+  i18n = (typeof window !== 'undefined' && window.WV2N_I18N) ? window.WV2N_I18N : null;
+
+  // Version in sidebar + about pane
+  try {
+    const v = chrome.runtime.getManifest().version || '-';
+    setText('extVersion', v);
+    setText('aboutVersion', `"${v}"`);
+  } catch (_) {}
+
+  // Load settings
+  const settings = await chrome.storage.sync.get([
+    'nasEndpoint', 'apiKey',
+    'autoDetect', 'showNotifications',
+    'uiLanguage', 'uiTheme',
+    'nasProfiles', 'activeProfileId',
+  ]);
+
+  applyTheme(settings.uiTheme || 'dark');
+  applyUiLanguage(settings.uiLanguage);
+  await migrateOrLoadProfiles(settings);
+
+  // Populate fields
+  $('nasEndpoint').value = settings.nasEndpoint || '';
+  $('apiKey').value      = settings.apiKey      || '';
+  setToggle('autoDetect',       settings.autoDetect       !== false);
+  setToggle('showNotifications', settings.showNotifications !== false);
+  const uiLanguage = settings.uiLanguage === 'zh' ? 'zh-TW' : (settings.uiLanguage || '');
+  $('uiLanguage').value = uiLanguage;
+
+  savedSnapshot = {
+    nasEndpoint: $('nasEndpoint').value.trim(),
+    apiKey:      $('apiKey').value.trim(),
+  };
+
+  // Sidebar host hint
+  if (savedSnapshot.nasEndpoint) {
+    try { setText('pingHost', new URL(savedSnapshot.nasEndpoint).host); } catch (_) {}
+  }
+
+  // Wire up nav
+  document.querySelectorAll('.nav-item').forEach(btn => {
+    btn.addEventListener('click', () => switchNav(btn.dataset.nav));
+  });
+
+  // Wire up theme toggle
+  $('themeToggleBtn').addEventListener('click', () => {
+    setTheme(theme === 'light' ? 'dark' : 'light');
+  });
+
+  // Wire up connection inputs
+  $('nasEndpoint').addEventListener('input', refreshDirtyIndicator);
+  $('apiKey').addEventListener('input', refreshDirtyIndicator);
+
+  // Wire up inline buttons
+  $('testBtn').addEventListener('click', testConnection);
+  $('apiKeyToggleBtn').addEventListener('click', toggleApiKeyMask);
+  $('apiKeyCopyBtn').addEventListener('click', copyApiKey);
+
+  // Wire up status bar buttons
+  $('saveBtn').addEventListener('click', saveSettings);
+  $('discardBtn').addEventListener('click', discardChanges);
+
+  // Wire up profiles
+  renderProfilesPane();
+  const addBtn = $('addProfileBtn');
+  if (addBtn) addBtn.addEventListener('click', addCurrentAsProfile);
+
+  // Wire up preference toggles (auto-save on change)
+  $('autoDetect').addEventListener('click', async () => {
+    setToggle('autoDetect', !getToggle('autoDetect'));
+    await savePreferences();
+  });
+  $('showNotifications').addEventListener('click', async () => {
+    setToggle('showNotifications', !getToggle('showNotifications'));
+    await savePreferences();
+  });
+  $('uiLanguage').addEventListener('change', async () => {
+    await savePreferences();
+    applyUiLanguage(($('uiLanguage').value || '').trim());
+  });
+
+  // Keyboard shortcuts: Ctrl/Cmd+S → save, Esc on connection pane → discard
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+      e.preventDefault();
+      saveSettings();
+    }
+  });
+
+  refreshDirtyIndicator();
+  recomputeGutter();
+  window.addEventListener('resize', recomputeGutter);
+});

@@ -104,19 +104,25 @@
 
   // For dynamically added videos, observe DOM mutations
   const observer = new MutationObserver((mutations) => {
+    let sawNewVideo = false;
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
         if (node.nodeType !== Node.ELEMENT_NODE) continue;
-        
+
         // Check if it's a video element or contains one
         if (node.tagName === 'VIDEO') {
           node.addEventListener('play', handlePlay);
+          sawNewVideo = true;
         } else if (node.querySelectorAll) {
           const videos = node.querySelectorAll('video');
-          videos.forEach(v => v.addEventListener('play', handlePlay));
+          if (videos.length > 0) {
+            videos.forEach(v => v.addEventListener('play', handlePlay));
+            sawNewVideo = true;
+          }
         }
       }
     }
+    if (sawNewVideo) schedulePageThumbnails();
   });
 
   observer.observe(document.body || document.documentElement, {
@@ -128,6 +134,81 @@
   document.querySelectorAll('video').forEach(v => {
     v.addEventListener('play', handlePlay);
   });
+
+  // ---- Page thumbnail scraping (og:image + <video poster>) ----
+  function absoluteUrl(maybeRelative) {
+    if (!maybeRelative) return null;
+    try { return new URL(maybeRelative, location.href).href; }
+    catch (_) { return maybeRelative; }
+  }
+
+  function getPageThumbnail() {
+    const selectors = [
+      'meta[property="og:image:secure_url"]',
+      'meta[property="og:image:url"]',
+      'meta[property="og:image"]',
+      'meta[name="og:image"]',
+      'meta[name="twitter:image"]',
+      'meta[name="twitter:image:src"]',
+      'meta[itemprop="thumbnailUrl"]',
+      'link[rel="image_src"]',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      const v = el.getAttribute('content') || el.getAttribute('href');
+      if (v) return absoluteUrl(v);
+    }
+    return null;
+  }
+
+  function getVideoPosters() {
+    const out = [];
+    document.querySelectorAll('video').forEach((v, idx) => {
+      const poster = v.getAttribute('poster');
+      if (!poster) return;
+      out.push({
+        poster: absoluteUrl(poster),
+        src: v.currentSrc || v.src || null,
+        index: idx,
+      });
+    });
+    return out;
+  }
+
+  function sendPageThumbnails() {
+    const pageThumbnail = getPageThumbnail();
+    const videoPosters = getVideoPosters();
+    if (!pageThumbnail && videoPosters.length === 0) return;
+    try {
+      chrome.runtime.sendMessage({
+        action: 'pageThumbnails',
+        pageUrl: window.location.href,
+        pageThumbnail: pageThumbnail,
+        videoPosters: videoPosters,
+      });
+    } catch (e) {
+      // Extension context may be invalid
+    }
+  }
+
+  // Initial scrape — wait for head to settle
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', sendPageThumbnails, { once: true });
+  } else {
+    sendPageThumbnails();
+  }
+
+  // Re-scrape when DOM changes (debounced) — handles SPA route changes + late-loaded posters
+  let pageThumbsTimer = null;
+  function schedulePageThumbnails() {
+    clearTimeout(pageThumbsTimer);
+    pageThumbsTimer = setTimeout(sendPageThumbnails, 600);
+  }
+  const headObserver = new MutationObserver(schedulePageThumbnails);
+  if (document.head) {
+    headObserver.observe(document.head, { childList: true, subtree: true, attributes: true });
+  }
 
   // Forward manifest detection to background
   function forwardManifest(data) {
