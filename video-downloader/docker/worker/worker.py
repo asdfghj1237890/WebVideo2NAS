@@ -87,6 +87,45 @@ def _enforce_ssrf_guard(url: str) -> None:
             raise Exception("URL host not allowed")
 
 
+# Defense-in-depth path validation. Even though the API normalizes/validates
+# output_subdir before insert, never trust DB contents — re-check before use.
+_INVALID_SUBDIR_CHARS = '<>:"|?*'
+
+
+def resolve_output_dir(subdir):
+    """Return absolute path to write files for this job.
+
+    base/<subdir> when subdir is set and safe; base alone otherwise. Raises
+    if the resolved path escapes the base directory.
+    """
+    from pathlib import Path
+    base = Path("/downloads").resolve()
+    if not subdir:
+        return base
+    cleaned = subdir.strip().replace("\\", "/")
+    if not cleaned:
+        return base
+    parts = [p.strip() for p in cleaned.split("/") if p.strip()]
+    if not parts:
+        return base
+    for p in parts:
+        if p in (".", ".."):
+            raise Exception(f"Invalid output_subdir component: {p!r}")
+        if any(ord(c) < 0x20 for c in p):
+            raise Exception("output_subdir contains control characters")
+        for bad in _INVALID_SUBDIR_CHARS:
+            if bad in p:
+                raise Exception(f"output_subdir contains invalid character: {bad!r}")
+        if len(p) == 2 and p[1] == ":" and p[0].isalpha():
+            raise Exception("output_subdir must not contain drive letters")
+    candidate = (base / "/".join(parts)).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        raise Exception("Resolved output path escapes base directory")
+    return candidate
+
+
 class DownloadWorker:
     """Worker class for processing download jobs"""
     
@@ -174,16 +213,16 @@ class DownloadWorker:
         try:
             result = self.db.execute(text("""
                 SELECT j.id, j.url, j.title, j.retry_count,
-                       jm.referer, jm.headers, jm.source_page
+                       jm.referer, jm.headers, jm.source_page, jm.output_subdir
                 FROM jobs j
                 LEFT JOIN job_metadata jm ON j.id = jm.job_id
                 WHERE j.id = :job_id
             """), {"job_id": job_id})
-            
+
             row = result.first()
             if not row:
                 return None
-            
+
             # Handle headers - can be dict (JSONB) or string (JSON)
             headers = {}
             if row.headers:
@@ -191,7 +230,7 @@ class DownloadWorker:
                     headers = row.headers
                 elif isinstance(row.headers, str):
                     headers = json.loads(row.headers)
-            
+
             return {
                 "id": str(row.id),
                 "url": row.url,
@@ -199,9 +238,10 @@ class DownloadWorker:
                 "retry_count": row.retry_count,
                 "referer": row.referer,
                 "headers": headers,
-                "source_page": row.source_page
+                "source_page": row.source_page,
+                "output_subdir": row.output_subdir,
             }
-        
+
         except Exception as e:
             logger.error(f"Failed to get job details: {e}")
             return None
@@ -307,8 +347,9 @@ class DownloadWorker:
             if not safe_title:
                 safe_title = f"video_{job_id[:8]}"
 
-            output_dir = Path("/downloads/completed")
+            output_dir = resolve_output_dir(job.get('output_subdir'))
             output_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Output directory: {output_dir}")
 
             base_name = safe_title
             output_file = output_dir / f"{base_name}.mp4"
@@ -468,20 +509,21 @@ class DownloadWorker:
             safe_title = "".join(c for c in job['title'] if c.isalnum() or c in (' ', '-', '_')).strip()
             if not safe_title:
                 safe_title = f"video_{job_id[:8]}"
-            
-            output_dir = Path("/downloads/completed")
+
+            output_dir = resolve_output_dir(job.get('output_subdir'))
             output_dir.mkdir(parents=True, exist_ok=True)
-            
+            logger.info(f"Output directory: {output_dir}")
+
             base_name = safe_title
             output_file = output_dir / f"{base_name}.mp4"
             counter = 1
-            
+
             while output_file.exists():
                 output_file = output_dir / f"{base_name} ({counter}).mp4"
                 counter += 1
-            
+
             output_file = str(output_file)
-            
+
             # Stream download with progress (using legacy SSL for compatibility)
             session = create_legacy_session()
             response = session.get(
@@ -1018,19 +1060,20 @@ class DownloadWorker:
                 safe_title = f"video_{job_id[:8]}"
             
             # Handle file name collisions
-            output_dir = Path("/downloads/completed")
+            output_dir = resolve_output_dir(job.get('output_subdir'))
             output_dir.mkdir(parents=True, exist_ok=True)
-            
+            logger.info(f"Output directory: {output_dir}")
+
             base_name = safe_title
             output_file = output_dir / f"{base_name}.mp4"
             counter = 1
-            
+
             while output_file.exists():
                 output_file = output_dir / f"{base_name} ({counter}).mp4"
                 counter += 1
-            
+
             output_file = str(output_file)
-            
+
             # Merge segments
             success = merge_segments(
                 segment_files=segment_files,
@@ -1145,13 +1188,25 @@ class DownloadWorker:
         self.db.close()
 
 
+def _ensure_schema() -> None:
+    """Idempotent schema migration — same as API. Safe to run from multiple
+    workers concurrently; PG handles the lock. Tolerant of failures."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS output_subdir TEXT"
+            ))
+    except Exception as e:
+        logger.warning(f"Schema migration skipped: {e}")
+
+
 def main():
     """Main entry point"""
     logger.info("="*50)
     logger.info("WebVideo2NAS Worker")
-    logger.info("Version: 1.9.2")
+    logger.info("Version: 1.10.0")
     logger.info("="*50)
-    
+
     # Wait for database to be ready
     max_retries = 30
     for i in range(max_retries):
@@ -1167,6 +1222,8 @@ def main():
                 sys.exit(1)
             logger.warning(f"Waiting for database... ({i+1}/{max_retries})")
             time.sleep(2)
+
+    _ensure_schema()
     
     # Wait for Redis to be ready
     for i in range(max_retries):

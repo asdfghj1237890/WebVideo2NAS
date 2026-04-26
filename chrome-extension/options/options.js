@@ -12,8 +12,29 @@ let theme = 'dark';
 let savedSnapshot = { nasEndpoint: '', apiKey: '' }; // last persisted (for dirty + discard)
 
 // Profiles state (loaded from chrome.storage.sync)
-let profiles = [];           // [{ id, name, endpoint, apiKey }]
+let profiles = [];           // [{ id, name, endpoint, apiKey, subdir }]
 let activeProfileId = null;
+
+// Subdir validation: relative path under /downloads on the NAS.
+// Empty = save to root (current behavior). Reject traversal/absolute/control chars.
+function sanitizeSubdir(input) {
+  if (input == null) return '';
+  let s = String(input).trim();
+  if (!s) return '';
+  s = s.replace(/\\/g, '/');
+  return s.split('/').map(p => p.trim()).filter(Boolean).join('/');
+}
+function subdirError(input) {
+  const s = sanitizeSubdir(input);
+  if (!s) return null;
+  if (s.length > 255) return 'too long (max 255 chars)';
+  for (const part of s.split('/')) {
+    if (part === '..' || part === '.') return `invalid component "${part}"`;
+    if (/[\x00-\x1f<>:"|?*]/.test(part)) return `invalid char in "${part}"`;
+    if (/^[a-zA-Z]:$/.test(part)) return 'drive letters not allowed';
+  }
+  return null;
+}
 
 function newProfileId() {
   return 'p_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
@@ -236,9 +257,15 @@ async function migrateOrLoadProfiles(stored) {
       name: t('options.profiles.defaultName') || 'Default',
       endpoint: stored.nasEndpoint,
       apiKey: stored.apiKey || '',
+      subdir: stored.nasOutputSubdir || '',
     }];
     activeProfileId = id;
     await persistProfiles();
+  }
+
+  // Backfill subdir on existing profiles loaded from older versions
+  for (const p of profiles) {
+    if (typeof p.subdir !== 'string') p.subdir = '';
   }
 
   // Ensure activeProfileId points to a real profile
@@ -267,8 +294,11 @@ function renderProfilesPane() {
     const safeEndpoint = escapeHtml(p.endpoint || '');
     const safeHost = escapeHtml(host);
     const safePort = escapeHtml(port);
+    const safeSubdir = escapeHtml(p.subdir || '');
     const activateLabel = t('options.profiles.activate') || 'activate';
     const deleteLabel = t('options.profiles.delete') || 'delete';
+    const subdirHelp = t('options.profiles.subdirHelp') || '# subfolder under /downloads (blank = root)';
+    const subdirPlaceholder = t('options.profiles.subdirPlaceholder') || 'e.g. anime/work-safe';
     return `
       <div class="profile-block">
         <div class="profile-head${isActive ? ' active' : ''}" data-pid="${safeId}" data-action="activate">
@@ -299,6 +329,20 @@ function renderProfilesPane() {
           <span class="eq">=</span>
           <span class="val readonly">${safePort}</span>
         </div>
+        <div class="kv">
+          <span class="key">subdir</span>
+          <span class="eq">=</span>
+          <span class="kv-edit">
+            <span class="quote">"</span>
+            <input class="input profile-subdir" type="text"
+                   data-pid="${safeId}"
+                   value="${safeSubdir}"
+                   placeholder="${escapeHtml(subdirPlaceholder)}"
+                   autocomplete="off">
+            <span class="quote">"</span>
+          </span>
+          <span class="comment-inline" data-subdir-comment="${safeId}">${escapeHtml(subdirHelp)}</span>
+        </div>
       </div>
     `;
   }).join('');
@@ -318,7 +362,57 @@ function renderProfilesPane() {
     });
   });
 
+  // Wire up subdir inputs (debounced save on input, immediate on blur)
+  list.querySelectorAll('.profile-subdir').forEach(input => {
+    let timer = null;
+    const commit = () => updateProfileSubdir(input.dataset.pid, input.value, input);
+    input.addEventListener('input', () => {
+      validateSubdirInputUI(input);
+      clearTimeout(timer);
+      timer = setTimeout(commit, 400);
+    });
+    input.addEventListener('blur', () => {
+      clearTimeout(timer);
+      commit();
+    });
+    input.addEventListener('click', (e) => e.stopPropagation());
+  });
+
   recomputeGutter();
+}
+
+function validateSubdirInputUI(input) {
+  const err = subdirError(input.value);
+  input.classList.toggle('input-error', !!err);
+  const comment = document.querySelector(`[data-subdir-comment="${input.dataset.pid}"]`);
+  if (comment) {
+    if (err) {
+      comment.textContent = '# ⚠ ' + err;
+    } else {
+      comment.textContent = t('options.profiles.subdirHelp')
+        || '# subfolder under /downloads (blank = root)';
+    }
+  }
+}
+
+async function updateProfileSubdir(pid, raw, inputEl) {
+  const p = profiles.find(x => x.id === pid);
+  if (!p) return;
+  const err = subdirError(raw);
+  if (err) {
+    showStatus((t('options.profiles.subdirInvalid') || 'Invalid subdir') + ': ' + err, 'error');
+    return;
+  }
+  const cleaned = sanitizeSubdir(raw);
+  if (p.subdir === cleaned) return;
+  p.subdir = cleaned;
+  if (inputEl && inputEl.value !== cleaned) inputEl.value = cleaned;
+  await persistProfiles();
+  // If active profile, also update the storage mirror so background.js picks it up
+  if (pid === activeProfileId) {
+    await chrome.storage.sync.set({ nasOutputSubdir: cleaned });
+  }
+  showStatus(t('options.profiles.subdirSaved') || 'subdir saved', 'success');
 }
 
 async function switchActiveProfile(id) {
@@ -331,8 +425,9 @@ async function switchActiveProfile(id) {
   $('apiKey').value      = p.apiKey   || '';
   savedSnapshot = { nasEndpoint: p.endpoint || '', apiKey: p.apiKey || '' };
   await chrome.storage.sync.set({
-    nasEndpoint: p.endpoint || '',
-    apiKey:      p.apiKey   || '',
+    nasEndpoint:     p.endpoint || '',
+    apiKey:          p.apiKey   || '',
+    nasOutputSubdir: p.subdir   || '',
     activeProfileId,
   });
   refreshDirtyIndicator();
@@ -382,9 +477,12 @@ async function addCurrentAsProfile() {
   if (!name) return;
 
   const id = newProfileId();
-  profiles.push({ id, name, endpoint: ep, apiKey: ak });
+  // Inherit current active profile's subdir as a sensible default for the new one
+  const inheritedSubdir = activeProfile()?.subdir || '';
+  profiles.push({ id, name, endpoint: ep, apiKey: ak, subdir: inheritedSubdir });
   activeProfileId = id;
   await persistProfiles();
+  await chrome.storage.sync.set({ nasOutputSubdir: inheritedSubdir });
   renderProfilesPane();
   showStatus(t('options.profiles.created', { name }) || `Saved profile "${name}"`, 'success');
 }
@@ -572,7 +670,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Load settings
   const settings = await chrome.storage.sync.get([
-    'nasEndpoint', 'apiKey',
+    'nasEndpoint', 'apiKey', 'nasOutputSubdir',
     'autoDetect', 'showNotifications',
     'uiLanguage', 'uiTheme',
     'nasProfiles', 'activeProfileId',
@@ -581,6 +679,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyTheme(settings.uiTheme || 'dark');
   applyUiLanguage(settings.uiLanguage);
   await migrateOrLoadProfiles(settings);
+
+  // Keep nasOutputSubdir mirror in sync with the active profile (background.js reads it)
+  const ap = activeProfile();
+  const apSubdir = (ap && ap.subdir) || '';
+  if ((settings.nasOutputSubdir || '') !== apSubdir) {
+    try { await chrome.storage.sync.set({ nasOutputSubdir: apSubdir }); } catch (_) {}
+  }
 
   // Populate fields
   $('nasEndpoint').value = settings.nasEndpoint || '';

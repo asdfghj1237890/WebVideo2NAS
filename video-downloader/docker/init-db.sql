@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS job_metadata (
     resolution VARCHAR(20),
     duration INTEGER,
     segment_count INTEGER,
-    user_agent TEXT
+    user_agent TEXT,
+    output_subdir TEXT
 );
 
 -- Config table: System configuration

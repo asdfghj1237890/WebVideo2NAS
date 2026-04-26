@@ -311,7 +311,7 @@ The system deploys **2 independent workers** by default, both pulling from the s
 6. Extension shows "Job submitted" notification
 7. Worker processes download in background
 8. User receives completion notification
-9. Video available in NAS `/downloads/completed/`
+9. Video available in NAS `/downloads/` (or `/downloads/<subdir>/` when the active profile sets `output_subdir`)
 
 ### 5.3 Monitoring
 1. User opens extension popup

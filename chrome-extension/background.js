@@ -750,8 +750,8 @@ async function sendToNAS(url, pageTitle, pageUrl) {
     }
 
     // Get settings
-    const settings = await chrome.storage.sync.get(['nasEndpoint', 'apiKey']);
-    
+    const settings = await chrome.storage.sync.get(['nasEndpoint', 'apiKey', 'nasOutputSubdir']);
+
     if (!settings.nasEndpoint || !settings.apiKey) {
       showNotification('Configuration Required', 'Please configure NAS settings in extension options');
       chrome.runtime.openOptionsPage();
@@ -950,6 +950,9 @@ async function sendToNAS(url, pageTitle, pageUrl) {
     };
     if (formatHint) {
       requestBody.format = formatHint;
+    }
+    if (settings.nasOutputSubdir && settings.nasOutputSubdir.trim()) {
+      requestBody.output_subdir = settings.nasOutputSubdir.trim();
     }
     
     console.log('Sending to NAS:');

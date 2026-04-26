@@ -63,6 +63,46 @@ def test_rate_limit_read_bucket_has_higher_limit(monkeypatch):
     assert api_main._RATE_LIMIT_MULTIPLIERS["read"] > api_main._RATE_LIMIT_MULTIPLIERS["write"]
 
 
+def test_output_subdir_normalizes_and_validates(monkeypatch):
+    api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+
+    # Empty / whitespace → None
+    assert api_main.normalize_output_subdir(None) is None
+    assert api_main.normalize_output_subdir("") is None
+    assert api_main.normalize_output_subdir("   ") is None
+
+    # Strips leading/trailing slashes and collapses repeats
+    assert api_main.normalize_output_subdir("/anime/") == "anime"
+    assert api_main.normalize_output_subdir("anime//work-safe") == "anime/work-safe"
+    assert api_main.normalize_output_subdir("\\anime\\sfw\\") == "anime/sfw"
+
+    # Rejects parent traversal
+    for bad in ("..", "../etc", "anime/..", "anime/../sfw", "."):
+        with pytest.raises(ValueError):
+            api_main.normalize_output_subdir(bad)
+
+    # Rejects reserved chars and drive letters
+    for bad in ('a<b', 'a>b', 'a:b', 'a"b', 'a|b', 'a?b', 'a*b', 'C:/foo', "ctrl\x01char"):
+        with pytest.raises(ValueError):
+            api_main.normalize_output_subdir(bad)
+
+
+def test_download_request_carries_output_subdir(monkeypatch):
+    api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+    r = api_main.DownloadRequest(
+        url="https://example.com/v/playlist.m3u8",
+        output_subdir="/Anime/Work Safe/",
+    )
+    assert r.output_subdir == "Anime/Work Safe"
+
+    # Invalid subdir bubbles up as a Pydantic validation error
+    with pytest.raises(Exception):
+        api_main.DownloadRequest(
+            url="https://example.com/v/playlist.m3u8",
+            output_subdir="../escape",
+        )
+
+
 def test_health_endpoint_requires_auth_even_for_localhost(monkeypatch):
     """Regression: previously /api/health skipped auth when client IP looked
     like localhost, which was bypassable via X-Forwarded-For: 127.0.0.1.

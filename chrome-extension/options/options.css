@@ -341,6 +341,10 @@ input:focus-visible, select:focus-visible { outline: none; }
   -webkit-text-security: disc;
   text-security: disc;
 }
+.kv-edit .input.input-error {
+  border-bottom-color: #e06c75;
+  color: #e06c75;
+}
 
 /* Inline buttons (test / show / hide / copy / etc.) */
 .inline-btn {

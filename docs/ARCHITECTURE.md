@@ -491,7 +491,7 @@ What the implementation actually does:
 - **Worker scaling**: each worker container processes one video at a time. Add more `worker*` services to scale horizontally; Redis `BLPOP` distributes jobs without coordination.
 - **DB indexes** ([init-db.sql](../video-downloader/docker/init-db.sql)): `idx_jobs_status`, `idx_jobs_created_at`. Status polling and listing don't full-scan.
 - **Connection reuse**: each worker keeps a single `requests.Session` (or `curl_cffi` `BrowserSession` for TLS impersonation) for the playlist + key + segments to preserve cookies and the JA3 fingerprint.
-- **Storage**: HLS segments land in `tempfile.mkdtemp()`, ffmpeg merges into `/downloads/completed/`, then the temp dir is deleted. MP4 multi-part downloads write `.partNN` files alongside the output then assemble in order.
+- **Storage**: HLS segments land in `tempfile.mkdtemp()`, ffmpeg merges into `/downloads/` (or `/downloads/<subdir>/` when the request carries a per-profile `output_subdir`), then the temp dir is deleted. MP4 multi-part downloads write `.partNN` files alongside the output then assemble in order.
 
 Rough throughput on a 4-core / 4 GB Synology DS920+ class device: 1080p HLS video (~1 GB) typically completes in 5–15 minutes, dominated by origin bandwidth rather than CPU.
 
@@ -543,7 +543,7 @@ Internet
 │ │ └─→ db_cleanup                  │ │
 │ │                                 │ │
 │ │ Volumes:                        │ │
-│ │ ├─→ /volume1/nsfw_video/...     │ │
+│ │ ├─→ /volume1/video-downloader/downloads     │ │
 │ │ ├─→ /volume1/docker/video-downloader/db_data    │ │
 │ │ ├─→ /volume1/docker/video-downloader/redis_data │ │
 │ │ └─→ /volume1/docker/video-downloader/logs       │ │

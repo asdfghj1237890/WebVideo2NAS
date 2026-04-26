@@ -151,7 +151,7 @@ Pick the right compose file for your host:
 | **Synology NAS** | `mv docker-compose.synology.yml docker-compose.yml` |
 | **Anything else** (Linux / macOS / Windows Docker) | `mv docker-compose_not_synology.yml docker-compose.yml` |
 
-> Synology paths are hard-coded as `/volume1/...` (DB, Redis, downloads, logs). If your shared folder isn't named `nsfw_video`, edit the `volumes:` section accordingly.
+> Synology paths are hard-coded as `/volume1/...` (DB, Redis, downloads, logs). Adjust the `volumes:` section if your layout differs.
 
 #### 2. Set up `.env`
 
@@ -190,7 +190,7 @@ If you'd rather not SSH:
    - `/volume1/docker/video-downloader/db_data/` (DB persistence)
    - `/volume1/docker/video-downloader/redis_data/` (Redis persistence)
    - `/volume1/docker/video-downloader/logs/` (logs)
-   - `/volume1/nsfw_video/video-downloader/downloads/completed/` (downloaded videos — change `nsfw_video` to your shared folder name; edit the compose file's `volumes:` if it differs)
+   - `/volume1/video-downloader/downloads/` (downloaded videos — adjust the path to match your shared folder, and update the compose file's `volumes:` if it differs)
 3. **Upload + extract** `WebVideo2NAS-downloader-docker.zip` to `/volume1/docker/video-downloader/` (gives `/volume1/docker/video-downloader/docker/`).
 4. **Edit `.env`** in DSM Text Editor (or upload from PC) — set `API_KEY` + `DB_PASSWORD`.
 5. **Container Manager → Projects → Create**:
@@ -238,7 +238,7 @@ Synology UI: open the Project → **Action → Pull** → **Restart**.
 3. Click extension icon to open side panel, or right-click → "Send to NAS"
 4. Video downloads automatically to your NAS (with cookies for authenticated streams)
 5. Monitor progress in the side panel
-6. Access completed videos in `/downloads/completed/`
+6. Access completed videos in `/downloads/` (or `/downloads/<subdir>/` if a per-profile subfolder is configured)
 
 ## Configuration
 

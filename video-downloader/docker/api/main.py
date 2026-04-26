@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8 and MP4)",
-    version="1.9.2"
+    version="1.10.0"
 )
 
 # CORS middleware
@@ -59,6 +59,28 @@ app.add_middleware(
 # Database setup
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def _ensure_schema() -> None:
+    """Idempotent migrations for columns added after init-db.sql shipped.
+
+    Tolerant of failures: in unit tests the database is sqlite without the
+    job_metadata table; in production the table exists and ALTER TABLE ...
+    ADD COLUMN IF NOT EXISTS is a no-op on subsequent boots.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS output_subdir TEXT"
+            ))
+    except Exception as e:
+        logger.warning(f"Schema migration skipped: {e}")
+
+
+@app.on_event("startup")
+async def _on_startup():
+    _ensure_schema()
+
 
 # Redis setup
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -162,6 +184,37 @@ def _enforce_ssrf_guard(url: HttpUrl) -> None:
         if not _is_ip_public(ip):
             raise HTTPException(status_code=400, detail="URL host not allowed")
 
+# Subfolder for storing this download under /downloads.
+# Empty/None → save to root (legacy behavior). Only relative paths allowed,
+# no parent traversal, no absolute paths, no Windows drive letters, no
+# control/reserved characters. Worker re-validates as defense in depth.
+_INVALID_SUBDIR_CHARS = '<>:"|?*'
+
+def normalize_output_subdir(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    s = value.strip().replace("\\", "/")
+    if not s:
+        return None
+    parts = [p.strip() for p in s.split("/") if p.strip()]
+    if not parts:
+        return None
+    for p in parts:
+        if p in (".", ".."):
+            raise ValueError("output_subdir must not contain '.' or '..' components")
+        if any(ord(c) < 0x20 for c in p):
+            raise ValueError("output_subdir must not contain control characters")
+        for bad in _INVALID_SUBDIR_CHARS:
+            if bad in p:
+                raise ValueError(f"output_subdir contains invalid character: {bad!r}")
+        # Reject Windows drive letters like "C:"
+        if len(p) == 2 and p[1] == ":" and p[0].isalpha():
+            raise ValueError("output_subdir must not contain drive letters")
+    cleaned = "/".join(parts)
+    if len(cleaned) > 255:
+        raise ValueError("output_subdir is too long (max 255 chars)")
+    return cleaned
+
 # Pydantic models
 class DownloadRequest(BaseModel):
     url: HttpUrl
@@ -170,6 +223,7 @@ class DownloadRequest(BaseModel):
     headers: Optional[dict] = None
     source_page: Optional[str] = None
     format: Optional[str] = None
+    output_subdir: Optional[str] = None
 
     @model_validator(mode='after')
     def validate_video_url(self):
@@ -178,6 +232,8 @@ class DownloadRequest(BaseModel):
         if not is_valid and self.format not in ('m3u8', 'mpd', 'mp4'):
             raise ValueError('URL must contain .m3u8, .mpd, or .mp4 (or provide format hint)')
         _enforce_ssrf_guard(self.url)
+        # Normalize+validate subdir; raises ValueError → 422 from FastAPI
+        self.output_subdir = normalize_output_subdir(self.output_subdir)
         return self
 
 class JobResponse(BaseModel):
@@ -233,7 +289,7 @@ async def root():
     """Root endpoint"""
     return {
         "name": "WebVideo2NAS API",
-        "version": "1.9.2",
+        "version": "1.10.0",
         "status": "running"
     }
 
@@ -286,15 +342,16 @@ async def submit_download(
         headers_dict = dict(request.headers) if request.headers else {}
         if request.format:
             headers_dict['X-WV2NAS-Format'] = request.format
-        if request.referer or headers_dict or request.source_page:
+        if request.referer or headers_dict or request.source_page or request.output_subdir:
             db.execute(text("""
-                INSERT INTO job_metadata (job_id, referer, headers, source_page)
-                VALUES (:job_id, :referer, :headers, :source_page)
+                INSERT INTO job_metadata (job_id, referer, headers, source_page, output_subdir)
+                VALUES (:job_id, :referer, :headers, :source_page, :output_subdir)
             """), {
                 "job_id": job_id,
                 "referer": request.referer,
                 "headers": json.dumps(headers_dict) if headers_dict else None,
-                "source_page": request.source_page
+                "source_page": request.source_page,
+                "output_subdir": request.output_subdir,
             })
         
         db.commit()

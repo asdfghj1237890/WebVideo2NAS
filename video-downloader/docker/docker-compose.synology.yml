@@ -67,7 +67,7 @@ services:
       - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-10}
       - STORAGE_PATH=/downloads
     volumes:
-      - /volume1/nsfw_video/video-downloader/downloads:/downloads
+      - /volume1/video-downloader/downloads:/downloads
       - /volume1/docker/video-downloader/logs:/logs
     ports:
       - "52052:8000"
@@ -106,7 +106,7 @@ services:
       - FFMPEG_THREADS=${FFMPEG_THREADS:-4}
       - STORAGE_PATH=/downloads
     volumes:
-      - /volume1/nsfw_video/video-downloader/downloads:/downloads
+      - /volume1/video-downloader/downloads:/downloads
       - /volume1/docker/video-downloader/logs:/logs
     depends_on:
       db:
@@ -139,7 +139,7 @@ services:
       - FFMPEG_THREADS=${FFMPEG_THREADS:-4}
       - STORAGE_PATH=/downloads
     volumes:
-      - /volume1/nsfw_video/video-downloader/downloads:/downloads
+      - /volume1/video-downloader/downloads:/downloads
       - /volume1/docker/video-downloader/logs:/logs
     depends_on:
       db:

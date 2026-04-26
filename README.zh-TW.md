@@ -21,7 +21,7 @@
 整體流程很簡單：
 1. Chrome Extension 偵測到影片 URL（M3U8/MP4）
 2. 一鍵送到 NAS 的 API
-3. NAS 背後的 Worker 下載、合併（必要時用 FFmpeg）並放到 `/downloads/completed/`
+3. NAS 背後的 Worker 下載、合併（必要時用 FFmpeg）並放到 `/downloads/`（可在 profile 設定子資料夾）
 
 ## 📦 安裝（Installation）
 
@@ -44,7 +44,7 @@ cd docker
 | **Synology NAS** | `mv docker-compose.synology.yml docker-compose.yml` |
 | **其他**（Linux / macOS / Windows Docker） | `mv docker-compose_not_synology.yml docker-compose.yml` |
 
-> Synology 的 path 寫死成 `/volume1/...`（DB、Redis、downloads、logs）。如果你的共享資料夾不叫 `nsfw_video`，到 compose 檔的 `volumes:` 區塊改一下。
+> Synology 的 path 寫死成 `/volume1/...`（DB、Redis、downloads、logs）。如果你的資料夾配置不同，到 compose 檔的 `volumes:` 區塊改一下。
 
 ### 2. 設定 `.env`
 
@@ -83,7 +83,7 @@ curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/hea
    - `/volume1/docker/video-downloader/db_data/`（DB 持久化）
    - `/volume1/docker/video-downloader/redis_data/`（Redis 持久化）
    - `/volume1/docker/video-downloader/logs/`（log）
-   - `/volume1/nsfw_video/video-downloader/downloads/completed/`（下載完的影片 — 把 `nsfw_video` 改成你的共享資料夾名稱；compose 檔的 `volumes:` 也要相應改）
+   - `/volume1/video-downloader/downloads/`（下載完的影片 — 路徑改成你想放的位置；compose 檔的 `volumes:` 也要相應改）
 3. **上傳 + 解壓** `WebVideo2NAS-downloader-docker.zip` 到 `/volume1/docker/video-downloader/`（解出 `/volume1/docker/video-downloader/docker/`）。
 4. **編輯 `.env`**（DSM Text Editor 或在 PC 編好上傳）— 設 `API_KEY` + `DB_PASSWORD`。
 5. **Container Manager → Projects → Create**：
@@ -128,7 +128,7 @@ Synology UI：在 Project 點 **Action → Pull**，再 **Restart**。
 1. 打開你要下載的影片網站並播放影片
 2. Extension 看到 URL 後，圖示/列表會出現可下載項目
 3. 點 **Send to NAS**（或類似按鈕）送出下載
-4. 在 Extension 介面看進度；完成後到 NAS 的 `/downloads/completed/` 找檔案
+4. 在 Extension 介面看進度；完成後到 NAS 的 `/downloads/` 找檔案（若 profile 設了 `subdir`，則在 `/downloads/<subdir>/`）
 
 ## 設定（Configuration）
 
