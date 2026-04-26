@@ -476,6 +476,20 @@ input:focus-visible, select:focus-visible { outline: none; }
 }
 .status-bar.dirty .unsaved { display: inline; }
 
+/* Auto-save panes (profiles, prefs, about) — hide manual save/discard
+   controls and the unsaved counter, show an auto-save hint instead. */
+.status-bar .autosave-hint {
+  color: var(--text-faint);
+  display: none;
+  font-style: italic;
+}
+.status-bar.autosave-pane .unsaved,
+.status-bar.autosave-pane .cmd-save,
+.status-bar.autosave-pane .cmd-discard {
+  display: none;
+}
+.status-bar.autosave-pane .autosave-hint { display: inline; }
+
 .status-toast {
   font-size: 12px;
   padding: 2px 7px;

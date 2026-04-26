@@ -71,6 +71,10 @@ async function setTheme(next) {
 }
 
 // ---------- Nav ----------
+// Only connection.toml goes through the explicit save/discard flow.
+// profiles + prefs auto-save on edit; about is read-only.
+const PANES_WITH_SAVE = new Set(['connection']);
+
 function switchNav(id) {
   if (!NAV_FILES[id]) return;
   currentNav = id;
@@ -85,6 +89,12 @@ function switchNav(id) {
   const filename = NAV_FILES[id];
   setText('titleFilename', filename);
   setText('statusFilename', filename);
+
+  // Show save/discard + unsaved counter only when the active pane uses them.
+  const usesSave = PANES_WITH_SAVE.has(id);
+  const bar = $('statusBar');
+  if (bar) bar.classList.toggle('autosave-pane', !usesSave);
+
   recomputeGutter();
 }
 
@@ -180,6 +190,7 @@ function localizeStaticText() {
   setText('apiKeyCopyText', t('options.btn.copy') || 'copy');
   setText('saveHint', t('options.cmd.saveHint'));
   setText('discardHint', t('options.cmd.discardHint'));
+  setText('autosaveHint', t('options.cmd.autosaveHint') || '↻ auto-saves on edit');
 
   // about steps
   setText('howToUseStep1', t('options.howToUse.step1'));

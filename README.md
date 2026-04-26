@@ -344,6 +344,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.1] - 2026-04-27
+
+#### Fixed
+- Save / discard buttons in the options page status bar appeared "broken" on the profiles and prefs panes (they stayed greyed because dirty-tracking only watches the connection.toml fields). The buttons + unsaved counter are now hidden on auto-save panes; an `↻ auto-saves on edit` hint appears in their place
+
+#### Changed
+- Extension `manifest.json` version: `2.0.0` → `2.1.1` (was unintentionally left at `2.0.0` in the v2.1.0 tag — first version where the feature is reflected in the manifest)
+- README version footer + changelog brought up to date
+
+### [2.1.0] - 2026-04-27
+
+#### Added
+- **Per-profile NAS subfolder**: each profile in the extension can now carry an `output_subdir` (relative path under `/downloads/`). Files land in `/downloads/<subdir>/`; empty = root. Useful for sorting downloads per content category or per NAS share
+- Validation runs in three layers (Chrome options UI, FastAPI Pydantic model, worker path resolver). Worker re-checks via `Path.resolve()` + `relative_to()` so DB tampering can't escape `/downloads/`
+
+#### Changed
+- **Flatten downloads layout**: worker no longer interposes a `completed/` directory — files now go directly to `/downloads/<subdir>/` (or `/downloads/`). Operators wanting to migrate can `mv` existing files out of `…/downloads/completed/`
+- Synology compose template default host path: `/volume1/nsfw_video/video-downloader/downloads` → `/volume1/video-downloader/downloads`
+- API internal version bumped to 1.10.0; extension bumped to 2.1.0
+
+#### Migration
+- Schema migration runs idempotently from API + worker startup (`ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS output_subdir TEXT`) — no manual SQL required
+
 ### [1.9.2] - 2026-04-26
 
 #### Fixed
@@ -593,8 +616,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 1.9.2  
-**Last Updated**: 2026-04-03  
+**Version**: 2.1.1  
+**Last Updated**: 2026-04-27  
 **Port**: 52052 (NAS host port → API container :8000)
 
 ## Star History
