@@ -457,6 +457,22 @@ function isCandidateVideoUrl(rawUrl) {
   return true;
 }
 
+// Capture the tab's current title and stamp it onto the urlInfo. Async because
+// chrome.tabs.get is async — by the time we resolve, the urlInfo is already in
+// the store, so we mutate the live object. Best-effort; missing title is OK.
+function attachTabTitle(urlInfo, tabId) {
+  if (tabId == null || tabId < 0) return;
+  try {
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) return;
+      const title = tab.title;
+      // Only overwrite if we got a real title — keeps a previously-captured
+      // good title if a later fetch races with a transient empty state.
+      if (title && title.trim()) urlInfo.pageTitle = title;
+    });
+  } catch (_) { /* ignore */ }
+}
+
 // Register a detected video URL into per-tab and orphan stores.
 // `extra` may carry additional fields like `detectedFormat`.
 function registerDetectedUrl(details, extra) {
@@ -467,6 +483,7 @@ function registerDetectedUrl(details, extra) {
     tabId: isRealTab ? details.tabId : -1,
     timestamp: Date.now(),
     pageUrl: details.initiator || details.documentUrl,
+    pageTitle: '',  // populated async by attachTabTitle below
     requestType: details.type,
     frameId: details.frameId,
     method: details.method,
@@ -488,6 +505,7 @@ function registerDetectedUrl(details, extra) {
     if (!currentTabUrlKeys[details.tabId].has(details.url)) {
       currentTabUrlKeys[details.tabId].add(details.url);
       currentTabUrls[details.tabId].push(urlInfo);
+      attachTabTitle(urlInfo, details.tabId);
     } else {
       const list = currentTabUrls[details.tabId];
       const existing = list.find(item => item && item.url === details.url);
@@ -501,6 +519,9 @@ function registerDetectedUrl(details, extra) {
         if (extra && extra.detectedFormat && !existing.detectedFormat) {
           existing.detectedFormat = extra.detectedFormat;
         }
+        // Refresh title in case the first capture raced with a transient
+        // empty-title state (loading SPA, etc).
+        if (!existing.pageTitle) attachTabTitle(existing, details.tabId);
         notifyDetectedUrlsUpdated(details.tabId);
       }
     }
@@ -736,6 +757,23 @@ function getDetectedFormat(url) {
   }
   for (const item of orphanUrlInfos) {
     if (item && item.url === url && item.detectedFormat) return item.detectedFormat;
+  }
+  return null;
+}
+
+// Find the page title that was captured when a URL was first detected.
+// This is the source of truth for "what tab/page this URL came from" — using
+// it avoids the multi-tab bug where the active tab at click-time could be
+// different from the tab the URL was actually detected on.
+function getStoredPageTitle(url) {
+  for (const tabId of Object.keys(currentTabUrls)) {
+    const list = currentTabUrls[tabId];
+    if (!Array.isArray(list)) continue;
+    const item = list.find(x => x && x.url === url);
+    if (item && item.pageTitle) return item.pageTitle;
+  }
+  for (const item of orphanUrlInfos) {
+    if (item && item.url === url && item.pageTitle) return item.pageTitle;
   }
   return null;
 }
@@ -1167,7 +1205,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'sendToNAS') {
-    sendToNAS(request.url, request.title, request.pageUrl);
+    // Prefer the title that was captured when this URL was first detected —
+    // that pins the title to the URL's source tab and survives the user
+    // switching tabs before clicking Send. Fall back to whatever the caller
+    // sent (right-click context menu provides the correct tab.title), then
+    // to a generic placeholder.
+    const titleToUse =
+      getStoredPageTitle(request.url) || request.title || 'Untitled Video';
+    sendToNAS(request.url, titleToUse, request.pageUrl);
     sendResponse({ success: true });
   }
 

@@ -817,14 +817,16 @@ async function sendToNAS(url, pageUrl) {
   }
 
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const title = tab.title || t('video.untitled');
-
+    // Don't pass the active tab's title — in a multi-tab session the active
+    // tab may not be the tab this URL came from, leading to mismatched titles.
+    // Background looks up the title that was captured when this URL was first
+    // detected (getStoredPageTitle) and falls back to a placeholder if
+    // missing. We still pass i18n-aware fallback so the language matches.
     chrome.runtime.sendMessage({
       action: 'sendToNAS',
       url: url,
-      title: title,
-      pageUrl: pageUrl || tab.url
+      title: t('video.untitled'),
+      pageUrl: pageUrl || ''
     });
 
     showToast(t('toast.sending'));

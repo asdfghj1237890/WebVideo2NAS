@@ -194,4 +194,29 @@ describe('background.js pure helpers', () => {
     expect(ctx.safeOrigin('https://example.com/a')).toBe('https://example.com');
     expect(ctx.safeOrigin('not a url')).toBe(null);
   });
+
+  it('getStoredPageTitle pins the title to the URL\'s source tab (multi-tab regression)', () => {
+    // Regression: previously the side panel passed the *active* tab's title
+    // when sending to NAS, so a URL detected in tab A would get tab B's
+    // title if the user switched tabs before clicking Send. Now background
+    // looks the title up from the urlInfo that was registered when the URL
+    // was first detected.
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+    });
+
+    const tabA = 100;
+    const tabB = 200;
+    ctx.__eval(`currentTabUrls[${tabA}] = ${JSON.stringify([
+      { url: 'https://cdn.example.com/v/episode-1.m3u8', pageTitle: 'Anime · Episode 1', timestamp: 1000 },
+    ])};`);
+    ctx.__eval(`currentTabUrls[${tabB}] = ${JSON.stringify([
+      { url: 'https://cdn.example.com/v/episode-2.m3u8', pageTitle: 'News · Top Story', timestamp: 1000 },
+    ])};`);
+
+    expect(ctx.getStoredPageTitle('https://cdn.example.com/v/episode-1.m3u8')).toBe('Anime · Episode 1');
+    expect(ctx.getStoredPageTitle('https://cdn.example.com/v/episode-2.m3u8')).toBe('News · Top Story');
+    // Unknown URL → null (caller falls back to whatever the message had)
+    expect(ctx.getStoredPageTitle('https://cdn.example.com/v/unknown.m3u8')).toBe(null);
+  });
 });

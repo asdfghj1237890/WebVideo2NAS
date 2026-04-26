@@ -344,6 +344,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.2] - 2026-04-27
+
+#### Fixed
+- **Multi-tab title mismatch**: when several tabs were open, sending a video to NAS could attach the wrong tab's title to the URL — the side panel was using the *active* tab's title at click time instead of the title of the tab where the URL was actually detected. The background service worker now records the page title at URL-detection time and uses that as the source of truth, so switching tabs before clicking *Send* no longer poisons the filename
+
 ### [2.1.1] - 2026-04-27
 
 #### Fixed
@@ -616,7 +621,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.1  
+**Version**: 2.1.2  
 **Last Updated**: 2026-04-27  
 **Port**: 52052 (NAS host port → API container :8000)
 
