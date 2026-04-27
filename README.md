@@ -344,6 +344,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.4] - 2026-04-28
+
+#### Changed
+- **`pending` job-status colour** in the side panel was indistinguishable from regular dimmed text (both grey). Pending now uses a new `--info` cyan-blue token (`oklch(78% 0.10 230)` dark, `oklch(55% 0.14 230)` light) — same lightness/chroma as `accent` / `warn` / `err`, distinct hue (230). Queued jobs are now visually scannable
+
 ### [2.1.3] - 2026-04-28
 
 #### Changed
@@ -626,7 +631,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.3  
+**Version**: 2.1.4  
 **Last Updated**: 2026-04-28  
 **Port**: 52052 (NAS host port → API container :8000)
 

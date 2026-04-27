@@ -16,6 +16,7 @@
   --warn: oklch(78% 0.12 75);
   --err: oklch(70% 0.18 25);
   --ok: oklch(78% 0.13 155);
+  --info: oklch(78% 0.10 230);
   --font: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans TC', 'Microsoft JhengHei', 'PingFang TC', 'Helvetica Neue', Arial, sans-serif;
   --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace;
   --ambient: radial-gradient(120% 40% at 0% 0%, oklch(28% 0.04 200 / 0.5), transparent 60%),
@@ -39,6 +40,7 @@
   --warn: oklch(58% 0.14 75);
   --err: oklch(55% 0.20 25);
   --ok: oklch(58% 0.14 155);
+  --info: oklch(55% 0.14 230);
   --ambient: radial-gradient(120% 40% at 0% 0%, oklch(85% 0.04 200 / 0.4), transparent 60%),
              radial-gradient(80% 30% at 100% 100%, oklch(85% 0.04 155 / 0.3), transparent 60%);
 }
@@ -526,7 +528,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .job-meta.status-processing .status-text { color: var(--warn); }
 .job-meta.status-completed .status-text { color: var(--text-dim); }
 .job-meta.status-failed .status-text { color: var(--err); }
-.job-meta.status-pending .status-text { color: var(--text-mid); }
+.job-meta.status-pending .status-text { color: var(--info); }
 .job-meta.status-cancelled .status-text { color: var(--text-faint); }
 .job-meta .meta-sep { color: var(--text-faint); }
 
