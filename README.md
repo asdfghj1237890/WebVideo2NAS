@@ -344,6 +344,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.3] - 2026-04-28
+
+#### Changed
+- **Bulk-send safety**: when ≥7 videos are detected, the side panel's bulk bar previously defaulted to a `Send all N` action even when nothing was selected — one accidental tap could fan out N NAS jobs. The Send button is now disabled until at least one video is selected; a separate `Select all (N)` / `Clear` toggle is the only way to bulk-select. The Send button label tracks selection count (`Send selected (N)`) and reads `Select to send` while nothing is selected
+
 ### [2.1.2] - 2026-04-27
 
 #### Fixed
@@ -621,8 +626,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.2  
-**Last Updated**: 2026-04-27  
+**Version**: 2.1.3  
+**Last Updated**: 2026-04-28  
 **Port**: 52052 (NAS host port → API container :8000)
 
 ## Star History

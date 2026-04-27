@@ -196,9 +196,32 @@ function setupEventListeners() {
   const bulkBtn = document.getElementById('bulkBtn');
   if (bulkBtn) {
     bulkBtn.addEventListener('click', () => {
+      // Send is now strictly "send what's selected". The Select-all toggle is
+      // the only path to a bulk send, so an accidental tap can't fan out an
+      // 8-job NAS submit.
+      if (selected.size === 0) return;
       const items = visibleDetectedUrls();
-      const target = selected.size > 0 ? items.filter(it => selected.has(it.url)) : items;
+      const target = items.filter(it => selected.has(it.url));
       bulkSend(target);
+    });
+  }
+
+  const bulkSelectBtn = document.getElementById('bulkSelectBtn');
+  if (bulkSelectBtn) {
+    bulkSelectBtn.addEventListener('click', () => {
+      const items = visibleDetectedUrls();
+      if (items.length === 0) return;
+      const allSelected = items.every(it => selected.has(it.url));
+      if (allSelected) {
+        // Deselect all visible
+        for (const it of items) selected.delete(it.url);
+      } else {
+        // Select all visible
+        for (const it of items) selected.add(it.url);
+      }
+      // Re-render so per-tile checkboxes / selected state visually update
+      renderDetectedUrls({ keepPulse: false });
+      updateBulkBar();
     });
   }
 
@@ -705,7 +728,10 @@ function updateBulkBar() {
   const bar = document.getElementById('bulkBar');
   const line1 = document.getElementById('bulkLine1');
   const line2 = document.getElementById('bulkLine2');
+  const btn = document.getElementById('bulkBtn');
   const btnText = document.getElementById('bulkBtnText');
+  const selBtn = document.getElementById('bulkSelectBtn');
+  const selBtnText = document.getElementById('bulkSelectBtnText');
   if (!bar) return;
 
   const total = detectedUrls.length;
@@ -715,6 +741,8 @@ function updateBulkBar() {
 
   const selCount = selected.size;
   const visible = visibleDetectedUrls();
+  const allVisibleSelected = visible.length > 0 && visible.every(it => selected.has(it.url));
+
   if (line1) {
     line1.textContent = selCount > 0
       ? t('bulk.selected', { n: selCount })
@@ -727,11 +755,21 @@ function updateBulkBar() {
       line2.textContent = '';
     }
   }
+  // Send button: only active when something is selected. No more "send all N"
+  // shortcut — bulk send requires explicit Select-all click first.
+  if (btn) btn.disabled = selCount === 0;
   if (btnText) {
     btnText.textContent = selCount > 0
-      ? t('bulk.sendSelected')
-      : t('bulk.sendAll', { n: visible.length });
+      ? t('bulk.sendSelected', { n: selCount })
+      : t('bulk.sendDisabled');
   }
+  // Toggle: "Select all" → "Clear" once everything visible is selected.
+  if (selBtnText) {
+    selBtnText.textContent = allVisibleSelected
+      ? t('bulk.clearAll')
+      : t('bulk.selectAll', { n: visible.length });
+  }
+  if (selBtn) selBtn.disabled = visible.length === 0;
 }
 
 // ---------- Send to NAS (single + bulk + flight ghost) ----------

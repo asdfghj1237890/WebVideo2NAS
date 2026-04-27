@@ -648,8 +648,31 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   display: inline-flex; align-items: center; gap: 6px;
   transition: transform 120ms ease, filter 120ms, background 320ms, color 320ms;
 }
-.bulk-btn:hover { transform: translateY(-1px); filter: brightness(1.08); }
-.bulk-btn:active { transform: translateY(0); }
+.bulk-btn:not([disabled]):hover { transform: translateY(-1px); filter: brightness(1.08); }
+.bulk-btn:not([disabled]):active { transform: translateY(0); }
+.bulk-btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.4);
+}
+
+/* Secondary toggle (Select all / Clear) — quieter than the primary Send */
+.bulk-btn-secondary {
+  padding: 8px 12px; border-radius: 6px;
+  background: transparent; color: var(--text);
+  border: 1px solid var(--glass-border-hi);
+  font-size: 13px; font-weight: 600;
+  font-family: var(--font); cursor: pointer;
+  transition: background 140ms, border-color 140ms, color 320ms;
+}
+.bulk-btn-secondary:not([disabled]):hover {
+  background: var(--glass-bg-hi);
+  border-color: var(--accent-dim);
+}
+.bulk-btn-secondary[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 
 /* ==== Flight ghost ==== */
 .flight-ghost {
