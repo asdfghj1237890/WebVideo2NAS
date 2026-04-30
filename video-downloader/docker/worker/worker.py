@@ -1074,12 +1074,14 @@ class DownloadWorker:
 
             output_file = str(output_file)
 
-            # Merge segments
+            # Merge segments. Hard-cap output to the m3u8's declared total so anti-leech
+            # streams (whose .ts files pad past EXTINF) don't bloat the merged file.
             success = merge_segments(
                 segment_files=segment_files,
                 output_file=output_file,
                 threads=int(os.getenv('FFMPEG_THREADS', 4)),
-                concat_dir=temp_dir
+                concat_dir=temp_dir,
+                target_duration=playlist_info.get('duration'),
             )
             
             if not success:
@@ -1204,7 +1206,7 @@ def main():
     """Main entry point"""
     logger.info("="*50)
     logger.info("WebVideo2NAS Worker")
-    logger.info("Version: 1.10.0")
+    logger.info("Version: 1.10.1")
     logger.info("="*50)
 
     # Wait for database to be ready

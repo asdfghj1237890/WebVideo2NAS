@@ -21,12 +21,16 @@ class FFmpegMerger:
         segment_files: List[str],
         output_file: str,
         threads: int = 4,
-        concat_dir: Optional[str] = None
+        concat_dir: Optional[str] = None,
+        target_duration: Optional[int] = None,
     ):
         self.segment_files = segment_files
         self.output_file = output_file
         self.threads = threads
         self.concat_dir = concat_dir or str(Path(output_file).parent)
+        # Hard-cap output duration to the m3u8's declared total so anti-leech
+        # streams that pad each .ts beyond its EXTINF don't bloat the merged file.
+        self.target_duration = target_duration
         self.ffmpeg_path: Optional[str] = None
         
         # Verify FFmpeg is available
@@ -77,6 +81,11 @@ class FFmpegMerger:
                 '-c', 'copy',             # Copy streams without re-encoding
                 '-bsf:a', 'aac_adtstoasc', # Fix AAC audio
                 '-threads', str(self.threads),
+            ]
+            if self.target_duration and self.target_duration > 0:
+                command += ['-t', str(self.target_duration)]
+                logger.info(f"Capping output duration at {self.target_duration}s (from m3u8 EXTINF total)")
+            command += [
                 '-y',                     # Overwrite output file
                 self.output_file
             ]
@@ -145,6 +154,10 @@ class FFmpegMerger:
                 '-c:a', 'aac',            # AAC audio
                 '-b:a', '128k',           # Audio bitrate
                 '-threads', str(self.threads),
+            ]
+            if self.target_duration and self.target_duration > 0:
+                command += ['-t', str(self.target_duration)]
+            command += [
                 '-y',
                 self.output_file
             ]
@@ -176,22 +189,26 @@ def merge_segments(
     output_file: str,
     threads: int = 4,
     try_re_encode: bool = True,
-    concat_dir: Optional[str] = None
+    concat_dir: Optional[str] = None,
+    target_duration: Optional[int] = None,
 ) -> bool:
     """
     Convenience function to merge segments
-    
+
     Args:
         segment_files: List of segment file paths
         output_file: Output video file path
         threads: Number of FFmpeg threads
         try_re_encode: Try re-encoding if copy mode fails
         concat_dir: Directory to store temporary concat file (defaults to output_file parent)
-    
+        target_duration: Optional hard-cap (seconds) on output. Pass the m3u8 EXTINF
+            total to defend against anti-leech streams whose .ts files contain padding
+            beyond their declared duration.
+
     Returns:
         True if successful
     """
-    merger = FFmpegMerger(segment_files, output_file, threads, concat_dir)
+    merger = FFmpegMerger(segment_files, output_file, threads, concat_dir, target_duration=target_duration)
     concat_file = Path(concat_dir or Path(output_file).parent) / "concat_list.txt"
     
     try:

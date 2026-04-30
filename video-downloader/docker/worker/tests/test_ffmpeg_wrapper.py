@@ -51,3 +51,71 @@ def test_merge_segments_cleans_up_concat_file(tmp_path, monkeypatch):
     assert ok is True
     assert output.exists() and output.stat().st_size > 0
     assert not (tmp_path / "concat_list.txt").exists()
+
+
+def test_merge_segments_caps_duration_with_target(tmp_path, monkeypatch):
+    """target_duration must add `-t <seconds>` so anti-leech .ts padding is trimmed."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"a")
+    output = tmp_path / "out.mp4"
+
+    captured = {}
+
+    def _fake_run(command, stdout=None, stderr=None, text=None, timeout=None):
+        captured["command"] = list(command)
+        Path(command[-1]).write_bytes(b"mp4")
+
+        class _P:
+            returncode = 0
+            stderr = ""
+
+        return _P()
+
+    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "run", _fake_run)
+
+    ok = merge_segments(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+        target_duration=38,
+    )
+    assert ok is True
+
+    cmd = captured["command"]
+    # `-t 38` must appear before the output file (output-side option).
+    assert "-t" in cmd, f"expected -t flag in command, got: {cmd}"
+    t_idx = cmd.index("-t")
+    assert cmd[t_idx + 1] == "38"
+    assert t_idx < len(cmd) - 1, "-t must precede the output file"
+    # And not consumed by an earlier position that would treat it as input option for concat
+    assert cmd[t_idx - 1] != "-i"
+
+
+def test_merge_segments_omits_t_when_target_is_none(tmp_path, monkeypatch):
+    """No target_duration → no -t flag (preserves prior behaviour)."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"a")
+    output = tmp_path / "out.mp4"
+
+    captured = {}
+
+    def _fake_run(command, stdout=None, stderr=None, text=None, timeout=None):
+        captured["command"] = list(command)
+        Path(command[-1]).write_bytes(b"mp4")
+
+        class _P:
+            returncode = 0
+            stderr = ""
+
+        return _P()
+
+    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "run", _fake_run)
+
+    ok = merge_segments([str(seg)], str(output), concat_dir=str(tmp_path), try_re_encode=False)
+    assert ok is True
+    assert "-t" not in captured["command"]

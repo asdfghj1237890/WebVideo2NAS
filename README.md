@@ -344,6 +344,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.5] - 2026-05-01
+
+#### Fixed
+- **Bloated output duration on anti-leech HLS** (e.g. some `*.jpg`-disguised `index.jpg?auth=…` streams): the m3u8 declared 38 s of segments but the merged MP4 played for 1:06. The `.ts` files contain padding past their declared `EXTINF`, and `ffmpeg -f concat -c copy` honours the raw TS PTS rather than the playlist's total — so every segment's padding leaked into the output. The merger now hard-caps output at the playlist's declared duration via `-t <seconds>`, trimming the padding without re-encoding. No effect on well-formed playlists where `EXTINF` already matches TS content
+- **Worker / API version markers**: `1.10.0` → `1.10.1` (server-side change, requires rebuilt docker image to take effect)
+
 ### [2.1.4] - 2026-04-28
 
 #### Changed
@@ -631,8 +637,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.4  
-**Last Updated**: 2026-04-28  
+**Version**: 2.1.5  
+**Last Updated**: 2026-05-01  
 **Port**: 52052 (NAS host port → API container :8000)
 
 ## Star History
