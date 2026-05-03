@@ -18,9 +18,9 @@ let qualityFilter = 'all';
 let searchQuery = '';
 let prevDetectedIds = new Set();  // tracks which URLs were rendered last frame, for pulse-new
 let firstRenderDone = false;
-let jobSort = 'active';           // 'active' | 'failed' — recent jobs sort mode
+let jobSort = 'failed';           // 'failed' | 'active' — recent jobs sort mode (failed-first by default so token-expiry/abort jobs surface immediately)
 
-const JOB_SORT_CYCLE = ['active', 'failed'];
+const JOB_SORT_CYCLE = ['failed', 'active'];
 
 const STATUS_RANK_ACTIVE = {
   downloading: 0, processing: 1, merging: 1,
@@ -70,8 +70,8 @@ async function loadSettingsFromStorage() {
   if (settings.jobSort && JOB_SORT_CYCLE.includes(settings.jobSort)) {
     jobSort = settings.jobSort;
   } else {
-    // Migrate stale value (e.g., legacy 'time' mode) → default 'active'.
-    jobSort = 'active';
+    // Migrate stale value (e.g., legacy 'time' mode) → default 'failed' so failed jobs sort first.
+    jobSort = 'failed';
   }
   return settings;
 }
