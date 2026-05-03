@@ -1041,7 +1041,14 @@ async function sendToNAS(url, pageTitle, pageUrl) {
       // a list of validator-error objects (422 Pydantic errors). Naively passing
       // the latter to `new Error()` produced "[object Object]" notifications.
       const errorJson = await response.json().catch(() => ({}));
-      throw new Error(formatApiErrorDetail(errorJson, response.status));
+      const detail = formatApiErrorDetail(errorJson, response.status);
+      const err = new Error(detail);
+      // Tag rate-limit errors so the catch can use a more visible notification.
+      // Easy to miss "Error: Rate limit exceeded ..." among 10+ stacked
+      // system notifications during a bulk send — the user just sees clicks
+      // disappearing into the void.
+      if (response.status === 429) err.isRateLimit = true;
+      throw err;
     }
     
     const result = await response.json();
@@ -1060,18 +1067,42 @@ async function sendToNAS(url, pageTitle, pageUrl) {
     
   } catch (error) {
     console.error('Error sending to NAS:', error);
-    showNotification('Error', error.message);
+    if (error && error.isRateLimit) {
+      // Hard-to-miss notification for rate-limit hits — the underlying API
+      // message already names the env var to raise (RATE_LIMIT_PER_MINUTE).
+      // requireInteraction keeps it on screen until the user dismisses it,
+      // priority 2 floats it above other notifications, and we use a
+      // dedicated id so multiple 429s in a burst collapse into one card
+      // instead of stacking 10+ identical toasts.
+      showNotification('NAS rate limit hit', error.message, {
+        id: 'wv2nas-rate-limit',
+        priority: 2,
+        requireInteraction: true,
+      });
+    } else {
+      showNotification('Error', error.message);
+    }
   }
 }
 
-// Show notification
-function showNotification(title, message) {
-  chrome.notifications.create({
+// Show notification. `opts` lets specific call sites override the defaults
+// (id for collapsing duplicate cards, priority/requireInteraction for the
+// must-not-miss case like rate-limit hits).
+function showNotification(title, message, opts) {
+  const o = opts || {};
+  const options = {
     type: 'basic',
     iconUrl: 'icons/icon128.png',
     title: title,
-    message: message
-  });
+    message: message,
+    priority: typeof o.priority === 'number' ? o.priority : 0,
+    requireInteraction: !!o.requireInteraction,
+  };
+  if (o.id) {
+    chrome.notifications.create(o.id, options);
+  } else {
+    chrome.notifications.create(options);
+  }
 }
 
 // Store job information.

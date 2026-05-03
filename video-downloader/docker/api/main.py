@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8, MP4, and MOV)",
-    version="1.10.3"
+    version="1.10.4"
 )
 
 # CORS middleware
@@ -145,7 +145,18 @@ def _rate_limit(request: Request, bucket: str) -> None:
     except Exception:
         return
     if count > limit:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        # Include the actual limit and the env var name so the chrome extension's
+        # error notification (and the user) can see exactly what to raise. Without
+        # this, "Rate limit exceeded" alone reads like a black hole — users had
+        # no idea the API was rejecting them, let alone how to fix it.
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded ({bucket}: {limit} requests/min). "
+                f"Raise RATE_LIMIT_PER_MINUTE in .env (currently {RATE_LIMIT_PER_MINUTE}) "
+                f"and restart the api container, or wait for the next minute window."
+            ),
+        )
 
 
 def _resolve_host_ips(hostname: str) -> list[ipaddress._BaseAddress]:
@@ -294,7 +305,7 @@ async def root():
     """Root endpoint"""
     return {
         "name": "WebVideo2NAS API",
-        "version": "1.10.3",
+        "version": "1.10.4",
         "status": "running"
     }
 

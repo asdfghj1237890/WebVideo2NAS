@@ -344,6 +344,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.17] - 2026-05-04
+
+#### Fixed
+- **"After ~15 pending jobs, no Send goes through" — actually a 429 rate-limit hit, not a black hole.** The compose templates and `.env.example` defaulted `RATE_LIMIT_PER_MINUTE=10`, which counts /api/download in the write bucket (multiplier 1) over a 60-second clock window. Once the user fired 10+ submissions in a minute, every additional one returned `429 "Rate limit exceeded"` — but the chrome extension surfaced this through the same low-priority `chrome.notifications.create` call as everything else, so during a bulk-send burst the 5–10 stacked rate-limit notifications got collapsed/missed and the user just saw clicks vanishing. Three changes: (1) bumped default `RATE_LIMIT_PER_MINUTE` from 10 → 60 in `docker-compose_not_synology.yml`, `docker-compose.synology.yml`, `.env.example`, and `SYNOLOGY_DEPLOY_COMMANDS.md` — 60/min is sensible for a private NAS while still rate-limiting public exposure; (2) the API's 429 detail now spells out the actual limit, the env var name, and how to raise it (`"Rate limit exceeded (write: 60 requests/min). Raise RATE_LIMIT_PER_MINUTE in .env (currently 60) and restart the api container, or wait for the next minute window."`) so the chrome extension's notification carries actionable info; (3) the extension tags 429 errors and shows them via a dedicated sticky notification (priority 2, `requireInteraction: true`, fixed id so duplicates collapse into one card), making the rate-limit hit unmissable instead of one of ten flashing toasts
+- Worker / API version markers: `1.10.3` → `1.10.4`; extension manifest: `2.1.16` → `2.1.17`
+
+#### Migration
+- Existing deployments need to update `.env` if they have `RATE_LIMIT_PER_MINUTE=10` set explicitly (the new default only kicks in if the var is unset). Bump to 60 (or higher for purely private NAS) and restart the api container
+
 ### [2.1.16] - 2026-05-04
 
 #### Fixed
@@ -692,7 +701,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.16  
+**Version**: 2.1.17  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 

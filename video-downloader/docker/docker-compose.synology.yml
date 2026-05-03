@@ -64,7 +64,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
-      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-10}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-60}
       - STORAGE_PATH=/downloads
     volumes:
       - /volume1/video-downloader/downloads:/downloads

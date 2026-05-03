@@ -60,7 +60,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
-      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-10}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-60}
     volumes:
       - ../downloads:/downloads
       - ../logs:/logs
