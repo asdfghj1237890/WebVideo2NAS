@@ -290,18 +290,21 @@ class DownloadWorker:
         is_mpd = format_hint == 'mpd' or '.mpd' in url_lower or '.mpd' in url_decoded
         is_m3u8 = format_hint == 'm3u8' or ('.m3u8' in url_lower and not is_mpd)
 
-        is_direct_download = (
-            url_lower.endswith('.mp4') or 
-            '.mp4?' in url_lower or
-            '.mp4&' in url_lower or
-            url_decoded.endswith('.mp4') or
-            '.mp4?' in url_decoded or
-            '.mp4&' in url_decoded or
-            ('file=' in url_lower and '.mp4' in url_decoded)
-        )
-        
+        def _matches_direct_ext(ext: str) -> bool:
+            return (
+                url_lower.endswith(ext) or
+                f'{ext}?' in url_lower or
+                f'{ext}&' in url_lower or
+                url_decoded.endswith(ext) or
+                f'{ext}?' in url_decoded or
+                f'{ext}&' in url_decoded or
+                ('file=' in url_lower and ext in url_decoded)
+            )
+
+        is_direct_download = _matches_direct_ext('.mp4') or _matches_direct_ext('.mov')
+
         if is_direct_download and not is_mpd and not is_m3u8:
-            logger.info(f"Detected as direct download (MP4): {job['url'][:100]}...")
+            logger.info(f"Detected as direct download: {job['url'][:100]}...")
             self._process_direct_download(job_id, job)
         elif is_mpd:
             logger.info(f"Detected as DASH stream (MPD){' (via format hint)' if format_hint == 'mpd' else ''}: {job['url'][:100]}...")
@@ -473,10 +476,11 @@ class DownloadWorker:
             self._handle_job_failure(job_id, job, str(e))
 
     def _process_direct_download(self, job_id: str, job: dict):
-        """Process direct file download (MP4, etc.)"""
+        """Process direct file download (MP4, MOV, etc.)"""
         from pathlib import Path
+        from urllib.parse import unquote
         from ssl_adapter import create_legacy_session
-        
+
         try:
             _enforce_ssrf_guard(job["url"])
 
@@ -514,12 +518,20 @@ class DownloadWorker:
             output_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Output directory: {output_dir}")
 
+            # Pick output extension from the source URL so .mov stays .mov.
+            # Strip query/fragment first since URLs often look like ".mov?token=...".
+            url_path = unquote(urlparse(job['url']).path or '').lower()
+            if url_path.endswith('.mov'):
+                out_ext = 'mov'
+            else:
+                out_ext = 'mp4'
+
             base_name = safe_title
-            output_file = output_dir / f"{base_name}.mp4"
+            output_file = output_dir / f"{base_name}.{out_ext}"
             counter = 1
 
             while output_file.exists():
-                output_file = output_dir / f"{base_name} ({counter}).mp4"
+                output_file = output_dir / f"{base_name} ({counter}).{out_ext}"
                 counter += 1
 
             output_file = str(output_file)

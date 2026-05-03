@@ -53,6 +53,7 @@ function scoreUrlInfo(info) {
   if (urlLower.includes('.m3u8')) score += 4;
   if (urlLower.includes('.mpd')) score += 4;
   if (urlLower.includes('.mp4')) score += 1;
+  if (urlLower.includes('.mov')) score += 1;
   const fmt = String(info?.detectedFormat || '').toLowerCase();
   if (fmt === 'mpd' || fmt === 'm3u8') score += 4;
 
@@ -428,7 +429,7 @@ function isCandidateVideoUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return false;
 
   const urlLower = rawUrl.toLowerCase();
-  if (!(urlLower.includes('.m3u8') || urlLower.includes('.mpd') || urlLower.includes('.mp4'))) return false;
+  if (!(urlLower.includes('.m3u8') || urlLower.includes('.mpd') || urlLower.includes('.mp4') || urlLower.includes('.mov'))) return false;
 
   // Reject obvious non-video resources even if they contain ".mp4" or ".m3u8" in the name.
   // Example: "preview_720p.mp4.jpg" is an image, not a real mp4.

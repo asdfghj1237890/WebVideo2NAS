@@ -412,6 +412,7 @@ function classifyVideoType(url) {
   if (lower.includes('.m3u8')) return 'M3U8';
   if (lower.includes('.mpd')) return 'MPD';
   if (lower.includes('.mp4')) return 'MP4';
+  if (lower.includes('.mov')) return 'MOV';
   if (lower.includes('.webm')) return 'WEBM';
   if (/\.ts(?:[?#/]|$)/.test(lower)) return 'TS';
 
@@ -448,6 +449,7 @@ const FORMAT_HUE = {
   M3U8: 155,   // mint — HLS, most common
   MPD:  240,   // blue — DASH
   MP4:  30,    // orange — direct file
+  MOV:  15,    // warm orange — direct QuickTime file (close to MP4 since both are progressive single-file)
   TS:   280,   // purple — transport stream
   WEBM: 320,   // magenta
 };

@@ -68,7 +68,7 @@ function withFixedNow(ctx, nowMs) {
 }
 
 describe('background.js pure helpers', () => {
-  it('isCandidateVideoUrl accepts m3u8/mpd/mp4 and rejects obvious non-video', () => {
+  it('isCandidateVideoUrl accepts m3u8/mpd/mp4/mov and rejects obvious non-video', () => {
     const ctx = loadScriptIntoContext('background.js', {
       chrome: makeChromeStub(),
       fetch: async () => ({ ok: true, json: async () => ({}) }),
@@ -78,6 +78,8 @@ describe('background.js pure helpers', () => {
     expect(ctx.isCandidateVideoUrl('https://a/b/c.mpd')).toBe(true);
     expect(ctx.isCandidateVideoUrl('https://a/b/manifest.mpd?token=abc')).toBe(true);
     expect(ctx.isCandidateVideoUrl('https://a/b/c.mp4')).toBe(true);
+    expect(ctx.isCandidateVideoUrl('https://a/b/c.mov')).toBe(true);
+    expect(ctx.isCandidateVideoUrl('https://lurl6.lurl.cc/20260501/abc.mov')).toBe(true);
 
     // segments
     expect(ctx.isCandidateVideoUrl('https://a/b/seg0001.ts')).toBe(false);
@@ -87,6 +89,7 @@ describe('background.js pure helpers', () => {
     expect(ctx.isCandidateVideoUrl('https://a/b/preview_720p.mp4.jpg')).toBe(false);
     expect(ctx.isCandidateVideoUrl('https://a/b/playlist.m3u8.png')).toBe(false);
     expect(ctx.isCandidateVideoUrl('https://a/b/app.js?video=1.mp4')).toBe(false);
+    expect(ctx.isCandidateVideoUrl('https://a/b/preview.mov.jpg')).toBe(false);
   });
 
   it('scoreUrlInfo prefers recent + range hits + media type', () => {
