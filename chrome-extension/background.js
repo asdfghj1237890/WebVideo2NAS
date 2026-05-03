@@ -779,6 +779,28 @@ function getStoredPageTitle(url) {
   return null;
 }
 
+// Format a FastAPI error response (`{detail: ...}`) into a readable string.
+// `detail` may be a string (HTTPException) or an array of {loc, msg, type}
+// validator errors (422). Without this, Array→Error stringifies to
+// "[object Object]" and the user sees nothing useful.
+function formatApiErrorDetail(errorJson, httpStatus) {
+  const detail = errorJson && errorJson.detail;
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail) && detail.length) {
+    return detail
+      .map(err => {
+        const loc = Array.isArray(err.loc) ? err.loc.filter(p => p !== 'body').join('.') : '';
+        const msg = err.msg || err.message || JSON.stringify(err);
+        return loc ? `${loc}: ${msg}` : msg;
+      })
+      .join('; ');
+  }
+  if (detail && typeof detail === 'object') {
+    try { return JSON.stringify(detail); } catch (_) { /* fall through */ }
+  }
+  return `HTTP ${httpStatus || 'error'} from NAS`;
+}
+
 // Send URL to NAS
 async function sendToNAS(url, pageTitle, pageUrl) {
   try {
@@ -1015,8 +1037,11 @@ async function sendToNAS(url, pageTitle, pageUrl) {
     });
     
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.detail || 'Failed to submit download');
+      // FastAPI returns `detail` either as a plain string (HTTPException) or as
+      // a list of validator-error objects (422 Pydantic errors). Naively passing
+      // the latter to `new Error()` produced "[object Object]" notifications.
+      const errorJson = await response.json().catch(() => ({}));
+      throw new Error(formatApiErrorDetail(errorJson, response.status));
     }
     
     const result = await response.json();

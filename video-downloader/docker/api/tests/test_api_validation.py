@@ -15,7 +15,7 @@ def _reload_api_main(monkeypatch, **env):
     return importlib.reload(api_main)
 
 
-def test_download_request_accepts_m3u8_and_mp4(monkeypatch):
+def test_download_request_accepts_m3u8_mp4_and_mov(monkeypatch):
     api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
 
     r1 = api_main.DownloadRequest(url="https://example.com/v/playlist.m3u8")
@@ -23,6 +23,10 @@ def test_download_request_accepts_m3u8_and_mp4(monkeypatch):
 
     r2 = api_main.DownloadRequest(url="https://example.com/v/video.mp4")
     assert ".mp4" in str(r2.url)
+
+    # .mov added in v2.1.10 — direct QuickTime files are now first-class.
+    r3 = api_main.DownloadRequest(url="https://example.com/v/clip.mov")
+    assert ".mov" in str(r3.url)
 
 
 def test_download_request_accepts_mp4_in_query_param(monkeypatch):
@@ -33,8 +37,9 @@ def test_download_request_accepts_mp4_in_query_param(monkeypatch):
 
 def test_download_request_rejects_unsupported_extension(monkeypatch):
     api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+    # Use .flv — still genuinely unsupported, unlike .mov which is now accepted.
     with pytest.raises(Exception):
-        api_main.DownloadRequest(url="https://example.com/video.mov")
+        api_main.DownloadRequest(url="https://example.com/video.flv")
 
 
 def test_download_request_allows_localhost_when_ssrf_guard_disabled(monkeypatch):

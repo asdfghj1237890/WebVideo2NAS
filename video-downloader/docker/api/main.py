@@ -228,9 +228,14 @@ class DownloadRequest(BaseModel):
     @model_validator(mode='after')
     def validate_video_url(self):
         url_str = str(self.url).lower()
-        is_valid = '.m3u8' in url_str or '.mpd' in url_str or '.mp4' in url_str
-        if not is_valid and self.format not in ('m3u8', 'mpd', 'mp4'):
-            raise ValueError('URL must contain .m3u8, .mpd, or .mp4 (or provide format hint)')
+        is_valid = (
+            '.m3u8' in url_str
+            or '.mpd' in url_str
+            or '.mp4' in url_str
+            or '.mov' in url_str
+        )
+        if not is_valid and self.format not in ('m3u8', 'mpd', 'mp4', 'mov'):
+            raise ValueError('URL must contain .m3u8, .mpd, .mp4, or .mov (or provide format hint)')
         _enforce_ssrf_guard(self.url)
         # Normalize+validate subdir; raises ValueError → 422 from FastAPI
         self.output_subdir = normalize_output_subdir(self.output_subdir)
