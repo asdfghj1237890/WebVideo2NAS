@@ -1074,26 +1074,41 @@ function showNotification(title, message) {
   });
 }
 
-// Store job information
-async function storeJob(job) {
-  const jobs = await chrome.storage.local.get(['jobs']);
-  const jobList = jobs.jobs || [];
-  
-  jobList.unshift({
-    id: job.id,
-    title: job.title,
-    url: job.url,
-    status: job.status,
-    progress: job.progress,
-    created_at: new Date().toISOString()
+// Store job information.
+// Serialised through a single-slot promise queue so concurrent sendToNAS
+// completions don't overlap their read-modify-write of `jobs`. Without the
+// queue, two parallel storeJob() calls each read the same snapshot, append
+// their job, and the second write clobbers the first — so when several tabs
+// finished submitting at once, only one of their jobs survived the local
+// list. (Local storage is internal bookkeeping today, but the symptom would
+// resurface the moment any UI starts reading from it.)
+let _storeJobChain = Promise.resolve();
+function storeJob(job) {
+  const next = _storeJobChain.then(async () => {
+    const jobs = await chrome.storage.local.get(['jobs']);
+    const jobList = jobs.jobs || [];
+
+    jobList.unshift({
+      id: job.id,
+      title: job.title,
+      url: job.url,
+      status: job.status,
+      progress: job.progress,
+      created_at: new Date().toISOString()
+    });
+
+    // Keep only last 50 jobs
+    if (jobList.length > 50) {
+      jobList.pop();
+    }
+
+    await chrome.storage.local.set({ jobs: jobList });
   });
-  
-  // Keep only last 50 jobs
-  if (jobList.length > 50) {
-    jobList.pop();
-  }
-  
-  await chrome.storage.local.set({ jobs: jobList });
+  // Don't let one failure poison the chain — log and continue.
+  _storeJobChain = next.catch((err) => {
+    console.error('storeJob failed:', err);
+  });
+  return next;
 }
 
 // Listen for action clicks to open sidepanel
@@ -1238,8 +1253,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // to a generic placeholder.
     const titleToUse =
       getStoredPageTitle(request.url) || request.title || 'Untitled Video';
-    sendToNAS(request.url, titleToUse, request.pageUrl);
-    sendResponse({ success: true });
+
+    // Hold the message channel open until sendToNAS settles. Without `return
+    // true` + a deferred sendResponse, Chrome considers this handler done the
+    // moment we return synchronously, and the MV3 service worker becomes
+    // eligible for shutdown between the awaits inside sendToNAS (storage.get
+    // → cookies.getAll → fetch). When the user fires Send across multiple
+    // tabs in quick succession, the first 1–2 land but the later ones lose
+    // their in-flight chains to SW termination and never reach the NAS.
+    sendToNAS(request.url, titleToUse, request.pageUrl)
+      .then(() => sendResponse({ success: true }))
+      .catch((err) => {
+        console.error('sendToNAS failed:', err);
+        sendResponse({ success: false, error: err && err.message });
+      });
+    return true;
   }
 
   if (request.action === 'clearDetected') {

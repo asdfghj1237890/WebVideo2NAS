@@ -344,6 +344,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.12] - 2026-05-04
+
+#### Fixed
+- **Send-from-multiple-tabs in quick succession dropped 1–2 of N requests** silently. The MV3 background service worker's `sendToNAS` message handler called `sendResponse({success:true})` synchronously and returned without `return true`, so Chrome considered the handler done the moment it returned and the SW became eligible for shutdown between the awaits inside `sendToNAS` (`storage.get` → `cookies.getAll` → `fetch`). The first 1–2 sends landed inside the active SW window; later sends lost their in-flight Promise chains to SW termination and never reached the NAS. Handler now returns `true` and defers `sendResponse` until `sendToNAS` settles, keeping the message channel — and therefore the SW — alive
+- **`storeJob` lost concurrent writes** to the local jobs list (read snapshot → unshift → write back, with no serialisation). Internal bookkeeping today, but the symptom would resurface the moment any UI started reading from it. Calls now flow through a single-slot promise chain so reads and writes don't interleave (verified: 10 concurrent `storeJob`s → 10 entries saved, max concurrent storage ops = 1)
+- Extension `manifest.json` version: `2.1.10` → `2.1.12` (skipping `2.1.11` since that tag was the metadata-only version-marker bump)
+
 ### [2.1.10] - 2026-05-04
 
 #### Fixed
@@ -663,7 +670,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.10  
+**Version**: 2.1.12  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
