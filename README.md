@@ -344,6 +344,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.10] - 2026-05-04
+
+#### Fixed
+- **`Error: [object Object]` notification after sending a `.mov` video**: v2.1.9 added `.mov` support to the chrome-extension and worker but missed the API's pydantic URL validator (`api/main.py`). The first `.mov` URL therefore got 422'd by FastAPI, and the chrome-extension's `new Error(error.detail)` stringified the validation-error array straight into `"[object Object]"`. The validator now accepts `.mov` (and `'mov'` as a `format` hint), and the extension routes API errors through a new `formatApiErrorDetail()` helper that handles all FastAPI shapes (string `detail`, validator-error array, object, missing) — multi-error 422s now read like `"url: field required; title: too short"` instead of vanishing
+- **Worker / API version markers**: `1.10.1` → `1.10.2` (server-side change, requires rebuilt docker image to take effect)
+
+### [2.1.9] - 2026-05-04
+
+#### Added
+- **Direct `.mov` (progressive QuickTime) downloads end-to-end**: previously the extension only detected `.m3u8`/`.mpd`/`.mp4` URLs and the worker only routed `.mp4` to the direct-download path, so MOV files served as a single Range-request resource (e.g. `https://lurl6.lurl.cc/.../*.mov`) never made it into the side panel and could not be sent. `background.js`/`sidepanel.js` now whitelist, score, classify, and colour `.mov` like `.mp4`. The worker's `is_direct_download` predicate was refactored into a small per-extension helper and runs for both `.mp4` and `.mov`, and the output filename now keeps the source extension (`.mov` stays `.mov`) instead of being forced to `.mp4`. Tests cover `.mov` acceptance and the `*.mov.jpg` false-positive trap
+
+### [2.1.8] - 2026-05-04
+
+#### Changed
+- **Default Recent Jobs sort flipped to failed-first**. After v2.1.6/v2.1.7 the worker correctly marks token-expiry / aborted jobs as `failed` instead of silently shipping stub MP4s, but with the previous `active`-first default those failures could scroll out of view as new jobs queued up. The default is now `failed` — it's what the user wants to see when something went wrong. Users who explicitly chose `active` in the past keep their preference; only the unset/legacy case changes. `JOB_SORT_CYCLE` flipped to `['failed', 'active']` so cycling reflects the new default order
+
+### [2.1.7] - 2026-05-04
+
+#### Fixed
+- **CDN-token-expiry surfaced as a real failure instead of a silent retry loop**. v2.1.6 made the worker raise on expired CDN tokens, but the rest of the pipeline didn't know what to do with the new error strings: the abort-detection in `_handle_job_failure` was looking for the brittle substring `"403/474 errors"` / `"URL expired or blocked"`, so the new `"Download aborted: only X/Y segments succeeded …"` message matched neither and was getting re-queued for `MAX_RETRY_ATTEMPTS` retries (pointless — the token is dead). The chrome-extension also classified these errors as either generic ("Download Failed") or — worse — as `403` (whose solution text is about IP-based auth, totally unrelated). Worker now treats any `"Download aborted: …"` message as a deliberate give-up (no retry), which also fixes a latent bug where the existing anti-hotlinking abort path was getting retried. Extension adds a new `error.tokenExpired.{type,solution}` key in all 8 locales and matches token-expiry patterns before the generic `403` branch, so users see "CDN Token Expired" with an actionable solution ("refresh source page, re-Send")
+
+### [2.1.6] - 2026-05-04
+
+#### Fixed
+- **Anti-leech HLS streams shipped as 5/54-segment stub MP4s reported "completed successfully"**. CDN signed-token URLs (`?auth=…&exp=…`) often serve a few segments before the token expires and the rest 401. Three holes combined to make the worker silently produce a 2.45 MB file labelled as a 392-second video: (1) the early-abort guard in `progress_callback` only counted HTTP `403`/`474`, never `401`; (2) the post-download check was `if not segment_files` — i.e. it only failed on *zero* segments; (3) the cached "working Referer strategy" stuck around even after that strategy started 401-ing for every subsequent segment, wasting one extra request per segment and obscuring the real cause. Worker now: includes `401` in the abort-condition counter (renamed log to `401/403/474`); requires ≥90% segment success after `download_all` (overridable via `MIN_SEGMENT_SUCCESS_RATIO` env var) and cleans up partial segments on failure; invalidates `working_referer_strategy` on first failure and logs a warning that points at signed-URL/token expiry rather than headers
+
 ### [2.1.5] - 2026-05-01
 
 #### Fixed
@@ -637,8 +663,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.5  
-**Last Updated**: 2026-05-01  
+**Version**: 2.1.10  
+**Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
 ## Star History
