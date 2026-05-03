@@ -776,10 +776,24 @@ function updateBulkBar() {
 
 // ---------- Send to NAS (single + bulk + flight ghost) ----------
 function flyToNAS(tileEl, url, pageUrl) {
-  if (!tileEl) {
-    sendToNAS(url, pageUrl);
-    return;
-  }
+  // Fire the actual NAS submission FIRST, before any visuals. Previously
+  // sendToNAS lived inside a 700 ms setTimeout (the fly-ghost animation),
+  // which created a window where the request could be lost: if the user
+  // closed the sidepanel during the animation, Chrome killed the JS context
+  // and the queued setTimeout never fired → silent drop. Same for the
+  // bulkSend path where the LAST tile's real send was ~1.4 s after the
+  // click. Fire-then-animate guarantees the request is in flight by the
+  // time the animation even starts. Bookkeeping (sentUrls / selected) is
+  // also moved up so a `loadDetectedUrls()` triggered by a new
+  // background-detected URL during the animation re-renders the tile in
+  // the correct .sent state instead of as a fresh untouched tile.
+  sentUrls.add(url);
+  selected.delete(url);
+  updateBulkBar();
+  sendToNAS(url, pageUrl);
+
+  if (!tileEl) return;
+
   const target = document.getElementById('recentHeader');
   const a = tileEl.getBoundingClientRect();
   const b = target ? target.getBoundingClientRect() : null;
@@ -816,10 +830,6 @@ function flyToNAS(tileEl, url, pageUrl) {
       tileEl.classList.remove('sending');
       tileEl.classList.add('sent');
     }
-    sentUrls.add(url);
-    selected.delete(url);
-    updateBulkBar();
-    sendToNAS(url, pageUrl);
   }, 700);
 }
 

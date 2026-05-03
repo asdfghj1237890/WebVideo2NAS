@@ -344,6 +344,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.16] - 2026-05-04
+
+#### Fixed
+- **"Occasionally clicked Send but no submission landed."** `flyToNAS()` was firing the actual NAS request *inside* the 700 ms fly-ghost animation `setTimeout`, so the click → real-send latency was 700 ms (and ~1.4 s for the last item in a bulk-send of 10). Anything that killed the sidepanel's JS context during that window — closing the side panel, browser idle suspension, navigation — also killed the queued setTimeout, and the `sendToNAS` call never fired. Even when the request did go through, a `loadDetectedUrls()` triggered by a new background-detected URL between click and animation end re-rendered the grid using a stale `sentUrls` (the click hadn't yet recorded the URL as sent), so the new tile rendered without `.sent` and the user assumed nothing happened. Refactored `flyToNAS()` to fire `sendToNAS()` and update `sentUrls`/`selected` *immediately* on click, then run the visual ghost flight in parallel. The request is now in flight before the animation even starts; closing the sidepanel mid-animation no longer drops anything; mid-animation re-renders pick up the correct `.sent` state
+
 ### [2.1.15] - 2026-05-04
 
 #### Fixed
@@ -687,7 +692,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.15  
+**Version**: 2.1.16  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
