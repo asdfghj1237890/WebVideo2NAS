@@ -112,6 +112,9 @@
       'error.invalidPlaylist.type': 'Invalid Playlist',
       'error.invalidPlaylist.solution': 'The m3u8 playlist is empty or invalid.\n<ul>\n  <li>The video requires authentication</li>\n  <li>The playlist URL is incomplete</li>\n  <li>The video format is not supported</li>\n</ul>',
 
+      'error.tokenExpired.type': 'CDN Token Expired',
+      'error.tokenExpired.solution': 'The video segments are protected by a <strong>signed CDN token</strong> (e.g. <code>?auth=...&exp=...</code>) that expired before the download finished. Most segments returned <strong>HTTP 401</strong>.\n<ul>\n  <li><strong>Refresh the source video page</strong> in the browser (this regenerates the token)</li>\n  <li>Then click <strong>Send</strong> again right away — these tokens are short-lived</li>\n  <li>If it keeps failing, the site may issue single-use URLs; try playing the video first to warm the session</li>\n</ul>',
+
       'error.generic.type': 'Download Failed',
       'error.generic.solution': 'An error occurred during download.\n<ul>\n  <li>Check NAS logs for more details</li>\n  <li>Try refreshing the video page and resending</li>\n  <li>Some websites have download protection that cannot be bypassed</li>\n</ul>',
 
@@ -276,6 +279,9 @@
       'error.invalidPlaylist.type': '播放清單無效',
       'error.invalidPlaylist.solution': 'm3u8 播放清單為空或無效。\n<ul>\n  <li>影片需要驗證/登入</li>\n  <li>播放清單 URL 不完整</li>\n  <li>影片格式不支援</li>\n</ul>',
 
+      'error.tokenExpired.type': 'CDN Token 已過期',
+      'error.tokenExpired.solution': '影片片段被 <strong>CDN 簽章 token</strong>(例如 <code>?auth=...&exp=...</code>)保護，token 在下載完成前就過期了，大部分片段都回 <strong>HTTP 401</strong>。\n<ul>\n  <li><strong>到瀏覽器重新整理影片來源頁</strong>(會重新產生 token)</li>\n  <li>立刻再按一次 <strong>Send</strong> — 這類 token 通常很快過期</li>\n  <li>還是失敗的話,該站可能用單次性 URL,先把影片播一下熱身再送</li>\n</ul>',
+
       'error.generic.type': '下載失敗',
       'error.generic.solution': '下載過程發生錯誤。\n<ul>\n  <li>到 NAS 日誌查看更多細節</li>\n  <li>重新整理影片頁面後再送出</li>\n  <li>部分網站有下載保護，可能無法繞過</li>\n</ul>',
 
@@ -423,6 +429,9 @@
       'error.invalidPlaylist.type': '播放列表无效',
       'error.invalidPlaylist.solution': 'm3u8 播放列表为空或无效。\n<ul>\n  <li>视频需要验证/登录</li>\n  <li>播放列表 URL 不完整</li>\n  <li>视频格式不支持</li>\n</ul>',
 
+      'error.tokenExpired.type': 'CDN Token 已过期',
+      'error.tokenExpired.solution': '视频片段被 <strong>CDN 签名 token</strong>(例如 <code>?auth=...&exp=...</code>)保护，token 在下载完成前就过期了，大部分片段都返回 <strong>HTTP 401</strong>。\n<ul>\n  <li><strong>到浏览器刷新视频源页面</strong>(会重新生成 token)</li>\n  <li>立刻再按一次 <strong>Send</strong> — 这类 token 通常很快过期</li>\n  <li>仍然失败的话,该站可能使用单次性 URL,先把视频播一下预热再发送</li>\n</ul>',
+
       'error.generic.type': '下载失败',
       'error.generic.solution': '下载过程中发生错误。\n<ul>\n  <li>到 NAS 日志查看更多细节</li>\n  <li>刷新视频页面后再发送</li>\n  <li>部分网站有下载保护，可能无法绕过</li>\n</ul>',
 
@@ -535,6 +544,9 @@
 
       'error.invalidPlaylist.type': '無効なプレイリスト',
       'error.invalidPlaylist.solution': 'm3u8 プレイリストが空、または無効です。\n<ul>\n  <li>認証が必要</li>\n  <li>URL が不完全</li>\n  <li>形式が未対応</li>\n</ul>',
+
+      'error.tokenExpired.type': 'CDN トークン期限切れ',
+      'error.tokenExpired.solution': '動画セグメントは <strong>署名付き CDN トークン</strong>(例: <code>?auth=...&exp=...</code>)で保護されており、ダウンロード完了前に期限切れとなり、ほとんどのセグメントが <strong>HTTP 401</strong> を返しました。\n<ul>\n  <li><strong>ブラウザで動画ページを再読み込み</strong>(トークンが再生成されます)</li>\n  <li>すぐにもう一度 <strong>Send</strong> を押す — このトークンは寿命が短いです</li>\n  <li>それでも失敗する場合、サイトが使い捨て URL を発行している可能性。先に動画を少し再生してセッションを温めてから送信</li>\n</ul>',
 
       'error.generic.type': 'ダウンロード失敗',
       'error.generic.solution': 'ダウンロード中にエラーが発生しました。\n<ul>\n  <li>NAS のログを確認</li>\n  <li>動画ページを更新して再送信</li>\n  <li>サイトの保護で回避できない場合があります</li>\n</ul>',
@@ -649,6 +661,9 @@
       'error.invalidPlaylist.type': '유효하지 않은 재생목록',
       'error.invalidPlaylist.solution': 'm3u8 재생목록이 비어 있거나 유효하지 않습니다.\n<ul>\n  <li>동영상에 인증/로그인이 필요할 수 있습니다</li>\n  <li>재생목록 URL이 불완전할 수 있습니다</li>\n  <li>동영상 형식이 지원되지 않을 수 있습니다</li>\n</ul>',
 
+      'error.tokenExpired.type': 'CDN 토큰 만료',
+      'error.tokenExpired.solution': '동영상 세그먼트가 <strong>서명된 CDN 토큰</strong>(예: <code>?auth=...&exp=...</code>)으로 보호되어 있으며, 다운로드가 끝나기 전에 만료되어 대부분의 세그먼트가 <strong>HTTP 401</strong>을 반환했습니다.\n<ul>\n  <li><strong>브라우저에서 동영상 페이지를 새로고침</strong>(토큰이 다시 생성됩니다)</li>\n  <li>즉시 다시 <strong>Send</strong>를 누르세요 — 이 토큰은 수명이 짧습니다</li>\n  <li>그래도 실패하면 사이트가 일회용 URL을 사용할 수 있으니, 먼저 동영상을 잠깐 재생해 세션을 워밍한 뒤 보내세요</li>\n</ul>',
+
       'error.generic.type': '다운로드 실패',
       'error.generic.solution': '다운로드 중 오류가 발생했습니다.\n<ul>\n  <li>NAS 로그에서 자세한 정보를 확인하세요</li>\n  <li>동영상 페이지를 새로고침한 뒤 다시 전송해 보세요</li>\n  <li>일부 사이트는 다운로드 방지 기능이 있어 우회가 불가능할 수 있습니다</li>\n</ul>',
 
@@ -761,6 +776,9 @@
 
       'error.invalidPlaylist.type': 'Playlist invalide',
       'error.invalidPlaylist.solution': 'La playlist m3u8 est vide ou invalide.\n<ul>\n  <li>La vidéo nécessite une authentification</li>\n  <li>L’URL est incomplète</li>\n  <li>Format non supporté</li>\n</ul>',
+
+      'error.tokenExpired.type': 'Jeton CDN expiré',
+      'error.tokenExpired.solution': 'Les segments vidéo sont protégés par un <strong>jeton CDN signé</strong> (ex. <code>?auth=...&exp=...</code>) qui a expiré avant la fin du téléchargement. La plupart des segments ont renvoyé <strong>HTTP 401</strong>.\n<ul>\n  <li><strong>Rafraîchissez la page source de la vidéo</strong> dans le navigateur (cela régénère le jeton)</li>\n  <li>Cliquez à nouveau sur <strong>Send</strong> immédiatement — ces jetons ont une courte durée de vie</li>\n  <li>Si l’échec persiste, le site peut émettre des URL à usage unique ; lancez d’abord la lecture de la vidéo pour amorcer la session</li>\n</ul>',
 
       'error.generic.type': 'Téléchargement échoué',
       'error.generic.solution': 'Une erreur est survenue pendant le téléchargement.\n<ul>\n  <li>Consultez les logs du NAS</li>\n  <li>Rafraîchissez la page et renvoyez</li>\n  <li>Certaines protections de site ne sont pas contournables</li>\n</ul>',
@@ -875,6 +893,9 @@
       'error.invalidPlaylist.type': 'Playlist inválida',
       'error.invalidPlaylist.solution': 'La playlist m3u8 está vacía o es inválida.\n<ul>\n  <li>El video requiere autenticación</li>\n  <li>La URL de la playlist está incompleta</li>\n  <li>El formato no es compatible</li>\n</ul>',
 
+      'error.tokenExpired.type': 'Token CDN expirado',
+      'error.tokenExpired.solution': 'Los segmentos del video están protegidos por un <strong>token CDN firmado</strong> (p. ej. <code>?auth=...&exp=...</code>) que caducó antes de que terminara la descarga. La mayoría de los segmentos devolvieron <strong>HTTP 401</strong>.\n<ul>\n  <li><strong>Recarga la página fuente del video</strong> en el navegador (esto regenera el token)</li>\n  <li>Vuelve a pulsar <strong>Send</strong> de inmediato — estos tokens duran poco</li>\n  <li>Si sigue fallando, el sitio puede emitir URL de un solo uso; reproduce primero el video para calentar la sesión</li>\n</ul>',
+
       'error.generic.type': 'Descarga fallida',
       'error.generic.solution': 'Ocurrió un error durante la descarga.\n<ul>\n  <li>Revisa los logs del NAS</li>\n  <li>Actualiza la página y reenvía</li>\n  <li>Algunos sitios tienen protección que no se puede evitar</li>\n</ul>',
 
@@ -987,6 +1008,9 @@
 
       'error.invalidPlaylist.type': 'Playlist inválida',
       'error.invalidPlaylist.solution': 'A playlist m3u8 está vazia ou inválida.\n<ul>\n  <li>O vídeo requer autenticação</li>\n  <li>A URL da playlist está incompleta</li>\n  <li>O formato não é suportado</li>\n</ul>',
+
+      'error.tokenExpired.type': 'Token do CDN expirado',
+      'error.tokenExpired.solution': 'Os segmentos do vídeo estão protegidos por um <strong>token de CDN assinado</strong> (ex.: <code>?auth=...&exp=...</code>) que expirou antes do download terminar. A maioria dos segmentos retornou <strong>HTTP 401</strong>.\n<ul>\n  <li><strong>Atualize a página fonte do vídeo</strong> no navegador (isso gera um novo token)</li>\n  <li>Clique em <strong>Send</strong> novamente imediatamente — esses tokens duram pouco</li>\n  <li>Se continuar falhando, o site pode emitir URLs de uso único; reproduza o vídeo primeiro para aquecer a sessão</li>\n</ul>',
 
       'error.generic.type': 'Falha no download',
       'error.generic.solution': 'Ocorreu um erro durante o download.\n<ul>\n  <li>Verifique os logs do NAS</li>\n  <li>Atualize a página e reenviar</li>\n  <li>Alguns sites têm proteção que não pode ser contornada</li>\n</ul>',

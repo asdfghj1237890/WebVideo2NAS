@@ -1289,6 +1289,18 @@ function getErrorInfo(errorMessage) {
     };
   }
   const msg = errorMessage.toLowerCase();
+  // CDN signed-token expiry: short-lived ?auth=...&exp=... URLs that 401 mid-download.
+  // Worker raises this either via the abort guard ("HTTP 401/403/474 errors") or the
+  // sub-threshold success ratio guard ("Likely expired CDN auth token"). Match before
+  // the generic 403 branch so 401-dominated aborts don't get classified as IP auth.
+  if (
+    msg.includes('401') ||
+    msg.includes('expired cdn auth token') ||
+    msg.includes('url/token expired') ||
+    (msg.includes('download aborted') && msg.includes('only ') && msg.includes('segments succeeded'))
+  ) {
+    return { type: t('error.tokenExpired.type'), message: errorMessage, solution: t('error.tokenExpired.solution') };
+  }
   if (msg.includes('403') || msg.includes('forbidden')) {
     return { type: t('error.403.type'), message: errorMessage, solution: t('error.403.solution') };
   }

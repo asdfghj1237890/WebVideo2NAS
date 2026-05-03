@@ -1148,9 +1148,12 @@ class DownloadWorker:
             logger.info(f"Job {job_id} was cancelled by user, no action needed")
             return
         
-        # Check if error is due to 403/474 (URL expired/blocked) - do not retry
-        if "403/474 errors" in error_str or "URL expired or blocked" in error_str:
-            logger.warning(f"Job {job_id} failed with URL expiration/blocking error - not retrying")
+        # Any "Download aborted: ..." message is a deliberate give-up by the worker
+        # (anti-hotlinking, 401/403/474 token failures, or sub-threshold success ratio).
+        # Retrying never helps these — the source URLs/tokens are dead. Mark failed
+        # immediately so the user sees it and can refresh the source page.
+        if "Download aborted" in error_str or "URL expired or blocked" in error_str:
+            logger.warning(f"Job {job_id} failed with non-retryable error - not retrying: {error_str[:120]}")
             self.update_job_status(
                 job_id,
                 "failed",
