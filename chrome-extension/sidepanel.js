@@ -847,6 +847,33 @@ function cssEscape(s) {
   return String(s).replace(/["\\]/g, '\\$&');
 }
 
+// Send a message to the background SW with retry on transient MV3 errors.
+// "Receiving end does not exist" → SW listener not yet registered (cold start
+// race after Chrome unloads the SW). "The message port closed before a
+// response was received" → SW died mid-handler. Both are recoverable by
+// resending after a brief delay; without retry, bulk sends from multiple
+// tabs silently dropped 1–2 of N requests because the first message arrived
+// during SW boot.
+async function sendMessageWithRetry(payload, maxAttempts = 4) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await chrome.runtime.sendMessage(payload);
+    } catch (err) {
+      lastErr = err;
+      const msg = (err && err.message) || String(err);
+      const transient =
+        msg.includes('Receiving end does not exist') ||
+        msg.includes('message port closed') ||
+        msg.includes('Extension context invalidated');
+      if (!transient || attempt === maxAttempts) throw err;
+      // Exponential backoff: 50, 150, 350 ms — total ≤ 550 ms before giving up.
+      await new Promise(r => setTimeout(r, 50 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 50)));
+    }
+  }
+  throw lastErr;
+}
+
 async function sendToNAS(url, pageUrl) {
   await loadSettingsFromStorage();
 
@@ -862,7 +889,7 @@ async function sendToNAS(url, pageUrl) {
     // Background looks up the title that was captured when this URL was first
     // detected (getStoredPageTitle) and falls back to a placeholder if
     // missing. We still pass i18n-aware fallback so the language matches.
-    chrome.runtime.sendMessage({
+    await sendMessageWithRetry({
       action: 'sendToNAS',
       url: url,
       title: t('video.untitled'),
@@ -872,7 +899,7 @@ async function sendToNAS(url, pageUrl) {
     showToast(t('toast.sending'));
     setTimeout(loadRecentJobs, 2000);
   } catch (error) {
-    console.error('Error:', error);
+    console.error('sendToNAS message failed after retries:', error);
     showToast(t('toast.failedToSend'));
   }
 }

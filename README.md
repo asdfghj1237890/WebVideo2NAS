@@ -344,6 +344,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.13] - 2026-05-04
+
+#### Fixed
+- **Bulk-send still dropped 1–2 of 10 even after the v2.1.12 receiver-side fix**, because the *sender* side (`sidepanel.js → chrome.runtime.sendMessage(...)`) fired-and-forgot without ever awaiting the response or retrying transient delivery errors. The first 1–2 messages of a burst routinely lose to MV3's SW cold-start race ("Could not establish connection. Receiving end does not exist.") — the listener isn't registered yet, the message never reaches the handler, and there's no second attempt. Added a `sendMessageWithRetry()` helper with up to 4 attempts and 50→150→350 ms exponential backoff (≤ 550 ms total before giving up), targeting only the three known transient MV3 messaging errors (cold listener, port closed mid-handler, extension context invalidated). Verified with a cold-listener simulation: 5/5 messages delivered with retry vs 0/5 without
+- **API `submit_download` blocked the FastAPI event loop** by being declared `async def` while the body uses sync SQLAlchemy + sync redis (`db.execute(...)`, `redis_client.rpush(...)`). Each in-flight request serialised the next one's I/O behind it, compounding latency under concurrent burst load and making the SW more likely to terminate before some sends could complete the round trip. Demoted to plain `def` so FastAPI runs each invocation in the threadpool (default 40 threads) and 10+ concurrent submissions parallelise cleanly. (`list_jobs`/`get_job`/etc. are still `async def` — they're not on the burst-submit path, separate cleanup later.)
+- Worker / API version markers: `1.10.2` → `1.10.3`; extension manifest: `2.1.12` → `2.1.13`
+
 ### [2.1.12] - 2026-05-04
 
 #### Fixed
@@ -670,7 +677,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.12  
+**Version**: 2.1.13  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 

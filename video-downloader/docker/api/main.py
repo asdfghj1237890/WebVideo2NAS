@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8, MP4, and MOV)",
-    version="1.10.2"
+    version="1.10.3"
 )
 
 # CORS middleware
@@ -294,7 +294,7 @@ async def root():
     """Root endpoint"""
     return {
         "name": "WebVideo2NAS API",
-        "version": "1.10.2",
+        "version": "1.10.3",
         "status": "running"
     }
 
@@ -322,12 +322,22 @@ async def health_check(request: Request, authorization: Optional[str] = Header(N
         raise HTTPException(status_code=503, detail="Service unhealthy")
 
 @app.post("/api/download", response_model=JobResponse)
-async def submit_download(
+def submit_download(
     request: DownloadRequest,
     db: Session = Depends(get_db),
     api_key: str = Depends(verify_api_key)
 ):
-    """Submit a new download job"""
+    """Submit a new download job.
+
+    Defined as a regular `def` (not `async def`) on purpose: the body uses
+    sync SQLAlchemy and a sync redis client. If this were `async def`, every
+    `db.execute(...)` and `redis_client.rpush(...)` would block the event
+    loop, serialising all in-flight requests behind whichever one was
+    currently in I/O. By making it sync, FastAPI runs each invocation in the
+    threadpool (default 40 threads) and they parallelise cleanly — which
+    matters when the chrome extension fires 10+ /api/download calls in a
+    short burst.
+    """
     try:
         job_id = str(uuid.uuid4())
         now = datetime.utcnow()
