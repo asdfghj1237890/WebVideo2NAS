@@ -311,9 +311,35 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   animation-delay: calc(var(--idx, 0) * 30ms);
 }
 .tile:hover { transform: translateY(-2px); border-color: var(--glass-border-hi); }
+
+/* Selected state — must stay visually dominant even when the same tile is
+   .sent (which already paints a mint border + inset mint outline + mint
+   background tint, all from the same accent family). The previous selected
+   style used `--accent-dim` and a faint 1 px ring, both of which got
+   visually eaten by .sent → toggling deselect on a sent tile produced no
+   visible diff ("送出之後想 deselect 看不出來"). The fix: paint the
+   selection state with rings that live OUTSIDE .sent's territory — a
+   tight full-strength accent ring + a near-white halo ring + a soft drop
+   glow — plus a small lift transform for tactile toggle feedback. The
+   halo ring uses a high-luminance mint distinct from .sent's saturated
+   mint, so the two states are layerable without one clobbering the other. */
 .tile.selected {
-  border-color: var(--accent-dim);
-  box-shadow: 0 0 0 1px var(--accent-dim), 0 4px 16px -4px var(--accent-dim);
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 2.5px var(--accent),
+    0 0 0 5px oklch(98% 0.04 155 / 0.55),
+    0 6px 22px -4px var(--accent-dim);
+  transform: translateY(-2px) scale(1.015);
+  transition: box-shadow 200ms ease, transform 200ms ease, border-color 200ms ease;
+}
+[data-theme="light"] .tile.selected {
+  box-shadow:
+    0 0 0 2.5px var(--accent),
+    0 0 0 5px oklch(15% 0.02 155 / 0.45),
+    0 6px 22px -4px var(--accent-dim);
+}
+.tile.selected:hover {
+  transform: translateY(-3px) scale(1.02);
 }
 
 /* When at least one tile is selected, dim the thumbnail + meta of every

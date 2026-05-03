@@ -344,6 +344,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.15] - 2026-05-04
+
+#### Fixed
+- **Deselect on a sent tile produced no visible change** ("送出之後想 deselect 看不出來"). The previous selected style used `--accent-dim` and a faint 1 px ring — both got visually eaten by the `.sent` state, which already paints a full-strength mint border, an inset mint outline, and a mint background tint from the same accent family. Toggling `.selected` off a `.sent` tile changed nothing the eye could detect. The selected style now paints rings that live OUTSIDE `.sent`'s territory: a 2.5 px full-strength accent ring + a near-white halo ring (dark halo on light theme) + a soft drop glow, plus a small lift+scale transform for tactile toggle feedback. The two states are now layerable — a sent+selected tile shows BOTH the mint .sent fill and the bright outer selection ring, so toggling the selection is unmistakable
+
 ### [2.1.14] - 2026-05-04
 
 #### Changed
@@ -682,7 +687,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.14  
+**Version**: 2.1.15  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
