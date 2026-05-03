@@ -468,10 +468,21 @@ class SegmentDownloader:
                     headers['Origin'] = strategy['Origin']
                 elif 'Origin' in headers and strategy.get('Origin') is None:
                     del headers['Origin']
-                
+
                 content = self._try_download_with_headers(url, headers, index)
                 if content:
                     used_strategy = strategy['name']
+                else:
+                    # The previously-working strategy stopped working. Drop it so we don't
+                    # waste an extra request on every subsequent segment. Usually this means
+                    # the CDN's signed auth token (?auth=...&exp=...) has expired, not that
+                    # the Referer header is wrong — re-probing won't help, but at least we
+                    # stop trusting a stale cache.
+                    logger.warning(
+                        f"Cached Referer strategy '{strategy['name']}' stopped working "
+                        f"(segment {index}); invalidating. Likely a signed-URL/token expiry."
+                    )
+                    self.working_referer_strategy = None
             
             # If no working strategy yet, or it failed, try all strategies
             if content is None:

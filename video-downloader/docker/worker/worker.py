@@ -1026,21 +1026,34 @@ class DownloadWorker:
                         logger.error(f"Anti-hotlinking protection detected: {hotlink_count} segments blocked")
                         raise Exception(f"Download aborted: Server blocked segment downloads (anti-hotlinking protection). Try refreshing the source page and retrying.")
                     
-                    # Count HTTP 403/474 errors
+                    # Count HTTP 401/403/474 errors (auth/forbidden — usually expired CDN tokens)
                     http_error_count = sum(
-                        1 for item in downloader.failed_segments 
-                        if '403' in item['error'] or '474' in item['error']
+                        1 for item in downloader.failed_segments
+                        if '401' in item['error'] or '403' in item['error'] or '474' in item['error']
                     )
-                    
+
                     if http_error_count > 20:
-                        logger.error(f"Too many HTTP 403/474 errors detected: {http_error_count} segments failed")
-                        raise Exception(f"Download aborted: {http_error_count} segments failed with HTTP 403/474 errors (URL expired or blocked)")
+                        logger.error(f"Too many HTTP 401/403/474 errors detected: {http_error_count} segments failed")
+                        raise Exception(f"Download aborted: {http_error_count} segments failed with HTTP 401/403/474 errors (URL/token expired or blocked)")
             
             segment_files = downloader.download_all(progress_callback)
-            
+
             if not segment_files:
                 raise Exception("No segments downloaded successfully")
-            
+
+            # Refuse to ship a stub file made from a tiny fraction of segments.
+            # Anti-leech CDNs often return a few tokens worth of segments and 401 the rest;
+            # without this guard the worker happily merges 5/54 into a "complete" video.
+            total_segments = len(downloader.segments)
+            min_success_ratio = float(os.getenv('MIN_SEGMENT_SUCCESS_RATIO', '0.9'))
+            if total_segments > 0 and len(segment_files) / total_segments < min_success_ratio:
+                downloader.cleanup()
+                raise Exception(
+                    f"Download aborted: only {len(segment_files)}/{total_segments} segments succeeded "
+                    f"(<{int(min_success_ratio * 100)}%). Likely expired CDN auth token — "
+                    f"refresh the source page and retry."
+                )
+
             logger.info(f"Downloaded {len(segment_files)} segments")
             self.update_job_status(job_id, "downloading", progress=85)
             
