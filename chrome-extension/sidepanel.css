@@ -315,6 +315,24 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   border-color: var(--accent-dim);
   box-shadow: 0 0 0 1px var(--accent-dim), 0 4px 16px -4px var(--accent-dim);
 }
+
+/* When at least one tile is selected, dim the thumbnail + meta of every
+   unselected sibling so the picked-vs-unpicked split is obvious at a glance.
+   The sel-dot stays at full opacity (it's a child of .thumb-wrap, not .thumb)
+   so the empty checkbox remains a clear, prominent target on the dimmed
+   background — mac Photos / iOS Photos pattern. Hover lifts unselected back
+   to ~85% so the user can see what they're about to pick without committing. */
+.grid:has(.tile.selected) .tile.selectable:not(.selected) .thumb,
+.grid:has(.tile.selected) .tile.selectable:not(.selected) .tile-body,
+.grid:has(.tile.selected) .tile.selectable:not(.selected) .ip-warn {
+  opacity: 0.45;
+  transition: opacity 180ms ease;
+}
+.grid:has(.tile.selected) .tile.selectable:not(.selected):hover .thumb,
+.grid:has(.tile.selected) .tile.selectable:not(.selected):hover .tile-body,
+.grid:has(.tile.selected) .tile.selectable:not(.selected):hover .ip-warn {
+  opacity: 0.85;
+}
 .tile.sending {
   opacity: 0; transform: scale(0.92) !important;
   transition: opacity 180ms ease, transform 220ms ease-in;
@@ -441,19 +459,42 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   filter: brightness(1.08);
 }
 
+/* Empty checkbox needs to look UNAMBIGUOUSLY empty against any thumbnail
+   background (busy frames, light video stills, dark stills). The previous
+   18×18 dim translucent square blended into thumbnails and read as a
+   media-overlay glyph rather than an interactive checkbox. */
 .sel-dot {
   position: absolute; top: 6px; right: 6px;
-  width: 18px; height: 18px; border-radius: 4px;
-  border: 1.5px solid rgba(255,255,255,0.4);
-  background: rgba(0,0,0,0.5);
+  width: 22px; height: 22px; border-radius: 6px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  background: rgba(0, 0, 0, 0.35);
   display: flex; align-items: center; justify-content: center;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
-  transition: background 160ms, border-color 160ms;
+  /* Layered shadow: tight inner contrast ring + soft outer halo so the
+     checkbox stays visible on both light and dark thumbnails. */
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, 0.28),
+    0 0 0 1px rgba(0, 0, 0, 0.55),
+    0 2px 6px rgba(0, 0, 0, 0.5);
+  transition: background 160ms, border-color 160ms, transform 160ms;
   pointer-events: none;
+}
+[data-theme="light"] .sel-dot {
+  /* On light theme the bright white ring becomes a dark ring instead — same
+     idea (high contrast against thumbnails) but keyed to the surface tone. */
+  border-color: rgba(0, 0, 0, 0.72);
+  background: rgba(255, 255, 255, 0.45);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.5),
+    0 0 0 1px rgba(255, 255, 255, 0.6),
+    0 2px 6px rgba(0, 0, 0, 0.25);
 }
 .tile.selected .sel-dot {
   background: var(--accent); border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg0), 0 2px 8px oklch(78% 0.13 155 / 0.6);
   animation: wv2nCheckBounce 260ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+[data-theme="light"] .tile.selected .sel-dot {
+  box-shadow: 0 0 0 2px var(--bg0), 0 2px 8px oklch(58% 0.14 155 / 0.45);
 }
 .sel-dot svg { display: none; }
 .tile.selected .sel-dot svg { display: block; }

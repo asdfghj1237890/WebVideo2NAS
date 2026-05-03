@@ -344,6 +344,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.14] - 2026-05-04
+
+#### Changed
+- **Selectable-tile state was hard to read at a glance.** In bulk-select mode (≥7 detected videos) the empty checkbox was an 18×18 dim translucent square that read more like a media-overlay glyph than an interactive control on busy thumbnails, and the unselected vs. selected tile bodies looked nearly identical except for a subtle accent border. Two changes: (1) the empty `.sel-dot` is now 22×22 with a 2 px high-contrast white ring (dark ring on light theme), an inner contrast halo, and a stronger drop shadow so it stays unmistakably checkbox-shaped on every thumbnail; (2) when *any* tile is selected, the thumbnail + meta of every unselected sibling fades to 45% opacity (hover lifts to 85%) — the picked-vs-unpicked split now reads instantly. The sel-dot itself stays at full opacity over the dimmed thumbnail, so the empty checkbox remains a prominent click target (mac/iOS Photos pattern). Implemented as pure CSS via `:has()` — no JS state changes
+
 ### [2.1.13] - 2026-05-04
 
 #### Fixed
@@ -677,7 +682,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.13  
+**Version**: 2.1.14  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
