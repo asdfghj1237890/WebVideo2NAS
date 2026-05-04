@@ -253,6 +253,34 @@ class SegmentDownloader:
         if len(key) != 16:
             raise ValueError(f"Unexpected AES-128 key length: {len(key)} bytes (expected 16)")
 
+        # Diagnostic: a real AES-128 key is 16 random binary bytes. If the
+        # endpoint returned 16 PRINTABLE ASCII chars instead (e.g. a hex
+        # string truncated to 16 chars), every segment will decrypt to
+        # garbage even though length passes the check above. Log the full
+        # hex + Content-Type so we can tell at a glance whether the key
+        # is real or text. Loud WARNING when it looks like ASCII.
+        content_type = ''
+        try:
+            content_type = response.headers.get('Content-Type', '') or ''
+        except Exception:
+            content_type = ''
+        is_printable_ascii = all(0x20 <= b <= 0x7E for b in key)
+        logger.info(
+            f"Key fetched from {key_url.split('?', 1)[0]}: "
+            f"Content-Type={content_type!r}, len={len(key)}, hex={key.hex()}"
+        )
+        if is_printable_ascii:
+            try:
+                as_text = key.decode('ascii', errors='replace')
+            except Exception:
+                as_text = repr(key)
+            logger.warning(
+                f"AES-128 key looks like printable ASCII text "
+                f"({as_text!r}) — endpoint may be returning a hex string "
+                f"or other text instead of binary bytes. If decryption "
+                f"output looks wrong, check the key endpoint response."
+            )
+
         with self._key_cache_lock:
             self._key_cache[key_url] = key
         return key
