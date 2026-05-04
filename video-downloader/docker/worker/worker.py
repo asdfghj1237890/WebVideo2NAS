@@ -126,6 +126,36 @@ def resolve_output_dir(subdir):
     return candidate
 
 
+def _make_safe_filename_stem(title, fallback: str, max_bytes: int = 240) -> str:
+    """Sanitize `title` into a filesystem-safe stem (no extension), truncated
+    to fit `max_bytes` UTF-8 bytes.
+
+    The Linux ext4/btrfs single-filename limit is 255 bytes — a Japanese title
+    of ~90 characters is roughly 270 bytes once UTF-8 encoded and overflows
+    that limit, producing `OSError: [Errno 36] File name too long` (the
+    `pathlib.Path.exists()` collision-check at the call sites is what surfaces
+    it). Default 240-byte cap leaves room for a `.mp4`/`.mov` extension and a
+    ` (NN)` collision-suffix without re-tripping the limit.
+
+    Truncation walks back to a UTF-8 character boundary so we never slice
+    inside a multi-byte sequence, then strips trailing whitespace introduced
+    by the cut.
+    """
+    cleaned = "".join(c for c in (title or "") if c.isalnum() or c in (" ", "-", "_")).strip()
+    if not cleaned:
+        return fallback
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return cleaned
+    # Walk back from `max_bytes` while the next byte would be a UTF-8
+    # continuation byte (0b10xxxxxx), so we cut on a codepoint boundary.
+    cut = max_bytes
+    while cut > 0 and (encoded[cut] & 0xC0) == 0x80:
+        cut -= 1
+    truncated = encoded[:cut].decode("utf-8", errors="ignore").rstrip()
+    return truncated or fallback
+
+
 class DownloadWorker:
     """Worker class for processing download jobs"""
     
@@ -346,9 +376,7 @@ class DownloadWorker:
                     continue
                 header_str += f"{k}: {v}\r\n"
 
-            safe_title = "".join(c for c in job['title'] if c.isalnum() or c in (' ', '-', '_')).strip()
-            if not safe_title:
-                safe_title = f"video_{job_id[:8]}"
+            safe_title = _make_safe_filename_stem(job.get('title') or '', fallback=f"video_{job_id[:8]}")
 
             output_dir = resolve_output_dir(job.get('output_subdir'))
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -510,9 +538,7 @@ class DownloadWorker:
             logger.info(f"Request headers: {headers}")
             
             # Prepare output path
-            safe_title = "".join(c for c in job['title'] if c.isalnum() or c in (' ', '-', '_')).strip()
-            if not safe_title:
-                safe_title = f"video_{job_id[:8]}"
+            safe_title = _make_safe_filename_stem(job.get('title') or '', fallback=f"video_{job_id[:8]}")
 
             output_dir = resolve_output_dir(job.get('output_subdir'))
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1080,9 +1106,7 @@ class DownloadWorker:
             self.update_job_status(job_id, "processing", progress=90)
             
             # Prepare output path
-            safe_title = "".join(c for c in job['title'] if c.isalnum() or c in (' ', '-', '_')).strip()
-            if not safe_title:
-                safe_title = f"video_{job_id[:8]}"
+            safe_title = _make_safe_filename_stem(job.get('title') or '', fallback=f"video_{job_id[:8]}")
             
             # Handle file name collisions
             output_dir = resolve_output_dir(job.get('output_subdir'))

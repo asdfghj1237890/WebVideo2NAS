@@ -344,6 +344,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.19] - 2026-05-04
+
+#### Fixed
+- **`OSError: [Errno 36] File name too long` on long Japanese / CJK titles**, killing the merge step after the user had already burned bandwidth downloading 1228 segments. The Linux ext4/btrfs single-filename limit is 255 bytes, but every Japanese character is 3 bytes UTF-8, so a ~90-character title encodes to ~270 bytes and overflows. Worker's `safe_title` sanitization had no length cap, and the chrome extension's `.substring(0, 100)` cap counts *characters* not bytes — neither protected against this. Added a module-level `_make_safe_filename_stem()` helper that sanitizes and then truncates to **240 UTF-8 bytes** (leaves headroom for `.mp4`/`.mov` and a ` (NN)` collision suffix under the 255-byte limit), walking back to a UTF-8 character boundary so it never slices inside a multi-byte sequence. Used by all three filename construction sites (MPD, direct download, m3u8). Verified with the failing real-world title: 256 bytes → 240 bytes truncated cleanly at a character boundary, full path with `.mp4` + ` (99)` suffix → 249 bytes ≤ 255
+- Worker / API version markers: `1.10.4` → `1.10.5`; extension manifest: `2.1.18` → `2.1.19` (worker fix needs a rebuilt docker image to take effect)
+
 ### [2.1.18] - 2026-05-04
 
 #### Fixed
@@ -706,7 +712,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.18  
+**Version**: 2.1.19  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 

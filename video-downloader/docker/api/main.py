@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8, MP4, and MOV)",
-    version="1.10.4"
+    version="1.10.5"
 )
 
 # CORS middleware
@@ -305,7 +305,7 @@ async def root():
     """Root endpoint"""
     return {
         "name": "WebVideo2NAS API",
-        "version": "1.10.4",
+        "version": "1.10.5",
         "status": "running"
     }
 
