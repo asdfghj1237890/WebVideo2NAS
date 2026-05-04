@@ -835,15 +835,6 @@ async function sendToNAS(url, pageTitle, pageUrl) {
       try { return new URL(u); } catch (_) { return null; }
     }
 
-    async function getActiveTabId() {
-      try {
-        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-        return tabs && tabs[0] ? tabs[0].id : null;
-      } catch (_) {
-        return null;
-      }
-    }
-
     function originOf(u) {
       const uu = tryGetUrl(u);
       return uu ? uu.origin : null;
@@ -857,7 +848,7 @@ async function sendToNAS(url, pageTitle, pageUrl) {
       return false;
     }
 
-    function findBestCapturedEntry(targetUrl, tabId, sourcePageUrl) {
+    function findBestCapturedEntry(targetUrl, sourcePageUrl) {
       const t = tryGetUrl(targetUrl);
       if (!t) return null;
 
@@ -874,15 +865,22 @@ async function sendToNAS(url, pageTitle, pageUrl) {
         const isManifestByFormat = !!getDetectedFormat(k);
         if (!isManifestByExt && !isManifestByFormat) continue;
 
+        // Match on the SOURCE PAGE'S origin, not the currently active tab.
+        // The previous +10 used `chrome.tabs.query({active:true})` which is the
+        // tab the user happens to be looking at right now — not the tab the
+        // URL was detected on. When the user switches tabs and then clicks a
+        // tile from the previous tab, that mismatch caused another tab's
+        // captured manifest to score highest and OVERWRITE the URL the user
+        // actually clicked. Origin is intrinsic to the URL/page, so it
+        // survives tab switches and tab close/reopen.
         let score = 0;
-        if (tabId != null && entry.tabId === tabId) score += 10;
+        if (sourceOrigin && entry.initiator && entry.initiator.startsWith(sourceOrigin)) score += 10;
         if (ku.origin === t.origin) score += 5;
         if (ku.pathname === t.pathname) score += 2;
         // Prefer tokenized URLs (query params) as they often map to full playlists
         if (ku.search && ku.search.length > 1) score += 3;
         // Prefer captured requests that already carried Cookie headers
         if (hasCookieHeader(entry.headers)) score += 3;
-        if (sourceOrigin && entry.initiator && entry.initiator.startsWith(sourceOrigin)) score += 3;
         if (entry.timestamp && (Date.now() - entry.timestamp) < 60_000) score += 1;
 
         if (!best) {
@@ -902,21 +900,31 @@ async function sendToNAS(url, pageTitle, pageUrl) {
       return best;
     }
 
-    const tabId = await getActiveTabId();
     let captured = capturedHeaders[url];
-    const best = findBestCapturedEntry(url, tabId, pageUrl);
+    const best = findBestCapturedEntry(url, pageUrl);
 
-    // Use the best captured m3u8 when it's a strong match for this tab+origin,
-    // even if we have an exact key hit. Exact matches are often "clean" URLs
-    // (no token) while the real player request contains query params.
+    // Use the best captured m3u8 when it's a strong match for this URL's
+    // SOURCE page+origin, even if we have an exact key hit. Exact matches are
+    // often "clean" URLs (no token) while the real player request contains
+    // query params. Hard requirement: the substitute must be from the SAME
+    // origin as the URL the user actually clicked — never substitute across
+    // origins, which would silently send a video from a different site.
+    const sourceOrigin = originOf(pageUrl);
+    const targetOrigin = originOf(url);
+    const bestUrlOrigin = best ? originOf(best.url) : null;
+    const sameOrigin = !!best && (
+      (sourceOrigin && best.entry.initiator && best.entry.initiator.startsWith(sourceOrigin)) ||
+      (targetOrigin && bestUrlOrigin && bestUrlOrigin === targetOrigin)
+    );
+
     const shouldUseBest =
-      !!best &&
+      !!best && sameOrigin &&
       (captured == null || best.score >= 15 || (best.entry && best.entry.timestamp && captured.timestamp && best.entry.timestamp > captured.timestamp));
 
     if (shouldUseBest) {
       captured = best.entry;
       urlToSend = best.url;
-      console.log('Using best captured manifest for this tab:', urlToSend);
+      console.log('Using best captured manifest for this URL\'s source page:', urlToSend);
     }
     
     if (captured && captured.headers) {

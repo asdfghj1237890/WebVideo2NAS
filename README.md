@@ -344,6 +344,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.20] - 2026-05-04
+
+#### Fixed
+- **Multi-tab URL substitution sent the wrong video.** When the user clicked Send on a tile from Tab A while currently viewing Tab B, the captured-headers picker scored every Tab B manifest +10 (because it called `chrome.tabs.query({active:true,currentWindow:true})` to get the "current" tabId — which is Tab B, not the URL's source tab). With the +10 weight dominating, `shouldUseBest` then OVERWROTE the URL the user actually clicked with whichever Tab B manifest scored highest, silently sending a video from a completely different site. Replaced the tabId-based scoring with **source-page origin matching** — the URL's source `pageUrl` is already passed through with the click, and a captured manifest's `entry.initiator` carries the page that triggered the request, so we can compare them directly without ever calling `chrome.tabs.query`. Also added a hard same-origin guard on the substitution itself: even if a captured entry scores high, it can only replace the user's clicked URL if it shares either (a) the source page's origin via initiator, or (b) the same URL origin as what the user clicked. Origin is intrinsic to the URL and survives tab switches/close/reopen, where tabId is a transient identifier the user can never see — making this both correct and tab-switch-immune. Verified with a two-tab simulation: old logic returned Tab B's URL when the user clicked Tab A's; new logic returns Tab A's tokenized variant as expected
+- Removed the now-unused `getActiveTabId()` helper and dropped the `tabId` parameter from `findBestCapturedEntry()`
+
 ### [2.1.19] - 2026-05-04
 
 #### Fixed
@@ -712,7 +718,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.19  
+**Version**: 2.1.20  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
