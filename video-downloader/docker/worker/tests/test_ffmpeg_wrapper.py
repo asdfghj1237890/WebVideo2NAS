@@ -7,6 +7,23 @@ import ffmpeg_wrapper
 from ffmpeg_wrapper import FFmpegMerger, merge_segments
 
 
+class _CapturingBytesIO(io.BytesIO):
+    """BytesIO that snapshots its content BEFORE close() so tests can
+    inspect what production code wrote, even though merge() closes
+    stdin as part of its normal flow. Without this snapshot, calling
+    .getvalue() after close raises ValueError: I/O operation on closed
+    file."""
+
+    def __init__(self):
+        super().__init__()
+        self.captured: bytes = b""
+
+    def close(self):
+        if not self.closed:
+            self.captured = self.getvalue()
+        super().close()
+
+
 class _FakePopen:
     """Stand-in for subprocess.Popen that captures the command, simulates
     a successful ffmpeg run by creating the output file, and exposes
@@ -16,7 +33,7 @@ class _FakePopen:
     def __init__(self, command, stdin=None, stdout=None, stderr=None, **kwargs):
         self.command = list(command)
         self.returncode = 0
-        self.stdin = io.BytesIO()
+        self.stdin = _CapturingBytesIO()
         self.stdout = io.BytesIO(b"")
         self.stderr = io.BytesIO(b"")
         # Output file is the last positional argument in the ffmpeg cmd.
@@ -104,7 +121,8 @@ def test_merge_uses_stdin_byte_concat_with_mpegts_input(tmp_path, monkeypatch):
     assert "-safe" not in cmd
 
     # Merger must write each segment's bytes into ffmpeg stdin in order.
-    piped = captured["instances"][0].stdin.getvalue()
+    # `captured` is the snapshot taken before merge() closed the stream.
+    piped = captured["instances"][0].stdin.captured
     assert piped == seg1.read_bytes() + seg2.read_bytes()
 
 
