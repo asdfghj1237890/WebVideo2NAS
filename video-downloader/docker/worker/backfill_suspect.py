@@ -68,13 +68,15 @@ def main() -> int:
     engine = create_engine(DATABASE_URL)
     Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-    # Build a thin shim with just the helpers we need so we don't have to
-    # spin up a full DownloadWorker (which connects to redis, etc.).
-    class _Shim:
-        _probe_duration_seconds = DownloadWorker._probe_duration_seconds
-        _compute_suspect_reason = DownloadWorker._compute_suspect_reason
-
-    shim = _Shim()
+    # Both helpers are @staticmethod on DownloadWorker, so we can invoke
+    # them directly off the class without instantiating a worker (which
+    # would connect to redis / DB twice). The previous _Shim approach
+    # hoisted the staticmethods as instance attributes, which Python
+    # rebinds as bound methods — so `shim._compute_suspect_reason(
+    # declared_duration=...)` got `shim` slotted into `declared_duration`
+    # and crashed with "got multiple values for argument".
+    probe_duration = DownloadWorker._probe_duration_seconds
+    compute_suspect_reason = DownloadWorker._compute_suspect_reason
 
     where_filter = (
         "WHERE j.status = 'completed' AND j.file_path IS NOT NULL"
@@ -111,7 +113,7 @@ def main() -> int:
             missing += 1
             continue
 
-        actual = shim._probe_duration_seconds(path)
+        actual = probe_duration(path)
         if actual is None:
             failed_probe += 1
         # File size from disk (more authoritative than DB column for backfill)
@@ -120,7 +122,7 @@ def main() -> int:
         except OSError:
             size_bytes = row.file_size or 0
 
-        reason = shim._compute_suspect_reason(
+        reason = compute_suspect_reason(
             declared_duration=row.duration,
             actual_duration=actual,
             file_size_bytes=size_bytes,

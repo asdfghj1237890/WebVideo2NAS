@@ -252,8 +252,11 @@ class DownloadWorker:
             # Never let a diagnostic kill a job.
             logger.warning(f"[diag] segment-duration sanity check failed: {e}")
 
-    def _probe_duration_seconds(self, file_path: str):
-        """Return media duration in seconds using ffprobe, or None if unavailable."""
+    @staticmethod
+    def _probe_duration_seconds(file_path: str):
+        """Return media duration in seconds using ffprobe, or None if
+        unavailable. Static so callers (incl. backfill_suspect.py shim)
+        can invoke it without spinning up a worker instance."""
         try:
             ffprobe_path = shutil.which("ffprobe")
             if not ffprobe_path:
