@@ -1583,5 +1583,5 @@ function containsIpAddress(url) {
   return ipv4QueryPattern.test(url);
 }
 
-// Auto-refresh jobs every 5 seconds
-setInterval(loadRecentJobs, 5000);
+// Auto-refresh jobs every 2 seconds
+setInterval(loadRecentJobs, 2000);

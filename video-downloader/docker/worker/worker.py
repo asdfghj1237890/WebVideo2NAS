@@ -523,7 +523,7 @@ class DownloadWorker:
             last_progress = 5
             time_pattern = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
 
-            check_interval_sec = 4.0
+            check_interval_sec = 2.0
             next_check_time = time.monotonic() + check_interval_sec
             stderr_lines = []
 
@@ -677,7 +677,7 @@ class DownloadWorker:
             # time-based throttling actually triggers.
             chunk_size = 1024 * 1024  # 1MB
 
-            check_interval_sec = 4.0
+            check_interval_sec = 2.0
             check_bytes_step = 16 * 1024 * 1024
 
             next_check_time = time.monotonic() + check_interval_sec
