@@ -344,6 +344,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.2.3] - 2026-05-04
+
+#### Changed
+- **Anti-hotlink failures now surface a Re-fetch button** instead of silently sitting in `failed`. When the worker aborts a job because the CDN started serving anti-hotlink PNG placeholders mid-download (signed-URL token expired, or the session/cookie context the CDN wanted got invalidated), the sidepanel now renders the same warm-tone Re-fetch block the suspect-file path uses (v2.1.22) — one click re-opens the original `source_page` in a new tab, the extension grabs fresh m3u8 + segment tokens, and the user resends as normal. Re-uses the existing `source_page` field on `job_metadata` (already populated since v2.1.22), the existing button + toast UI, and the same `suspect.refetch.*` i18n strings. Adds a new label key `suspect.label.refetch` ("Re-fetch needed" / "需要重新抓取" / "需要重新抓取") because the original `suspect.label` ("Probably wrong") is a misnomer for a job that never produced a file.
+- **Anti-hotlinking errors now classify as `error.tokenExpired`** in the failed-job error-details block (was `error.generic`). The recovery is identical to a CDN-token-expiry — refresh the source page and resend — so the existing tokenExpired solution copy applies cleanly. No new i18n needed.
+- **Worker stops retrying segments once it confirms the response is an anti-hotlink placeholder**: the `download_segment` retry loop now short-circuits when the failure message contains `anti-hotlinking`, since retrying the same URL with the same session and same auth produces the same PNG. Saves ~16 dead HTTP requests per segment and lets the existing 5-segment hotlink-count guard (`worker.py:1152`) trip in <1s instead of ~4s. The other retry paths (timeouts, transient 5xx, etc.) still get the full 3 retries with exponential backoff.
+
+#### Notes
+- The Re-fetch button only renders when `job.source_page` is recorded — pre-v2.1.22 jobs without a captured source URL still surface the error-details block but no actionable button (same as before for any job with no source_page).
+- The new `isHotlinkFail` detection in `sidepanel.js` is a substring match on the worker's existing abort message ("Download aborted: Server blocked segment downloads (anti-hotlinking protection)…"). No worker→extension contract change.
+
 ### [2.2.2] - 2026-05-04
 
 #### Changed

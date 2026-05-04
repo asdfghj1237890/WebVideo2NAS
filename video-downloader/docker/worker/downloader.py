@@ -605,20 +605,32 @@ class SegmentDownloader:
             return str(output_path)
         
         except Exception as e:
-            logger.warning(f"Failed to download segment {index} (attempt {retry_count + 1}): {e}")
-            
+            err_str = str(e)
+            logger.warning(f"Failed to download segment {index} (attempt {retry_count + 1}): {err_str}")
+
             # Check if stop was requested before retrying
             if self._stop_event.is_set():
                 logger.debug(f"Segment {index} retry cancelled - stop requested")
                 return None
-            
+
+            # Skip retries when the CDN returned an anti-hotlink placeholder
+            # (PNG/JPEG/GIF) on every Referer strategy. Same session + same URL +
+            # same auth on retry → same PNG. Retrying just wastes ~16 requests
+            # and delays the abort threshold by ~4 seconds. Let it fail now so
+            # the worker's hotlink-count guard trips quickly and the user gets
+            # the Re-fetch prompt.
+            if 'anti-hotlinking' in err_str.lower():
+                logger.error(f"Segment {index} hit anti-hotlink response; not retrying (retries cannot recover an expired CDN token)")
+                self.failed_segments.append({'segment': segment, 'error': err_str})
+                return None
+
             # Retry logic
             if retry_count < self.max_retries:
                 time.sleep(2 ** retry_count)  # Exponential backoff
                 return self.download_segment(segment, retry_count + 1)
             else:
                 logger.error(f"Segment {index} failed after {self.max_retries} attempts")
-                self.failed_segments.append({'segment': segment, 'error': str(e)})
+                self.failed_segments.append({'segment': segment, 'error': err_str})
                 return None
     
     def download_all(

@@ -116,6 +116,7 @@
       'error.tokenExpired.solution': 'The video segments are protected by a <strong>signed CDN token</strong> (e.g. <code>?auth=...&exp=...</code>) that expired before the download finished. Most segments returned <strong>HTTP 401</strong>.\n<ul>\n  <li><strong>Refresh the source video page</strong> in the browser (this regenerates the token)</li>\n  <li>Then click <strong>Send</strong> again right away — these tokens are short-lived</li>\n  <li>If it keeps failing, the site may issue single-use URLs; try playing the video first to warm the session</li>\n</ul>',
 
       'suspect.label': 'Probably wrong',
+      'suspect.label.refetch': 'Re-fetch needed',
       'suspect.refetch': 'Re-fetch from source page',
       'suspect.refetch.title': 'Open the source page so the extension can capture a fresh m3u8 token, then click Send again',
       'suspect.toast.opened': 'Opened source page. Wait for the player to load, then click Send to redownload.',
@@ -299,6 +300,7 @@
       'error.tokenExpired.solution': '影片片段被 <strong>CDN 簽章 token</strong>(例如 <code>?auth=...&exp=...</code>)保護，token 在下載完成前就過期了，大部分片段都回 <strong>HTTP 401</strong>。\n<ul>\n  <li><strong>到瀏覽器重新整理影片來源頁</strong>(會重新產生 token)</li>\n  <li>立刻再按一次 <strong>Send</strong> — 這類 token 通常很快過期</li>\n  <li>還是失敗的話,該站可能用單次性 URL,先把影片播一下熱身再送</li>\n</ul>',
 
       'suspect.label': '檔案疑似有問題',
+      'suspect.label.refetch': '需要重新抓取',
       'suspect.refetch': '從來源頁重新下載',
       'suspect.refetch.title': '開啟來源頁讓 extension 抓到新的 m3u8 token,然後再按一次 Send',
       'suspect.toast.opened': '已開啟來源頁。等 player 載入,再按 Send 重新下載。',
@@ -465,6 +467,7 @@
       'error.tokenExpired.solution': '视频片段被 <strong>CDN 签名 token</strong>(例如 <code>?auth=...&exp=...</code>)保护，token 在下载完成前就过期了，大部分片段都返回 <strong>HTTP 401</strong>。\n<ul>\n  <li><strong>到浏览器刷新视频源页面</strong>(会重新生成 token)</li>\n  <li>立刻再按一次 <strong>Send</strong> — 这类 token 通常很快过期</li>\n  <li>仍然失败的话,该站可能使用单次性 URL,先把视频播一下预热再发送</li>\n</ul>',
 
       'suspect.label': '文件疑似有问题',
+      'suspect.label.refetch': '需要重新抓取',
       'suspect.refetch': '从源页面重新下载',
       'suspect.refetch.title': '打开源页面让 extension 抓到新的 m3u8 token,然后再按一次 Send',
       'suspect.toast.opened': '已打开源页面。等 player 加载,再按 Send 重新下载。',

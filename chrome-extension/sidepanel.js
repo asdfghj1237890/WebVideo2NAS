@@ -1067,7 +1067,17 @@ function getJobInnerHtml(job) {
   // for completed jobs, and only useful when we have a source_page to
   // re-open in the browser so the user can capture a fresh m3u8 token.
   const isSuspect = job.status === 'completed' && !!job.suspect_reason;
-  const canRefetch = job.status === 'completed' && !!job.source_page;
+  // Hotlink-fail = worker aborted mid-download because the CDN started
+  // serving anti-hotlink PNGs (token expired / session invalidated). Same
+  // recovery as suspect: re-open source_page so the extension grabs fresh
+  // m3u8/segment tokens, then user resends. The error_message above
+  // already shows the failure reason, so the suspect-block here just
+  // surfaces the action button.
+  const isHotlinkFail = isFailed && !!job.error_message && (() => {
+    const m = job.error_message.toLowerCase();
+    return m.includes('anti-hotlinking') || m.includes('download aborted');
+  })();
+  const canRefetch = !!job.source_page && (isSuspect || isHotlinkFail);
   const statusTooltip = (job.status === 'completed' && typeof job.duration === 'number')
     ? t('job.duration', { duration: formatDuration(job.duration) })
     : '';
@@ -1125,13 +1135,13 @@ function getJobInnerHtml(job) {
           </div>
         </details>
       ` : ''}
-      ${isSuspect ? `
+      ${(isSuspect || isHotlinkFail) ? `
         <div class="suspect-block">
           <div class="suspect-summary">
             <span class="suspect-icon" aria-hidden="true">!</span>
-            <span class="suspect-label">${escapeHtml(t('suspect.label'))}</span>
+            <span class="suspect-label">${escapeHtml(t(isHotlinkFail ? 'suspect.label.refetch' : 'suspect.label'))}</span>
           </div>
-          <div class="suspect-reason">${escapeHtml(job.suspect_reason)}</div>
+          ${isSuspect ? `<div class="suspect-reason">${escapeHtml(job.suspect_reason)}</div>` : ''}
           ${canRefetch ? `
             <button class="suspect-refetch-btn" type="button"
                     data-refetch
@@ -1522,6 +1532,7 @@ function getErrorInfo(errorMessage) {
     msg.includes('401') ||
     msg.includes('expired cdn auth token') ||
     msg.includes('url/token expired') ||
+    msg.includes('anti-hotlinking') ||
     (msg.includes('download aborted') && msg.includes('only ') && msg.includes('segments succeeded'))
   ) {
     return { type: t('error.tokenExpired.type'), message: errorMessage, solution: t('error.tokenExpired.solution') };
