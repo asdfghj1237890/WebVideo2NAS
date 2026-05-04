@@ -179,6 +179,9 @@ services:
   worker2:
     # identical to worker; second instance for parallelism
 
+  worker3:
+    # identical to worker; third instance for parallelism
+
   db:    { image: postgres:15-alpine }
   redis: { image: redis:7-alpine }
   db_cleanup: # postgres:15-alpine container running a periodic job-pruning script
@@ -278,7 +281,7 @@ The system deploys **2 independent workers** by default, both pulling from the s
 
 ### 4.2 NAS Backend
 - **API Gateway**: FastAPI (Python 3.11)
-- **Workers**: Python 3.11; libraries: `requests`, `curl_cffi` (TLS impersonation), `m3u8`, `pycryptodome` (HLS AES-128); 2 workers by default, scalable
+- **Workers**: Python 3.11; libraries: `requests`, `curl_cffi` (TLS impersonation), `m3u8`, `pycryptodome` (HLS AES-128); 3 workers by default, scalable
 - **FFmpeg**: bundled in the unified image
 - **Database**: PostgreSQL 15
 - **Queue**: Redis 7

@@ -255,11 +255,11 @@ The full list with inline comments lives in [`.env.example`](video-downloader/do
 | `RATE_LIMIT_PER_MINUTE` | `10` | Per-IP API rate limit (0 disables) |
 | `ALLOWED_CLIENT_CIDRS` | _(empty)_ | Comma-separated CIDRs permitted to call the API; empty = no restriction |
 | `SSRF_GUARD` | `false` | `true` blocks downloads targeting private/loopback/link-local hosts |
-| `CLEANUP_INTERVAL_SECONDS` | `3600` | How often `db_cleanup` prunes finished jobs (keeps latest 100) |
+| `CLEANUP_INTERVAL_SECONDS` | `3600` | How often `db_cleanup` prunes finished jobs (keeps latest 100 per status: completed/failed/cancelled). Partial files for failed/cancelled are also rm'd. |
 
 ### Worker Scaling
 
-The default compose runs **2 download workers**. For higher throughput copy the `worker2` block into `worker3` / `worker4` / etc. For lower-spec hosts delete the `worker2` service.
+The default compose runs **3 download workers**. For higher throughput copy the `worker3` block into `worker4` / `worker5` / etc. For lower-spec hosts delete the `worker3` (or `worker2`) service.
 
 ### Extension Settings
 

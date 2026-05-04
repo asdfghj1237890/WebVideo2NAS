@@ -1387,6 +1387,29 @@ def _ensure_schema() -> None:
         logger.warning(f"Schema migration skipped: {e}")
 
 
+def _reap_zombie_jobs() -> None:
+    """Mark long-stuck in-flight jobs as failed at startup.
+    A job in 'downloading'/'processing' with started_at >2h ago is presumed
+    abandoned by a worker that crashed mid-download. The 2h floor keeps slow
+    legitimate HLS jobs from getting clobbered when another worker restarts.
+    Idempotent across concurrent worker boots — PG row locks serialise; the
+    second writer just sees no matching rows."""
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                UPDATE jobs
+                SET status = 'failed',
+                    error_message = 'Worker restarted while job was in progress (zombie reaped after 2h)'
+                WHERE status IN ('downloading', 'processing')
+                  AND started_at IS NOT NULL
+                  AND started_at < NOW() - INTERVAL '2 hours'
+            """))
+            if result.rowcount > 0:
+                logger.warning(f"Reaped {result.rowcount} zombie in-flight job(s) (>2h with no completion)")
+    except Exception as e:
+        logger.warning(f"Zombie reaper skipped: {e}")
+
+
 def main():
     """Main entry point"""
     logger.info("="*50)
@@ -1411,7 +1434,8 @@ def main():
             time.sleep(2)
 
     _ensure_schema()
-    
+    _reap_zombie_jobs()
+
     # Wait for Redis to be ready
     for i in range(max_retries):
         try:

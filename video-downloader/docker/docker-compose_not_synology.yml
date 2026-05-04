@@ -149,7 +149,44 @@ services:
     networks:
       - video_network
 
-  # Periodic DB cleanup: keep latest 100 finished jobs
+  # Download Worker 3 — same image, ROLE=worker
+  worker3:
+    image: ghcr.io/asdfghj1237890/webvideo2nas:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: video_worker_3
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - ROLE=worker
+      - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-postgres_password}@db:5432/video_db
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
+      - MAX_DOWNLOAD_WORKERS=${MAX_DOWNLOAD_WORKERS:-10}
+      - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
+      - FFMPEG_THREADS=${FFMPEG_THREADS:-4}
+    volumes:
+      - ../downloads:/downloads
+      - ../logs:/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # The unified image's Dockerfile HEALTHCHECK probes :8000 (the API).
+      # Worker doesn't listen, so disable the inherited check.
+      disable: true
+    networks:
+      - video_network
+
+  # Periodic DB cleanup: keep latest 100 jobs PER status (completed/failed/
+  # cancelled), and rm partial files left by failed/cancelled jobs.
+  # Sleeps before the first pass so container restarts don't trigger an
+  # immediate re-prune.
   db_cleanup:
     image: postgres:15-alpine
     container_name: video_db_cleanup
@@ -159,15 +196,38 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - ../downloads:/downloads
     command:
       - sh
       - -ec
       - |
           while true; do
-            echo "[db_cleanup] pruning finished jobs (keep latest 100)..."
-            export PGPASSWORD="$${DB_PASSWORD:-postgres_password}"
-            psql -h db -U postgres -d video_db -v ON_ERROR_STOP=1 -c "WITH keep AS (SELECT id FROM jobs WHERE status IN ('completed','failed') ORDER BY created_at DESC LIMIT 100) DELETE FROM jobs WHERE status IN ('completed','failed') AND id NOT IN (SELECT id FROM keep);"
             sleep "$${CLEANUP_INTERVAL_SECONDS:-3600}"
+            echo "[db_cleanup] pruning (keep latest 100 per status: completed/failed/cancelled)..."
+            export PGPASSWORD="$${DB_PASSWORD:-postgres_password}"
+            psql -h db -U postgres -d video_db -At -v ON_ERROR_STOP=1 -c "
+              WITH keep AS (
+                SELECT id FROM (
+                  SELECT id, ROW_NUMBER() OVER (PARTITION BY status ORDER BY created_at DESC) AS rn
+                  FROM jobs WHERE status IN ('completed','failed','cancelled')
+                ) r WHERE rn <= 100
+              ),
+              deleted AS (
+                DELETE FROM jobs
+                WHERE status IN ('completed','failed','cancelled')
+                  AND id NOT IN (SELECT id FROM keep)
+                RETURNING status, file_path
+              )
+              SELECT file_path FROM deleted
+              WHERE status IN ('failed','cancelled') AND file_path IS NOT NULL;
+            " > /tmp/paths
+            while IFS= read -r p; do
+              case "$$p" in
+                /downloads/*) [ -f "$$p" ] && rm -f "$$p" && echo "[db_cleanup] rm partial: $$p" ;;
+              esac
+            done < /tmp/paths
+            rm -f /tmp/paths
           done
     networks:
       - video_network

@@ -464,22 +464,23 @@ The system deploys **2 independent download workers** by default to maximize thr
 
 Each worker container processes **one video at a time** (`MAX_CONCURRENT_DOWNLOADS` was removed in v1.8.0; concurrency now comes from running multiple worker services). Within a video, segment downloads parallelise via `MAX_DOWNLOAD_WORKERS` threads (default 20).
 
-**Default 2-worker setup:**
-- Parallel videos: **2** (one per worker container)
+**Default 3-worker setup:**
+- Parallel videos: **3** (one per worker container)
 - Per-video segment threads: 20
-- Recommended for NAS with 4+ CPU cores and 4 GB+ RAM
+- Recommended for NAS with 6+ CPU cores and 6 GB+ RAM
 
 ### 8.4 Scaling Workers
 
-Both compose templates use the unified image; copy the `worker2` block into `worker3`/`worker4`/etc. (with matching `container_name: video_worker_3` and identical env). Or for non-Synology, `docker compose up -d --scale worker=5`.
+Both compose templates use the unified image; copy the `worker3` block into `worker4`/`worker5`/etc. (with matching `container_name: video_worker_4` and identical env). Or for non-Synology, `docker compose up -d --scale worker=5`.
 
 **Scaling guidelines:**
 
 | NAS specs | Recommended workers | Parallel videos |
 |---|---|---|
 | 2 cores, 2 GB RAM | 1 | 1 |
-| 4 cores, 4 GB RAM | 2 (default) | 2 |
-| 8+ cores, 8 GB+ RAM | 3–4 | 3–4 |
+| 4 cores, 4 GB RAM | 2 | 2 |
+| 6+ cores, 6 GB+ RAM | 3 (default) | 3 |
+| 8+ cores, 8 GB+ RAM | 4+ | 4+ |
 
 ---
 
@@ -501,7 +502,7 @@ Rough throughput on a 4-core / 4 GB Synology DS920+ class device: 1080p HLS vide
 
 What's available out of the box:
 
-- **stdout/stderr logs** from each container — `docker compose logs -f api` / `worker` / `worker2`. Log level controlled by `LOG_LEVEL` env (default `INFO`). The format is plain `%(asctime)s - %(name)s - %(levelname)s - %(message)s` (not structured JSON).
+- **stdout/stderr logs** from each container — `docker compose logs -f api` / `worker` / `worker2` / `worker3`. Log level controlled by `LOG_LEVEL` env (default `INFO`). The format is plain `%(asctime)s - %(name)s - %(levelname)s - %(message)s` (not structured JSON).
 - **Health endpoint** `GET /api/health` — checks DB and Redis connectivity. Used by Docker `HEALTHCHECK` (which sends the API key via Authorization header).
 - **System status** `GET /api/status` — returns `{active_downloads, queue_length, total_jobs}`.
 - **Job-level state** in PostgreSQL `jobs` table — every status transition is persisted (`pending` → `downloading` → `completed`/`failed`/`cancelled`).
@@ -538,6 +539,7 @@ Internet
 │ │ │   └─→ Port 52052              │ │
 │ │ ├─→ worker   (ROLE=worker)      │ │
 │ │ ├─→ worker2  (ROLE=worker)      │ │
+│ │ ├─→ worker3  (ROLE=worker)      │ │
 │ │ ├─→ db       (PostgreSQL 15)    │ │
 │ │ ├─→ redis    (Redis 7)          │ │
 │ │ └─→ db_cleanup                  │ │
