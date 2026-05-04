@@ -1130,15 +1130,28 @@ class DownloadWorker:
                 session=shared_session,
             )
             
+            # HLS callback fires per-segment (can be hundreds per video).
+            # Cancellation is checked every call for fast reaction; the DB write
+            # is throttled to once every 2s, with the final segment always reported.
+            check_interval_sec = 2.0
+            progress_state = {"next_check_time": time.monotonic() + check_interval_sec,
+                              "last_reported_progress": -1}
+
             def progress_callback(completed, total):
-                # Check for cancellation FIRST (before updating status)
                 if self.is_job_cancelled(job_id):
                     logger.info(f"Job {job_id} was cancelled during segment download, aborting")
                     raise Exception("Job cancelled by user")
-                
+
                 # Map download progress to 5-85%
                 download_progress = int(5 + (completed / total) * 80)
-                self.update_job_status(job_id, "downloading", progress=download_progress)
+                now = time.monotonic()
+                is_final = (completed == total)
+                should_write = (download_progress != progress_state["last_reported_progress"]
+                                and (now >= progress_state["next_check_time"] or is_final))
+                if should_write:
+                    self.update_job_status(job_id, "downloading", progress=download_progress)
+                    progress_state["last_reported_progress"] = download_progress
+                    progress_state["next_check_time"] = now + check_interval_sec
                 
                 # Check if too many segments failed during download
                 failed_count = len(downloader.failed_segments)
