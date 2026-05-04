@@ -67,9 +67,27 @@ seg-2.ts
 
 ### 1.3 ffmpeg 兩種接段法
 
-我們的 worker 下完 1216 段之後，要把它們合併成一個 mp4 檔。ffmpeg 提供兩條主要路徑：
+我們的 worker 下完 1216 段之後，要把它們合併成一個 mp4 檔。
 
-**路徑 1：concat demuxer**（v2.3.6 之前用的）
+#### 先補：demuxer / muxer / container 是什麼
+
+影片檔可以拆成兩個概念：
+
+- **container（容器）**：檔案本身的封裝格式。`.ts`、`.mp4`、`.mkv` 都是 container。同一支影片可以裝在不同的 container 裡（就像同一份 word 文件可以存成 .docx 或 .pdf）
+- **stream（流）**：container 裡面真正的影音資料——一系列已經編好碼的 packet（壓縮過的影格、音訊樣本）
+
+對應的兩個元件：
+
+- **demuxer**：「拆容器」。讀一個 container 檔，吐出裡面的 packet 序列（每個 packet 帶有時間標記 PTS）
+- **muxer**：「裝容器」。收 packet 序列，包成另一種 container 寫出去
+
+我們要做的事叫 **transmuxing**——拆 1216 個 `.ts` container（用 mpegts demuxer）、把所有 packet 包進一個 mp4 container（用 mp4 muxer）。**完全不重新編碼影像或音訊**——只動 container 那一層。所以快、也不損失畫質。
+
+ffmpeg 提供兩條 transmuxing 路徑：
+
+---
+
+#### 路徑 1：concat demuxer（v2.3.6 之前用的——壞掉的那條）
 
 ```
 ffmpeg -f concat -safe 0 -i list.txt -c copy out.mp4
@@ -84,46 +102,137 @@ file 'seg-2.ts'
 ...
 ```
 
-ffmpeg 把每個檔當成**獨立的輸入流**處理。它會：
+`-f concat` 啟動一個叫 **concat demuxer** 的特殊 demuxer。它的工作是「把多個檔的內容串起來、假裝是一個 stream 給後面的 muxer」。流程：
 
-1. 一次打開 seg-0.ts，讀完 packet
-2. 打開 seg-1.ts。**因為每段內部時間都從 0 開始**，ffmpeg 必須**自己算 offset**——把 seg-1 的 PTS 加上 seg-0 的長度，把 seg-2 的 PTS 加上 seg-0+seg-1 的長度，依此類推
-3. 算 offset 時若沒有外部給的「這段預期長度」，就靠 input 自己 reported 的 timestamp 推
-4. 拼接後寫進 out.mp4
+1. 讀 list.txt，知道有 1216 個檔要處理
+2. 對第一個檔（seg-0.ts），內部呼叫 mpegts demuxer 拆它，拿到 packet 序列
+3. 對第二個檔（seg-1.ts），同樣拆，**但這時候有個問題要處理**——
+4. 把所有 packet 餵給 mp4 muxer 寫成 out.mp4
 
-**問題在 step 3**。當 input 是 PTS 從 0 開始的 .ts 段、而 list.txt 裡也沒寫 `duration X.XXX` directive（我們沒寫——也沒人記得寫）時，ffmpeg 推算 offset 用的是 input 內部的 last-PTS，配上一些 heuristic。在某些 stream 上這個 heuristic 算錯，產生 offset 重疊（segment N+1 的開始時間 < segment N 的結束時間）→ muxer 會丟掉「時間倒退」的 packet → output 的 duration 短於預期。
+**問題在 step 3**。看具體例子。假設每段 6 秒，每段內部 packet 的 PTS（單位秒）是：
 
-**`-c copy` 不會降低風險**——不重新編碼只是省 CPU，timestamp 計算邏輯一樣。
+```
+seg-0.ts 內部:   PTS = 0.0   1.0   2.0   3.0   4.0   5.0    (一段約 6 秒)
+seg-1.ts 內部:   PTS = 0.0   1.0   2.0   3.0   4.0   5.0    ← 也是從 0 開始
+seg-2.ts 內部:   PTS = 0.0   1.0   2.0   3.0   4.0   5.0    ← 也是從 0 開始
+```
 
-具體在這次的 case 上，丟了大約 57% 的 packet。每段個別測都是 6.07 秒（用 `ffprobe seg-N.ts` 驗過五個 sample，全對），merge 完只有 3158 秒——表示問題完全發生在 ffmpeg 的接段邏輯，不在 segment 本身。
+每段 PTS 都從 0 開始，這在 §1.2 講過——HLS spec 允許。但合併後變成一支 18 秒的影片，就需要把後段的 PTS 「往後挪」：
 
-**路徑 2：byte-concat**（v2.3.6 改用的）
+```
+合併後期望 PTS:  0  1  2  3  4  5  | 6  7  8  9  10 11 | 12 13 14 15 16 17
+                ↑ seg-0 不動         ↑ seg-1 +6           ↑ seg-2 +12
+```
 
-回頭利用 §1.2 講的那個性質：**MPEG-TS 可以直接 byte-wise 拼接**。
+那個 `+6` / `+12` 就是 **offset**。concat demuxer 的工作是算這些 offset。
+
+**怎麼算？**理想做法是 list.txt 裡寫 `duration` directive 直接告訴它每段多長：
+
+```
+file 'seg-0.ts'
+duration 6.006
+file 'seg-1.ts'
+duration 6.006
+```
+
+但**我們的舊 code 沒寫**——只列檔名，沒寫長度。這時 concat demuxer 就靠 input 自己 reported 的「最後一個 packet PTS」當作該段的長度，配上一些內建的 heuristic 算 offset。
+
+在這次踩到的 stream 上，這個 heuristic **算錯了**——某些段的 offset 算得比實際短，造成 PTS 範圍**重疊**：
+
+```
+heuristic 算錯的結果（seg-1 的 offset 變成 3 而不是 6）:
+合併後實際 PTS:  0  1  2  3  4  5  | 3  4  5  6  7  8  | 6  7  8  9 ...
+                                     ↑ 倒退了！
+```
+
+接下來輪到 mp4 muxer 收 packet。**mp4 container 規定 packet 必須照 PTS 嚴格遞增寫入**——這是 mp4 的 spec 要求，目的是讓播放器能 random seek。muxer 看到「上一個 packet PTS=5、下一個 packet PTS=3」這種**時間倒退**的情況，處理方式是 **直接丟掉那個 packet**（不會 throw error，也不會 log warning，就是當沒看到）。
+
+→ 結果：每組 PTS 重疊範圍的 packet 全部被靜默丟棄。output mp4 比 input 加總短。
+
+具體這次：丟掉約 57% packet，7299 秒的素材剩 3158 秒。每段個別跑 `ffprobe seg-N.ts` 驗過五個 sample，duration 都是 6.07 秒沒問題——錯不在 segment 本身，**錯在 concat demuxer 的 offset arithmetic**。
+
+**`-c copy` 也救不了**——`-c copy` 只是「不重編碼，packet 內容直接複製」，**timestamp 處理走的是同一條 code path**。offset 算錯一樣 muxer 一樣丟。
+
+---
+
+#### 路徑 2：byte-concat（v2.3.6 改用的——對的那條）
+
+關鍵 framing 一句話：
+
+> **路徑 1**：ffmpeg 看到多個檔，自己負責拼接
+> **路徑 2**：我們把 bytes 先拼好，ffmpeg 只看到一條 stream
+
+回頭利用 §1.2 那個關鍵性質——**MPEG-TS 可以直接 byte-wise 拼接、結果還是合法的 MPEG-TS**：
 
 ```
 ffmpeg -f mpegts -i pipe:0 -c copy out.mp4
 ```
 
-`pipe:0` = stdin。我們在 Python 裡：
+`pipe:0` = stdin。我們在 Python 端：
 
 ```python
-process = subprocess.Popen(cmd, stdin=subprocess.PIPE, ...)
-for seg_path in segment_files:
+import subprocess, shutil
+
+process = subprocess.Popen(
+    ['ffmpeg', '-f', 'mpegts', '-i', 'pipe:0', '-c', 'copy', 'out.mp4'],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+
+for seg_path in segment_files:        # 1216 個檔
     with open(seg_path, 'rb') as f:
-        shutil.copyfileobj(f, process.stdin, length=1024*1024)
-process.stdin.close()
+        shutil.copyfileobj(f, process.stdin, length=1024*1024)  # 一次 1 MB
+
+process.stdin.close()                  # 通知 ffmpeg：沒了，收尾吧
+process.wait()
 ```
 
-`shutil.copyfileobj` 一次 1 MB 把每段內容寫進 ffmpeg 的 stdin。ffmpeg 看到的是**一條連續的 stream**——它根本不知道我們是用 1216 個檔串出來的，也不需要算什麼 offset，從頭照單全收。
+`shutil.copyfileobj` 是 streaming 的——不會把 1216 個檔全 load 進記憶體再寫，而是一次讀 1 MB、寫 1 MB、讀下一個 1 MB。整支 2 GB 影片從頭到尾不會佔超過 1 MB 記憶體。
 
-換句話說：**timestamp 對齊的責任從 ffmpeg 移交給「source encoder 自己當初切片時就要保持時間軸連續」**。對 HLS 來說這是合理假設——切片的目的是讓播放器逐段播放，原始時間軸本來就是設計好的。
+從 ffmpeg 角度看：
 
-實作細節有幾個小坑：
+1. 啟動 mpegts demuxer（`-f mpegts` 強制指定，因為從 stdin 來的 stream 沒副檔名給它判斷）
+2. demuxer 從 stdin 不斷讀 188 byte packet
+3. 因為 source encoder 切片時 PTS 是設計成可以無縫播放的（連續），demuxer 看到的 PTS 自然是 `0 → 6 → 12 → 18 → ...`，**單調遞增**
+4. **沒有任何 offset 計算**——ffmpeg 不知道（也不需要知道）這 stream 是 1216 個檔串出來的
+5. packet 餵進 mp4 muxer，muxer 看到 monotonic PTS，全部正常寫入
 
-- ffmpeg 把進度資訊寫到 stderr，如果不主動 drain，pipe 滿了就 deadlock。所以另開兩條 thread 抽 stderr / stdout
-- 有 15 分鐘 timeout 兜底
-- 萬一新的 byte-concat 路徑失敗，fallback 還是會走 concat demuxer + transcode（`-c:v libx264 -c:a aac`）。transcode 會解碼後重新編碼，PTS 會從新編出來，原本 demuxer 的 bug 不會發生在 transcode 路徑上
+**為什麼這次安全**：concat demuxer 出包是因為要拆多個 input、自己算跨檔 offset。byte-concat 把「時間軸對齊」這個責任從 ffmpeg 推給「source encoder 切片時就要保持時間軸連續」——對 HLS 來說這是合理假設（HLS 切片的目的就是讓播放器逐段無縫播放，原始時間軸本來就應該是連續的）。
+
+#### 路徑 2 的實作小坑
+
+**坑 1：stderr deadlock**
+
+ffmpeg 不只寫 mp4 檔，還會把進度資訊（每秒一兩行 `frame=... time=...`）寫到 stderr。OS 給 subprocess 的 stderr pipe 通常只有 **64 KB buffer**（Linux 預設）。如果我們不主動讀 stderr：
+
+```
+ffmpeg 寫 stderr → buffer 累積 → 超過 64 KB → ffmpeg 寫 stderr 卡住
+                                            → ffmpeg 同時也不繼續讀 stdin
+                                            → 我們寫 stdin 卡住
+                                            → DEADLOCK
+```
+
+對長影片必中（merge 1216 段過程中 ffmpeg 寫上千行進度）。解決方法：另開兩條 background thread 持續從 `process.stderr` 跟 `process.stdout` 讀資料丟掉（或 log）：
+
+```python
+import threading
+
+def drain(stream):
+    for line in iter(stream.readline, b''):
+        pass  # 讀掉就好，避免 buffer 滿
+
+threading.Thread(target=drain, args=(process.stderr,), daemon=True).start()
+threading.Thread(target=drain, args=(process.stdout,), daemon=True).start()
+```
+
+**坑 2：超時兜底**
+
+整體用 `process.wait(timeout=900)` 包，最多等 15 分鐘。萬一 ffmpeg 因為某個 corner case 卡死（過去就遇過 ffmpeg bug 在某個 packet 上 infinite loop），不至於拖死 worker。
+
+**坑 3：fallback 不變**
+
+byte-concat 主路徑萬一失敗，會自動 fallback 到 `merge_with_re_encode`——那條走 `-c:v libx264 -c:a aac` **重新編碼**。重新編碼的過程中 PTS 完全重生（decoder 解出 raw frame、encoder 重新編入新的 PTS），所以 concat demuxer 的 offset bug **不會在 transcode 路徑發生**。換句話說：byte-concat 是主路徑修法，舊的 concat demuxer + transcode 是「最終安全網」，兩條都壞才會真的失敗。
 
 ### 1.4 為什麼這個 bug 很容易 escape
 
