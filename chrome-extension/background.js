@@ -859,59 +859,159 @@ function _newHistoryId() {
   return `av_${Date.now()}_${Math.floor(Math.random() * 1e6).toString(36)}`;
 }
 
-// Open the user's URL in a background tab and start a timeout. The
-// detection pipeline calls maybeFireAvTaskAutoSend() when a manifest
-// shows up; that path handles the actual Send. Also writes a `pending`
-// row to avTaskHistory so the options table can show progress.
+// Two-phase AV-task pipeline:
+//   Phase 1 — missav template (`hidden_mode.url_template`, default
+//     `https://missav.ws/dm18/{code}`) in an INACTIVE background tab. Fully
+//     automatic: the site's JS produces a fresh signed m3u8 under a real
+//     Chrome browsing context and the existing detection pipeline
+//     (registerDetectedUrl → maybeFireAvTaskAutoSend) ships it to NAS
+//     without bothering the user. This is the v2.2.0 behaviour — most
+//     codes resolve here.
+//   Phase 2 — jav101 search page in an ACTIVE (foreground) tab. Only
+//     reached if phase 1 doesn't produce a manifest inside
+//     AV_TASK_TIMEOUT_MS. The user manually clicks the download button and
+//     solves the reCAPTCHA; the unblocked request to
+//     dl*.jav101.com/<file>.mp4 is picked up by the same pipeline and
+//     shipped as a single direct mp4 (no HLS, no segment auth). Foreground
+//     because captcha solve requires user interaction.
+// The history row stays `pending` across the transition; its `url` field
+// updates from missav → jav101 so the table reflects which site is
+// currently being attempted.
 async function handleAvTaskFetch(request) {
-  const url = request && request.url;
+  const missavUrl = request && request.url;
   const code = request && request.code;
-  if (!url || !code) {
+  if (!missavUrl || !code) {
     return { error: 'avTaskFetch missing url/code' };
   }
   const historyId = _newHistoryId();
   await avHistoryAppend({
     id: historyId,
     code,
-    url,
+    url: missavUrl,
     status: 'pending',
     submittedAt: Date.now(),
   });
 
   try {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const tab = await chrome.tabs.create({ url: missavUrl, active: false });
     if (!tab || tab.id == null) {
-      await avHistoryUpdate(historyId, { status: 'failed', message: 'failed to open tab' });
-      broadcastAvTaskUpdate(code, 'failed', 'failed to open tab');
-      return { error: 'failed to open tab' };
+      return launchAvTaskJav101Fallback(historyId, code);
     }
-    // Track this tab so registerDetectedUrl knows to auto-send the first
-    // manifest it captures here.
-    const handle = setTimeout(() => {
-      const pending = avPendingTabs[tab.id];
-      if (!pending || pending.fired) return;
-      console.warn('AV task timed out without detecting a manifest:', code, url);
-      const msg = 'Timed out — no manifest detected. Try opening the page manually.';
-      avHistoryUpdate(historyId, { status: 'failed', message: msg });
-      broadcastAvTaskUpdate(code, 'failed', msg);
-      cleanupAvTask(tab.id);
-    }, AV_TASK_TIMEOUT_MS);
-
-    avPendingTabs[tab.id] = {
+    setupAvPendingTab(tab.id, {
       code,
-      requestedAt: Date.now(),
-      fired: false,
-      timeoutHandle: handle,
       historyId,
-    };
+      phase: 'missav',
+      onTimeout: () => {
+        console.warn('AV task missav phase timed out, falling back to jav101:', code);
+        // Remove the helper tab BEFORE opening jav101. cleanupAvTask (called
+        // inside setupAvPendingTab's timeout wrapper) already deleted the
+        // pending entry, so chrome.tabs.onRemoved sees nothing and won't
+        // mark the row as failed mid-transition.
+        try { chrome.tabs.remove(tab.id, () => void chrome.runtime.lastError); } catch (_) {}
+        launchAvTaskJav101Fallback(historyId, code);
+      },
+    });
     return { success: true, tabId: tab.id, historyId };
   } catch (e) {
-    const msg = (e && e.message) || 'tabs.create threw';
+    return launchAvTaskJav101Fallback(historyId, code);
+  }
+}
+
+async function launchAvTaskJav101Fallback(historyId, code) {
+  const jav101Url = `https://jav101.com/search/${encodeURIComponent(code)}`;
+  await avHistoryUpdate(historyId, { url: jav101Url });
+  try {
+    // Active tab — the user needs to see the page to solve the reCAPTCHA
+    // and click the download button. If they're elsewhere, the tab pops to
+    // the front to flag that the task needs their attention.
+    const tab = await chrome.tabs.create({ url: jav101Url, active: true });
+    if (!tab || tab.id == null) {
+      const msg = 'failed to open fallback tab';
+      await avHistoryUpdate(historyId, { status: 'failed', message: msg });
+      broadcastAvTaskUpdate(code, 'failed', msg);
+      return { error: msg };
+    }
+    setupAvPendingTab(tab.id, {
+      code,
+      historyId,
+      phase: 'jav101',
+      onTimeout: () => {
+        console.warn('AV task jav101 fallback timed out:', code, jav101Url);
+        const msg = 'Timed out on missav + jav101 — no manifest detected.';
+        avHistoryUpdate(historyId, { status: 'failed', message: msg });
+        broadcastAvTaskUpdate(code, 'failed', msg);
+      },
+    });
+    return { success: true, tabId: tab.id, historyId };
+  } catch (e) {
+    const msg = (e && e.message) || 'tabs.create threw on jav101 fallback';
     await avHistoryUpdate(historyId, { status: 'failed', message: msg });
     broadcastAvTaskUpdate(code, 'failed', msg);
     return { error: msg };
   }
 }
+
+function setupAvPendingTab(tabId, { code, historyId, phase, onTimeout }) {
+  const handle = setTimeout(() => {
+    const pending = avPendingTabs[tabId];
+    if (!pending || pending.fired) return;
+    cleanupAvTask(tabId);
+    onTimeout();
+  }, AV_TASK_TIMEOUT_MS);
+  avPendingTabs[tabId] = {
+    code,
+    requestedAt: Date.now(),
+    fired: false,
+    timeoutHandle: handle,
+    historyId,
+    phase,
+  };
+}
+
+// jav101 play pages fire several .mp4 requests on load (preview clips,
+// thumbnails, ads). Only the post-captcha SIGNED download lives on a
+// dl*.jav101.com subdomain — restrict the auto-send to those so we don't
+// accidentally ship a 30-second preview to the NAS.
+function isJav101DownloadUrl(url) {
+  try {
+    const u = new URL(url);
+    // .endsWith('.jav101.com') matches dl3.jav101.com etc. but not the
+    // apex jav101.com itself, which is what serves the page chrome.
+    return u.hostname.endsWith('.jav101.com');
+  } catch (_) {
+    return false;
+  }
+}
+
+// Fast-fail the missav phase when it's clearly never going to produce a
+// manifest: HTTP 4xx/5xx on the main_frame response (e.g.
+// https://missav.ws/dm18/orecz-214 returns 404 because the code path
+// doesn't exist on missav). Without this, the user waits the full 60s
+// timeout for a page that's already declared "not found" in <100ms.
+// Filter to type:'main_frame' so that ad subframes / API errors don't
+// trigger spurious failovers. jav101 phase isn't included — its search
+// page returns 200 with empty results when a code is unknown, so HTTP
+// status alone can't classify success/failure there.
+chrome.webRequest.onHeadersReceived.addListener(
+  function(details) {
+    if (details.type !== 'main_frame') return;
+    const pending = avPendingTabs[details.tabId];
+    if (!pending || pending.fired) return;
+    if (pending.phase !== 'missav') return;
+    const status = details.statusCode || 0;
+    if (status < 400) return;  // 2xx success or 3xx redirect — let it ride
+
+    console.warn(
+      'AV task missav phase got HTTP', status,
+      '— failing over to jav101 immediately:', pending.code
+    );
+    const { historyId, code } = pending;
+    cleanupAvTask(details.tabId);
+    try { chrome.tabs.remove(details.tabId, () => void chrome.runtime.lastError); } catch (_) {}
+    launchAvTaskJav101Fallback(historyId, code);
+  },
+  { urls: ['<all_urls>'], types: ['main_frame'] }
+);
 
 // Called from registerDetectedUrl when a NEW (not duplicate) manifest is
 // captured for a tab. If that tab is one we opened for an AV task, fire
@@ -923,6 +1023,13 @@ function maybeFireAvTaskAutoSend(tabId, manifestUrl) {
   // Only trigger on URLs we'd accept from a normal Send — avoids firing on
   // every byte-range probe or unrelated subresource.
   if (!isCandidateVideoUrl(manifestUrl) && !getDetectedFormat(manifestUrl)) return;
+
+  // Phase-specific filter: jav101 pages emit preview .mp4s on page load
+  // (and possibly ad mp4s); we only want the signed dl*.jav101.com download
+  // that fires after the user solves the captcha. Anything else on the
+  // jav101 phase is ignored — the timeout will fall back to missav if the
+  // user never reaches the download.
+  if (pending.phase === 'jav101' && !isJav101DownloadUrl(manifestUrl)) return;
 
   pending.fired = true;
   if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
@@ -1513,10 +1620,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'avTaskFetch') {
-    // Hidden-mode quick-input: open the user's URL in a background tab so
-    // the site's JS reissues a fresh m3u8 (signed token + cookies) under
-    // a real Chrome browsing context. The existing detection pipeline
-    // (registerDetectedUrl → maybeFireAvTaskAutoSend) takes it from there.
+    // Hidden-mode quick-input: try the user's missav template first
+    // (background tab, fully automatic — most codes resolve here), then
+    // fall back to jav101 (foreground tab — user solves reCAPTCHA, signed
+    // dl*.jav101.com mp4 fires) on timeout. Both phases feed the same
+    // registerDetectedUrl → maybeFireAvTaskAutoSend pipeline.
     handleAvTaskFetch(request)
       .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ error: err && err.message }));

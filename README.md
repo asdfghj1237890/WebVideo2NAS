@@ -344,6 +344,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.3.0] - 2026-05-04
+
+#### Added
+- **AV-task falls back to jav101 when missav doesn't produce a manifest.** New two-phase pipeline in `handleAvTaskFetch`: **phase 1** is the original v2.2.0 behaviour — opens the user's `hidden_mode.url_template` (default `https://missav.ws/dm18/{code}`) in a **background tab**, fully automatic, the site's JS produces a signed m3u8 and the existing detection pipeline ships it to NAS without bothering the user. **Phase 2** only kicks in if missav times out (no manifest in 60s): opens `https://jav101.com/search/{code}` in an **active foreground tab** so the user can click the download button and solve the reCAPTCHA — the resulting request to `dl*.jav101.com/<file>.mp4?md5=…&expires=…` is picked up by the same `maybeFireAvTaskAutoSend → sendToNAS` path and shipped as a single direct mp4 (no HLS, no segment auth, no cookies). The history row stays `pending` across the transition; its `url` field updates from missav → jav101 so the table reflects which site is currently being attempted.
+
+#### Changed
+- **`maybeFireAvTaskAutoSend` gained a phase-aware URL filter**: during the jav101 phase, only URLs whose hostname is a subdomain of `jav101.com` (i.e. `dl3.jav101.com` etc., not the apex that serves the page chrome) qualify for auto-send. Without this filter the play page's preview-clip mp4s would race the real download and ship a 30-second teaser to the NAS. The missav phase keeps the original "first eligible URL wins" behaviour.
+- **Missav phase fast-fails on HTTP 4xx/5xx** instead of waiting the full 60s timeout. New `chrome.webRequest.onHeadersReceived` listener watches the missav helper tab's `main_frame` response — if the status code is ≥400 (e.g. `missav.ws/dm18/orecz-214` returns 404 because the path doesn't exist), the tab is closed immediately and the jav101 fallback opens within milliseconds rather than after a minute of dead air. Filtered to `main_frame` only so that ad subframes and API errors don't trigger spurious failovers. The jav101 phase isn't covered — its search page returns 200 with empty results when a code is unknown, so HTTP status can't classify success/failure there.
+
+#### Notes
+- **Order is "automatic-first, manual-fallback"** by design: most codes resolve on missav inside the first ~5–15s without the user noticing anything happened, and jav101 only intrudes (active tab popping to the front) for the codes that missav genuinely can't deliver. Worst-case end-to-end timeout is 120s (60s missav + 60s jav101) when missav stalls without erroring, but a missav 404 now flips to jav101 in under a second.
+- **Phase 2 is not "hidden"** — the jav101 tab opens in foreground because reCAPTCHA solving requires user interaction (Anthropic safety policy forbids auto-solving CAPTCHAs, and jav101 doesn't expose the signed download without it). If the user isn't around to solve the captcha, the 60s timer expires and the row is marked `failed`.
+- jav101's URL is hardcoded — no new option added. The existing `hidden_mode.url_template` setting still controls the missav phase, so swapping the primary site (or pointing it at a 404 to force jav101 every time) remains a one-line change in `hidden_mode.toml`.
+- The `dl*.jav101.com` mp4 carries an `expires=<unix-timestamp>` query param — a few minutes in the future when issued. The pipeline forwards the URL to NAS within ~4s of capture (existing `AV_TASK_AUTOCLOSE_DELAY_MS` window), well inside the validity. If the NAS queue is backed up enough that the URL expires before the worker dequeues, the existing v2.2.3 anti-hotlink Re-fetch path takes over (re-open jav101 tab, solve captcha again, resend).
+
 ### [2.2.3] - 2026-05-04
 
 #### Changed
