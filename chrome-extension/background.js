@@ -28,6 +28,14 @@ let videoMetaByUrl = {};
 let videoMetaProbing = new Set();
 const VIDEO_META_MAX_ENTRIES = 500;
 
+// Hidden-mode AV-task pipeline: tabs we opened on the user's behalf so the
+// site's own JS can produce a fresh m3u8. Keyed by tabId; expires after the
+// timeout regardless of outcome so the user gets feedback.
+// Value: { code, requestedAt, fired: bool, timeoutHandle }
+let avPendingTabs = {};
+const AV_TASK_TIMEOUT_MS = 60_000; // 60s for the page to load + emit a manifest
+const AV_TASK_AUTOCLOSE_DELAY_MS = 4_000; // give the worker a chance to grab fresh cookies
+
 // User settings
 let userSettings = {
   autoDetect: true,
@@ -499,6 +507,11 @@ function registerDetectedUrl(details, extra) {
       currentTabUrlKeys[details.tabId].add(details.url);
       currentTabUrls[details.tabId].push(urlInfo);
       attachTabTitle(urlInfo, details.tabId);
+      // If this tab was opened by the hidden-mode AV-task pipeline, this
+      // is the fresh manifest we were waiting for — auto-send it once
+      // (only the FIRST eligible URL, to avoid firing on every quality
+      // variant the player probes).
+      maybeFireAvTaskAutoSend(details.tabId, details.url);
     } else {
       const list = currentTabUrls[details.tabId];
       const existing = list.find(item => item && item.url === details.url);
@@ -792,6 +805,114 @@ function formatApiErrorDetail(errorJson, httpStatus) {
   }
   return `HTTP ${httpStatus || 'error'} from NAS`;
 }
+
+// ---------- Hidden-mode AV-task pipeline ----------
+
+// Open the user's URL in a background tab and start a timeout. The
+// detection pipeline calls maybeFireAvTaskAutoSend() when a manifest
+// shows up; that path handles the actual Send.
+async function handleAvTaskFetch(request) {
+  const url = request && request.url;
+  const code = request && request.code;
+  if (!url || !code) {
+    return { error: 'avTaskFetch missing url/code' };
+  }
+  try {
+    const tab = await chrome.tabs.create({ url, active: false });
+    if (!tab || tab.id == null) {
+      return { error: 'failed to open tab' };
+    }
+    // Track this tab so registerDetectedUrl knows to auto-send the first
+    // manifest it captures here.
+    const handle = setTimeout(() => {
+      const pending = avPendingTabs[tab.id];
+      if (!pending || pending.fired) return;
+      console.warn('AV task timed out without detecting a manifest:', code, url);
+      broadcastAvTaskUpdate(code, 'failed', 'Timed out — no manifest detected. Try opening the page manually.');
+      cleanupAvTask(tab.id);
+    }, AV_TASK_TIMEOUT_MS);
+
+    avPendingTabs[tab.id] = {
+      code,
+      requestedAt: Date.now(),
+      fired: false,
+      timeoutHandle: handle,
+    };
+    return { success: true, tabId: tab.id };
+  } catch (e) {
+    return { error: (e && e.message) || 'tabs.create threw' };
+  }
+}
+
+// Called from registerDetectedUrl when a NEW (not duplicate) manifest is
+// captured for a tab. If that tab is one we opened for an AV task, fire
+// sendToNAS for that exact URL — same path the user-clicked Send takes.
+function maybeFireAvTaskAutoSend(tabId, manifestUrl) {
+  const pending = avPendingTabs[tabId];
+  if (!pending || pending.fired) return;
+
+  // Only trigger on URLs we'd accept from a normal Send — avoids firing on
+  // every byte-range probe or unrelated subresource.
+  if (!isCandidateVideoUrl(manifestUrl) && !getDetectedFormat(manifestUrl)) return;
+
+  pending.fired = true;
+  if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
+
+  // The capture pipeline writes capturedHeaders[manifestUrl] just before
+  // emitting registerDetectedUrl, but on some sites the headers race lands
+  // immediately after; sendToNAS()'s findBestCapturedEntry() handles either
+  // ordering, so we can fire right away.
+  const title = getStoredPageTitle(manifestUrl) || `[${pending.code}]`;
+  // pageUrl: the source page the AV task opened. Need to look it up from
+  // the tab's current URL since we don't preserve it on the pending entry
+  // (the JS-driven SPA may have redirected from the original).
+  chrome.tabs.get(tabId, (tab) => {
+    const pageUrl = tab && tab.url ? tab.url : '';
+    sendToNAS(manifestUrl, title, pageUrl)
+      .then(() => {
+        broadcastAvTaskUpdate(pending.code, 'sent');
+        // Auto-close the helper tab a few seconds after Send so any
+        // late header captures (cookies refreshed by player JS) still
+        // land. Best-effort — survive errors silently.
+        setTimeout(() => {
+          try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {}
+          cleanupAvTask(tabId);
+        }, AV_TASK_AUTOCLOSE_DELAY_MS);
+      })
+      .catch((err) => {
+        broadcastAvTaskUpdate(pending.code, 'failed', (err && err.message) || 'sendToNAS failed');
+        cleanupAvTask(tabId);
+      });
+  });
+}
+
+function cleanupAvTask(tabId) {
+  const pending = avPendingTabs[tabId];
+  if (pending && pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
+  delete avPendingTabs[tabId];
+}
+
+// Notify any listening sidepanel about the task's progress. Use sendMessage;
+// missing-listener errors are expected (sidepanel may be closed) and silenced.
+function broadcastAvTaskUpdate(code, status, message) {
+  try {
+    chrome.runtime.sendMessage(
+      { action: 'avTaskUpdate', code, status, message },
+      () => void chrome.runtime.lastError  // silence "no receivers" complaint
+    );
+  } catch (_) { /* ignore */ }
+}
+
+// If the user closes the helper tab manually, clean up our tracking.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (avPendingTabs[tabId]) {
+    const pending = avPendingTabs[tabId];
+    if (!pending.fired) {
+      broadcastAvTaskUpdate(pending.code, 'failed', 'Tab closed before manifest detected.');
+    }
+    cleanupAvTask(tabId);
+  }
+});
 
 // Send URL to NAS
 async function sendToNAS(url, pageTitle, pageUrl) {
@@ -1298,6 +1419,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         console.error('sendToNAS failed:', err);
         sendResponse({ success: false, error: err && err.message });
       });
+    return true;
+  }
+
+  if (request.action === 'avTaskFetch') {
+    // Hidden-mode quick-input: open the user's URL in a background tab so
+    // the site's JS reissues a fresh m3u8 (signed token + cookies) under
+    // a real Chrome browsing context. The existing detection pipeline
+    // (registerDetectedUrl → maybeFireAvTaskAutoSend) takes it from there.
+    handleAvTaskFetch(request)
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ error: err && err.message }));
     return true;
   }
 

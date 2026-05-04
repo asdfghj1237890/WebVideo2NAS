@@ -77,6 +77,24 @@
         <div id="qualityChips" class="chips"></div>
       </div>
 
+      <!-- Hidden-mode AV-task block: only visible when hiddenMode is on in
+           options. Lets the user enter a video code (e.g. nttr-015) and fire
+           a background tab that loads {url_template/code}; the existing
+           detection + auto-send pipeline picks up the m3u8 from there. -->
+      <div id="avTaskBlock" class="av-task-block" hidden>
+        <div class="section-label">
+          <span id="avTaskTitle">AV task</span>
+        </div>
+        <div class="av-input-row">
+          <input id="avCodeInput" class="av-input" type="text"
+                 placeholder="nttr-015" autocomplete="off" spellcheck="false">
+          <button id="avSubmitBtn" class="av-submit-btn" type="button">
+            <span id="avSubmitLabel">Fetch</span>
+          </button>
+        </div>
+        <div id="avTasksList" class="av-tasks"></div>
+      </div>
+
       <!-- Body: two independently scrolling panes -->
       <div class="body">
         <div class="pane detected-pane wv2n-scroll">

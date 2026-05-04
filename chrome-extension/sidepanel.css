@@ -776,6 +776,65 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .suspect-refetch-btn:hover { filter: brightness(1.08); }
 .suspect-refetch-btn:active { transform: scale(0.96); }
 
+/* ==== Hidden-mode AV task block ==== */
+/* Lives between the toolbar and the detected/recent panes; only renders
+   when chrome.storage.sync.hiddenMode === true. Visually quieter than the
+   main panes so it doesn't dominate the panel. */
+.av-task-block {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--glass-border);
+  background: var(--bg1);
+  flex-shrink: 0;
+}
+.av-task-block .section-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-mid);
+  margin-bottom: 6px;
+}
+.av-input-row {
+  display: flex; gap: 6px; align-items: center;
+}
+.av-input {
+  flex: 1; min-width: 0;
+  padding: 6px 8px;
+  background: var(--bg0);
+  border: 1px solid var(--glass-border);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit; font-family: var(--mono); font-size: 12px;
+  transition: border-color 140ms;
+}
+.av-input:focus { outline: none; border-color: var(--accent); }
+.av-submit-btn {
+  flex: 0 0 auto;
+  padding: 6px 12px; border-radius: 5px;
+  background: var(--accent); color: var(--bg0);
+  border: none; cursor: pointer;
+  font: inherit; font-size: 12px; font-weight: 600;
+  transition: filter 140ms, transform 140ms;
+}
+.av-submit-btn:hover { filter: brightness(1.08); }
+.av-submit-btn:active { transform: scale(0.96); }
+.av-submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.av-tasks { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.av-task-row {
+  display: flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 11px;
+  padding: 3px 6px; border-radius: 4px;
+  background: var(--bg0);
+}
+.av-task-code { color: var(--text); font-weight: 600; flex: 0 0 auto; }
+.av-task-status {
+  flex: 1; text-align: right; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.av-task-row.is-pending .av-task-status { color: var(--info, var(--accent)); }
+.av-task-row.is-sent    .av-task-status { color: var(--accent); }
+.av-task-row.is-failed  .av-task-status { color: var(--err); }
+
 /* ==== Bulk bar ==== */
 .bulk-bar {
   padding: 10px;

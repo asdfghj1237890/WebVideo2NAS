@@ -217,6 +217,8 @@ function localizeStaticText() {
   setText('autoDetectComment', '# ' + (t('options.autoDetect.help') || ''));
   setText('notifComment', '# ' + (t('options.showNotifications.help') || ''));
   setText('langComment', '# ' + (t('options.uiLanguage.help') || ''));
+  setText('hiddenModeComment', '# ' + (t('options.hiddenMode.help') || ''));
+  setText('hiddenModeUrlTemplateComment', '# ' + (t('options.hiddenModeUrlTemplate.help') || ''));
 
   // Profiles
   setText('addProfileText', t('options.profiles.addBtn') || '[profile.new] — save current as profile');
@@ -551,7 +553,16 @@ async function savePreferences() {
   const autoDetect       = getToggle('autoDetect');
   const showNotifications = getToggle('showNotifications');
   const uiLanguage       = ($('uiLanguage').value || '').trim();
-  await chrome.storage.sync.set({ autoDetect, showNotifications, uiLanguage });
+  // Hidden-mode (the AV-task quick-input flow). The toggle gates visibility
+  // of the side-panel input box; the URL template is the per-site pattern
+  // we substitute the user's input code into. Empty template falls back to
+  // the missav default at the read site to avoid storing a placeholder.
+  const hiddenMode               = getToggle('hiddenMode');
+  const hiddenModeUrlTemplate    = ($('hiddenModeUrlTemplate').value || '').trim();
+  await chrome.storage.sync.set({
+    autoDetect, showNotifications, uiLanguage,
+    hiddenMode, hiddenModeUrlTemplate,
+  });
 }
 
 // ---------- Test connection ----------
@@ -685,6 +696,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     'autoDetect', 'showNotifications',
     'uiLanguage', 'uiTheme',
     'nasProfiles', 'activeProfileId',
+    'hiddenMode', 'hiddenModeUrlTemplate',
   ]);
 
   applyTheme(settings.uiTheme || 'dark');
@@ -703,6 +715,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('apiKey').value      = settings.apiKey      || '';
   setToggle('autoDetect',       settings.autoDetect       !== false);
   setToggle('showNotifications', settings.showNotifications !== false);
+  // hiddenMode default OFF (opt-in feature; only useful for the specific
+  // AV-task workflow). url_template default is the missav pattern the user
+  // referenced; saved value wins when present.
+  setToggle('hiddenMode', settings.hiddenMode === true);
+  $('hiddenModeUrlTemplate').value = settings.hiddenModeUrlTemplate || 'https://missav.ws/dm18/{code}';
   const uiLanguage = settings.uiLanguage === 'zh' ? 'zh-TW' : (settings.uiLanguage || '');
   $('uiLanguage').value = uiLanguage;
 
@@ -751,6 +768,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   $('showNotifications').addEventListener('click', async () => {
     setToggle('showNotifications', !getToggle('showNotifications'));
+    await savePreferences();
+  });
+  $('hiddenMode').addEventListener('click', async () => {
+    setToggle('hiddenMode', !getToggle('hiddenMode'));
+    await savePreferences();
+  });
+  $('hiddenModeUrlTemplate').addEventListener('input', () => { /* persisted on blur */ });
+  $('hiddenModeUrlTemplate').addEventListener('blur', async () => {
     await savePreferences();
   });
   $('uiLanguage').addEventListener('change', async () => {

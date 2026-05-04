@@ -66,13 +66,17 @@ function tHtml(key, vars) {
 }
 
 async function loadSettingsFromStorage() {
-  settings = await chrome.storage.sync.get(['nasEndpoint', 'apiKey', 'uiLanguage', 'uiTheme', 'jobSort']);
+  settings = await chrome.storage.sync.get([
+    'nasEndpoint', 'apiKey', 'uiLanguage', 'uiTheme', 'jobSort',
+    'hiddenMode', 'hiddenModeUrlTemplate',
+  ]);
   if (settings.jobSort && JOB_SORT_CYCLE.includes(settings.jobSort)) {
     jobSort = settings.jobSort;
   } else {
     // Migrate stale value (e.g., legacy 'time' mode) → default 'failed' so failed jobs sort first.
     jobSort = 'failed';
   }
+  applyHiddenModeVisibility();
   return settings;
 }
 
@@ -231,6 +235,18 @@ function setupEventListeners() {
   }
   applyJobSortLabel();
 
+  const avSubmitBtn = document.getElementById('avSubmitBtn');
+  const avInput = document.getElementById('avCodeInput');
+  if (avSubmitBtn && avInput) {
+    avSubmitBtn.addEventListener('click', () => submitAvTask(avInput.value));
+    avInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitAvTask(avInput.value);
+      }
+    });
+  }
+
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.status === 'complete') {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -275,6 +291,12 @@ function setupEventListeners() {
       if (needsUiUpdate || needsConnUpdate) {
         checkConnection();
         loadRecentJobs();
+      }
+
+      if (changes.hiddenMode || changes.hiddenModeUrlTemplate) {
+        if (changes.hiddenMode) settings.hiddenMode = changes.hiddenMode.newValue;
+        if (changes.hiddenModeUrlTemplate) settings.hiddenModeUrlTemplate = changes.hiddenModeUrlTemplate.newValue;
+        applyHiddenModeVisibility();
       }
     }
   });
@@ -1288,6 +1310,115 @@ async function cancelJob(jobId) {
     showToast(t('toast.failedToCancel'));
   }
 }
+
+// ---------- Hidden mode (AV-task quick-input) ----------
+// In-memory list of tasks fired this session. Each entry is
+// { code, url, status: 'pending'|'sent'|'failed', message, ts }.
+// Cleared on side-panel reload — the persisted job in the NAS DB is the
+// real source of truth, this list is just per-session feedback.
+const avTasks = [];
+const AV_TASKS_MAX = 8;
+
+function applyHiddenModeVisibility() {
+  const block = document.getElementById('avTaskBlock');
+  if (!block) return;
+  const enabled = !!(settings && settings.hiddenMode);
+  if (enabled) {
+    block.removeAttribute('hidden');
+    const titleEl = document.getElementById('avTaskTitle');
+    const labelEl = document.getElementById('avSubmitLabel');
+    if (titleEl) titleEl.textContent = t('av.title');
+    if (labelEl) labelEl.textContent = t('av.submit');
+    const input = document.getElementById('avCodeInput');
+    if (input) input.placeholder = t('av.placeholder');
+  } else {
+    block.setAttribute('hidden', '');
+  }
+}
+
+function submitAvTask(rawCode) {
+  const code = (rawCode || '').trim();
+  if (!code) return;
+
+  const template = (settings && settings.hiddenModeUrlTemplate) || 'https://missav.ws/dm18/{code}';
+  if (!template.includes('{code}')) {
+    showToast(t('av.toast.invalidTemplate'));
+    return;
+  }
+  // Sanitize the code: only printable URL-safe chars. Strips spaces and
+  // any path-injection attempts like "foo/bar"; the template is supposed
+  // to substitute a single segment.
+  const safeCode = code.replace(/[^A-Za-z0-9._-]/g, '');
+  if (!safeCode) {
+    showToast(t('av.toast.invalidCode'));
+    return;
+  }
+  const url = template.replace('{code}', encodeURIComponent(safeCode));
+
+  // Optimistically add a row; background.js will message back when the
+  // m3u8 is detected and Send fires.
+  const task = { code: safeCode, url, status: 'pending', ts: Date.now() };
+  avTasks.unshift(task);
+  while (avTasks.length > AV_TASKS_MAX) avTasks.pop();
+  renderAvTasks();
+
+  // Clear input for the next code.
+  const input = document.getElementById('avCodeInput');
+  if (input) input.value = '';
+
+  chrome.runtime.sendMessage(
+    { action: 'avTaskFetch', code: safeCode, url },
+    (response) => {
+      // Sender Promise rejection (Chrome MV3) lands in lastError; treat
+      // it as a transient retry case the same way bulk-send does.
+      if (chrome.runtime.lastError) {
+        task.status = 'failed';
+        task.message = chrome.runtime.lastError.message || 'message failed';
+      } else if (response && response.error) {
+        task.status = 'failed';
+        task.message = response.error;
+      } else {
+        // Background acked — keep status 'pending' until the auto-send
+        // confirmation arrives via the avTaskUpdate broadcast below.
+      }
+      renderAvTasks();
+    }
+  );
+}
+
+function renderAvTasks() {
+  const list = document.getElementById('avTasksList');
+  if (!list) return;
+  if (avTasks.length === 0) {
+    list.innerHTML = '';
+    return;
+  }
+  list.innerHTML = avTasks.map(task => `
+    <div class="av-task-row is-${escapeHtml(task.status)}">
+      <span class="av-task-code">${escapeHtml(task.code)}</span>
+      <span class="av-task-status">${escapeHtml(avStatusLabel(task))}</span>
+    </div>
+  `).join('');
+}
+
+function avStatusLabel(task) {
+  if (task.status === 'pending') return t('av.status.pending');
+  if (task.status === 'sent')    return t('av.status.sent');
+  if (task.status === 'failed')  return task.message || t('av.status.failed');
+  return task.status;
+}
+
+// Listen for background.js broadcasts when an AV task progresses.
+// Background sends `{ action: 'avTaskUpdate', code, status, message }`.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.action !== 'avTaskUpdate') return;
+  // Don't shadow the imported t() i18n helper — use a different name here.
+  const task = avTasks.find(x => x.code === msg.code);
+  if (!task) return;
+  task.status = msg.status || task.status;
+  if (msg.message) task.message = msg.message;
+  renderAvTasks();
+});
 
 // ---------- Toast ----------
 function showToast(message) {

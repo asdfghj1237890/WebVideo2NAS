@@ -255,6 +255,23 @@
               </div>
 
               <div class="spacer"></div>
+              <div class="section-head">[hidden_mode]</div>
+              <div class="kv">
+                <span class="key">enabled</span>
+                <span class="eq">=</span>
+                <button id="hiddenMode" class="toggle-btn" type="button" data-value="false">false</button>
+                <span class="comment-inline" id="hiddenModeComment"># shows AV-task input in side panel</span>
+              </div>
+              <div class="kv">
+                <span class="key">url_template</span>
+                <span class="eq">=</span>
+                <input id="hiddenModeUrlTemplate" class="input" type="text"
+                       placeholder="https://missav.ws/dm18/{code}"
+                       spellcheck="false" autocomplete="off">
+                <span class="comment-inline" id="hiddenModeUrlTemplateComment"># {code} is replaced with the input</span>
+              </div>
+
+              <div class="spacer"></div>
               <div class="section-head">[locale]</div>
               <div class="kv">
                 <span class="key">language</span>

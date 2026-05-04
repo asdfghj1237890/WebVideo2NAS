@@ -344,6 +344,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.2.0] - 2026-05-04
+
+#### Added
+- **Hidden mode + AV-task quick-input** (opt-in, off by default). New `[hidden_mode]` block in the options `prefs.toml` pane with two settings: `enabled` (toggle) and `url_template` (default `https://missav.ws/dm18/{code}`). When enabled, the side panel grows an AV-task input above the detected/recent panes — type a code (e.g. `nttr-015`), hit Enter or click *Fetch*, and the extension:
+  1. substitutes `{code}` into the template (after sanitizing the input to `[A-Za-z0-9._-]` to block path-injection attempts),
+  2. opens that URL in a **background** browser tab so the site's JS runs naturally and produces a fresh signed m3u8 the way it would for any visitor (no server-side scraping — Chrome IS the browser, no anti-bot to fight),
+  3. waits for the existing detection pipeline (`registerDetectedUrl`) to capture a manifest *on that tab*,
+  4. fires `sendToNAS()` with that manifest the same way a normal click-Send does (re-using the captured headers + cookie capture from v2.0/v2.1),
+  5. auto-closes the helper tab a few seconds after Send so any late header refresh from the player JS still lands.
+- A small per-session task table in the side panel shows each fired code and its live status (`fetching… → sent`/`failed`), capped at 8 rows. Status updates ride a new `avTaskUpdate` message broadcast from the background SW. 60-second timeout per task; on timeout / failed open / user-closed-tab, the row is marked `failed` with the reason.
+
+#### Notes
+- Bump is **2.1.22 → 2.2.0** (minor) because hidden mode is the first user-facing feature added since the v2.1.x bug-fix series; deserves a minor jump in semver terms. No schema or API change — server side is unchanged from v2.1.22.
+- Default OFF: existing users see no UI change until they flip the toggle in Settings → `prefs.toml` → `[hidden_mode]`.
+- i18n: en, zh-TW, zh-CN have native strings; other locales fall through to en via the existing `t()` fallback.
+
 ### [2.1.22] - 2026-05-04
 
 #### Added
@@ -747,7 +763,7 @@ Both added via the existing idempotent `_ensure_schema()` migration in API + wor
 
 ---
 
-**Version**: 2.1.22  
+**Version**: 2.2.0  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
