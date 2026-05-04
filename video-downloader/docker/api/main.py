@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8, MP4, and MOV)",
-    version="1.10.5"
+    version="1.11.0"
 )
 
 # CORS middleware
@@ -72,6 +72,19 @@ def _ensure_schema() -> None:
         with engine.begin() as conn:
             conn.execute(text(
                 "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS output_subdir TEXT"
+            ))
+            # actual_duration: probed from the merged file via ffprobe.
+            # Compared against `duration` (declared by m3u8 EXTINF) to spot
+            # under-downloaded / token-expired jobs that were marked completed.
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS actual_duration INTEGER"
+            ))
+            # suspect_reason: short string set when the merged file is flagged
+            # as probably-wrong (e.g. "actual 38s < 85% of declared 392s").
+            # NULL = not suspect / not yet checked. Surfaced in the chrome
+            # sidepanel so the user can re-fetch via source_page.
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS suspect_reason TEXT"
             ))
     except Exception as e:
         logger.warning(f"Schema migration skipped: {e}")
@@ -263,6 +276,15 @@ class JobResponse(BaseModel):
     file_size: Optional[int] = None
     file_path: Optional[str] = None
     error_message: Optional[str] = None
+    # Probable-wrong detection (set by worker post-merge): when non-null the
+    # merged file's actual duration is materially shorter than the m3u8 said,
+    # OR the file size is implausibly small for the declared duration. The
+    # chrome sidepanel renders a warning chip + "Re-fetch" button using these.
+    actual_duration: Optional[int] = None
+    suspect_reason: Optional[str] = None
+    # Original source page URL — used by the sidepanel's "Re-fetch" action to
+    # reopen the player so the extension can capture a fresh m3u8 token.
+    source_page: Optional[str] = None
 
 class SystemStatus(BaseModel):
     status: str
@@ -305,7 +327,7 @@ async def root():
     """Root endpoint"""
     return {
         "name": "WebVideo2NAS API",
-        "version": "1.10.5",
+        "version": "1.11.0",
         "status": "running"
     }
 
@@ -411,23 +433,24 @@ async def list_jobs(
     try:
         query = """
             SELECT j.id, j.url, j.title, j.status, j.progress, j.created_at,
-                   jm.duration,
+                   jm.duration, jm.actual_duration, jm.suspect_reason,
+                   jm.source_page,
                    j.file_size, j.file_path, j.error_message
             FROM jobs j
             LEFT JOIN job_metadata jm ON j.id = jm.job_id
         """
         params = {}
-        
+
         if status:
             query += " WHERE j.status = :status"
             params["status"] = status
-        
+
         query += " ORDER BY j.created_at DESC LIMIT :limit"
         params["limit"] = limit
-        
+
         result = db.execute(text(query), params)
         jobs = []
-        
+
         for row in result:
             jobs.append(JobResponse(
                 id=str(row.id),
@@ -437,13 +460,16 @@ async def list_jobs(
                 progress=row.progress,
                 created_at=row.created_at.isoformat(),
                 duration=row.duration,
+                actual_duration=row.actual_duration,
+                suspect_reason=row.suspect_reason,
+                source_page=row.source_page,
                 file_size=row.file_size,
                 file_path=row.file_path,
                 error_message=row.error_message
             ))
-        
+
         return jobs
-    
+
     except Exception as e:
         logger.error(f"Failed to list jobs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -458,17 +484,18 @@ async def get_job(
     try:
         result = db.execute(text("""
             SELECT j.id, j.url, j.title, j.status, j.progress, j.created_at,
-                   jm.duration,
+                   jm.duration, jm.actual_duration, jm.suspect_reason,
+                   jm.source_page,
                    j.file_size, j.file_path, j.error_message
             FROM jobs j
             LEFT JOIN job_metadata jm ON j.id = jm.job_id
             WHERE j.id = :job_id
         """), {"job_id": job_id})
-        
+
         row = result.first()
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
-        
+
         return JobResponse(
             id=str(row.id),
             url=row.url,
@@ -477,6 +504,9 @@ async def get_job(
             progress=row.progress,
             created_at=row.created_at.isoformat(),
             duration=row.duration,
+            actual_duration=row.actual_duration,
+            suspect_reason=row.suspect_reason,
+            source_page=row.source_page,
             file_size=row.file_size,
             file_path=row.file_path,
             error_message=row.error_message

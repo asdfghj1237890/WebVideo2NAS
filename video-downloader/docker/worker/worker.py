@@ -195,6 +195,95 @@ class DownloadWorker:
             return int(seconds)
         except Exception:
             return None
+
+    @staticmethod
+    def _compute_suspect_reason(declared_duration, actual_duration, file_size_bytes):
+        """Decide whether a completed file looks materially under-downloaded.
+
+        Returns a short human-readable reason string when something is off,
+        or `None` when the file looks fine. Two heuristics layered:
+
+        1. Duration shortfall — if the m3u8's declared EXTINF total exists
+           and ffprobe came back, flag when actual < 85% of declared. The
+           classic token-expired failure mode left v2.1.6 jobs at ~9% of
+           declared, so 85% has a comfortable margin against legitimate
+           encoder rounding (typically 0.5–2%).
+
+        2. Bitrate floor — when ffprobe couldn't read a duration but we did
+           get a file, fall back to "is the file plausibly a video at all?"
+           by checking that file_size / declared_duration ≥ 50 KB/s. Below
+           that, the file is almost certainly anti-hotlink JPEGs or a few
+           scattered segments.
+
+        Both checks are conservative on purpose: false positives push the
+        user toward an unnecessary re-fetch (annoying but harmless), false
+        negatives leave a stub file unflagged (the original bug we're
+        trying to detect). Bias toward false positives.
+        """
+        try:
+            declared = int(declared_duration) if declared_duration else 0
+        except Exception:
+            declared = 0
+
+        if declared <= 0:
+            return None  # No basis for comparison.
+
+        if actual_duration is not None:
+            try:
+                actual = int(actual_duration)
+            except Exception:
+                actual = 0
+            if actual > 0 and actual < declared * 0.85:
+                pct = int(round(actual * 100 / declared))
+                return (
+                    f"actual duration {actual}s is only {pct}% of declared "
+                    f"{declared}s — likely partial download (token expiry / "
+                    f"anti-hotlink). Re-fetch via the source page."
+                )
+            return None
+
+        # ffprobe failed; fall back to a bitrate sanity check.
+        try:
+            kbps = (int(file_size_bytes) / 1024.0) / float(declared)
+        except Exception:
+            return None
+        if kbps < 50:
+            return (
+                f"ffprobe could not read duration and file size implies "
+                f"~{kbps:.1f} KB/s over {declared}s — likely corrupted or "
+                f"anti-hotlink content. Re-fetch via the source page."
+            )
+        return None
+
+    def _save_suspect_metadata(self, job_id, actual_duration, suspect_reason):
+        """Persist actual_duration + suspect_reason on the job_metadata row."""
+        try:
+            self.db.execute(
+                text(
+                    """
+                    INSERT INTO job_metadata (job_id, actual_duration, suspect_reason)
+                    VALUES (:job_id, :actual_duration, :suspect_reason)
+                    ON CONFLICT (job_id)
+                    DO UPDATE SET
+                      actual_duration = EXCLUDED.actual_duration,
+                      suspect_reason  = EXCLUDED.suspect_reason
+                    """
+                ),
+                {
+                    "job_id": job_id,
+                    "actual_duration": actual_duration,
+                    "suspect_reason": suspect_reason,
+                },
+            )
+            self.db.commit()
+        except Exception as e:
+            # Non-fatal — the job is still marked completed; the suspect
+            # flag is metadata for the UI, not load-bearing.
+            logger.warning(f"Failed to save suspect metadata for {job_id}: {e}")
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
     
     def update_job_status(self, job_id: str, status: str, progress: int = None, 
                          error_message: str = None, file_path: str = None, 
@@ -1135,34 +1224,59 @@ class DownloadWorker:
             
             if not success:
                 raise Exception("FFmpeg merge failed")
-            
+
             # Get file size
             file_size = Path(output_file).stat().st_size
-            
+
             # Step 4: Complete (95% - 100%)
             self.update_job_status(job_id, "processing", progress=95)
-            
+
             # Cleanup temp files
             logger.info("Step 4: Cleaning up temporary files")
             downloader.cleanup()
-            
+
             # Final cancellation check before marking complete
             if self.is_job_cancelled(job_id):
                 logger.info(f"Job {job_id} was cancelled, cleaning up output file")
                 if Path(output_file).exists():
                     Path(output_file).unlink()
                 raise Exception("Job cancelled by user")
-            
+
+            # Probe the merged file's actual duration and compare against the
+            # m3u8's declared EXTINF total. Token-expiry / partial-success cases
+            # that v2.1.6 didn't already block (e.g. a merge that succeeded but
+            # the output is materially shorter than the playlist promised) get
+            # flagged here so the user can re-fetch via the chrome sidepanel
+            # without manually inspecting every file.
+            declared_duration = playlist_info.get('duration')
+            actual_duration = self._probe_duration_seconds(output_file)
+            suspect_reason = self._compute_suspect_reason(
+                declared_duration=declared_duration,
+                actual_duration=actual_duration,
+                file_size_bytes=file_size,
+            )
+            self._save_suspect_metadata(
+                job_id=job_id,
+                actual_duration=actual_duration,
+                suspect_reason=suspect_reason,
+            )
+
             # Mark as completed
             self.update_job_status(
-                job_id, 
-                "completed", 
+                job_id,
+                "completed",
                 progress=100,
                 file_path=output_file,
                 file_size=file_size
             )
-            
-            logger.info(f"Job {job_id} completed successfully: {output_file} ({file_size / 1024 / 1024:.2f} MB)")
+
+            if suspect_reason:
+                logger.warning(
+                    f"Job {job_id} completed but FLAGGED SUSPECT: {suspect_reason} — "
+                    f"file: {output_file} ({file_size / 1024 / 1024:.2f} MB)"
+                )
+            else:
+                logger.info(f"Job {job_id} completed successfully: {output_file} ({file_size / 1024 / 1024:.2f} MB)")
         
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}", exc_info=True)
@@ -1249,6 +1363,12 @@ def _ensure_schema() -> None:
         with engine.begin() as conn:
             conn.execute(text(
                 "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS output_subdir TEXT"
+            ))
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS actual_duration INTEGER"
+            ))
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS suspect_reason TEXT"
             ))
     except Exception as e:
         logger.warning(f"Schema migration skipped: {e}")

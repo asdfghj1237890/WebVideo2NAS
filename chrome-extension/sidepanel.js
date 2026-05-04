@@ -1040,6 +1040,12 @@ function getJobInnerHtml(job) {
   const showProgress = isActiveStatus(job.status);
   const isFailed = job.status === 'failed';
   const errorInfo = isFailed ? getErrorInfo(job.error_message) : null;
+  // Suspect = worker (or backfill) flagged the merged file as probably-wrong
+  // (actual duration << declared, or implausible bitrate). Only relevant
+  // for completed jobs, and only useful when we have a source_page to
+  // re-open in the browser so the user can capture a fresh m3u8 token.
+  const isSuspect = job.status === 'completed' && !!job.suspect_reason;
+  const canRefetch = job.status === 'completed' && !!job.source_page;
   const statusTooltip = (job.status === 'completed' && typeof job.duration === 'number')
     ? t('job.duration', { duration: formatDuration(job.duration) })
     : '';
@@ -1096,6 +1102,30 @@ function getJobInnerHtml(job) {
             </div>
           </div>
         </details>
+      ` : ''}
+      ${isSuspect ? `
+        <div class="suspect-block">
+          <div class="suspect-summary">
+            <span class="suspect-icon" aria-hidden="true">!</span>
+            <span class="suspect-label">${escapeHtml(t('suspect.label'))}</span>
+          </div>
+          <div class="suspect-reason">${escapeHtml(job.suspect_reason)}</div>
+          ${canRefetch ? `
+            <button class="suspect-refetch-btn" type="button"
+                    data-refetch
+                    data-job-id="${escapeHtml(String(job.id))}"
+                    data-source-page="${escapeHtml(job.source_page)}"
+                    title="${escapeHtml(t('suspect.refetch.title'))}">
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 8a5 5 0 0 1 9-3l1.5 1.5"/>
+                <path d="M13 3v3.5h-3.5"/>
+                <path d="M13 8a5 5 0 0 1-9 3L2.5 9.5"/>
+                <path d="M3 13v-3.5h3.5"/>
+              </svg>
+              ${escapeHtml(t('suspect.refetch'))}
+            </button>
+          ` : ''}
+        </div>
       ` : ''}
     </div>
     ${showProgress ? ringMarkup : ''}
@@ -1209,6 +1239,27 @@ function bindJobEvents(el, jobId) {
     details.addEventListener('toggle', (e) => {
       if (e.target.open) expandedErrorIds.add(jobId);
       else expandedErrorIds.delete(jobId);
+    });
+  }
+  const refetchBtn = el.querySelector('[data-refetch]');
+  if (refetchBtn) {
+    refetchBtn.addEventListener('click', () => {
+      const sourcePage = refetchBtn.dataset.sourcePage;
+      if (!sourcePage) {
+        showToast(t('suspect.toast.noSource'));
+        return;
+      }
+      // Open the original video page in a new active tab so the site's JS
+      // re-runs, the player triggers a fresh m3u8 request, and the
+      // background SW captures a usable token + cookies. The user then
+      // clicks Send normally on that tab — no auto-Send here on purpose
+      // (avoids racing the player's load).
+      try {
+        chrome.tabs.create({ url: sourcePage, active: true });
+        showToast(t('suspect.toast.opened'));
+      } catch (_) {
+        showToast(t('suspect.toast.noSource'));
+      }
     });
   }
 }

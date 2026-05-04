@@ -344,6 +344,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.22] - 2026-05-04
+
+#### Added
+- **Probable-wrong file detection + Re-fetch flow** for jobs where the worker marked the file `completed` but the result is materially shorter than the m3u8 promised (the classic CDN-token-expiry bug from before v2.1.6, which left silent stub files on disk that the user couldn't easily distinguish from healthy ones). Two-part feature:
+  1. **Worker post-merge probe** (m3u8 path): after a successful merge, ffprobe the output and compare to the m3u8 EXTINF declared duration. If actual < 85% of declared, write `job_metadata.suspect_reason` describing the shortfall (e.g. `"actual duration 38s is only 10% of declared 392s — likely partial download (token expiry / anti-hotlink). Re-fetch via the source page."`). Falls back to a 50 KB/s bitrate floor when ffprobe can't read a duration, catching anti-hotlink JPEGs / corrupted outputs that still file-exist.
+  2. **Chrome sidepanel surfacing**: completed-but-suspect jobs render a warm-tone warning block under the job title with the human-readable reason and a `Re-fetch from source page` button. Clicking opens the original `source_page` (e.g. `https://jav101.com/play/video/avid…`) in a new active tab so the site's JS reissues a fresh m3u8 token and the extension's network capture picks it up; the user clicks Send normally on that tab to redownload (no auto-Send to avoid racing the player's load). Toast confirms.
+- **`backfill_suspect.py`**: standalone retroactive scanner for existing files. `docker compose exec worker python /app/worker/backfill_suspect.py` walks every `completed` job that has a `file_path` on disk, ffprobes it, runs the same suspect heuristic, and writes `actual_duration`/`suspect_reason` into `job_metadata`. Supports `--dry-run`, `--report-only`, `--limit N`, `--rescan-flagged`. Idempotent. **Run this once after deploying v2.1.22 to mark old stubs already on disk** — they'll then surface in the chrome sidepanel with the Re-fetch button.
+
+#### Schema
+- `job_metadata.actual_duration INTEGER` — ffprobed duration of the merged file
+- `job_metadata.suspect_reason TEXT` — null when fine, non-null with a short explanation when probably-wrong
+
+Both added via the existing idempotent `_ensure_schema()` migration in API + worker — no manual SQL needed.
+
+#### API
+- `JobResponse` now includes `actual_duration`, `suspect_reason`, and `source_page` (the latter so the sidepanel can drive the Re-fetch button without an extra round trip)
+- `/api/jobs` and `/api/jobs/{job_id}` SELECT joins read all three columns from `job_metadata`
+
+#### Migration / Operator notes
+- API container needs rebuild for the new `JobResponse` fields and SELECT join (`docker compose up -d --build api`)
+- Worker container needs rebuild for the post-merge probe and `_compute_suspect_reason`/`_save_suspect_metadata` helpers (`docker compose up -d --build worker`). New `_ensure_schema()` runs on first boot and is a no-op afterwards.
+- After both are up: `docker compose exec worker python /app/worker/backfill_suspect.py` to mark existing files
+- Worker / API version markers: `1.10.5` → `1.11.0` (minor bump because of the new schema columns); extension manifest: `2.1.21` → `2.1.22`
+
 ### [2.1.21] - 2026-05-04
 
 #### Fixed
@@ -723,7 +747,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.21  
+**Version**: 2.1.22  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
