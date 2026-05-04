@@ -199,7 +199,7 @@ docker pull ghcr.io/asdfghj1237890/webvideo2nas:2.3.6
 
 用 [SemVer 2.0](https://semver.org/) 但鬆綁 — 多數 release 是 patch bump。從 git log 看：
 
-- `v2.3.0` → 加 jav101 fallback (新 feature)
+- `v2.3.0` → 加 secondary-source fallback (新 feature)
 - `v2.3.1` → tighter progress refresh (UX 改進)
 - `v2.3.2` → HLS progress callback 同樣節流（fix）
 - `v2.3.3` → worker3 + db_cleanup 大改（feature）

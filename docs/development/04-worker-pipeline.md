@@ -52,7 +52,7 @@ def process_job(self, job_id):
         self._process_m3u8_download(job_id, job)
 ```
 
-「direct」這個分支對 `.mp4` / `.mov` 有效，但**只在 URL 不像 manifest 的時候**（url 沒 .m3u8 / .mpd）。例如 jav101 fallback 拿到的 `dl3.jav101.com/foo.mp4` 走這裡；但 `manifest.m3u8?fallback=true.mp4` 仍走 m3u8。
+「direct」這個分支對 `.mp4` / `.mov` 有效，但**只在 URL 不像 manifest 的時候**（url 沒 .m3u8 / .mpd）。例如 secondary fallback 拿到的純 `dl.example.com/foo.mp4` 走這裡；但 `manifest.m3u8?fallback=true.mp4` 仍走 m3u8。
 
 ## 3. m3u8 path（最複雜，bug 最多的一條）
 
@@ -141,7 +141,7 @@ key endpoint 的診斷在 [downloader._get_key_bytes()](../../video-downloader/d
 Content-Type='binary/octet-stream', len=16, hex=35316633...
 ```
 
-如果 16 bytes 全在可印 ASCII 範圍 → 印 WARNING（多數情況是 false alarm，但在診斷 jav101-style key 內容時看一眼省事）。
+如果 16 bytes 全在可印 ASCII 範圍 → 印 WARNING（多數情況是 false alarm——有些站的 AES key 本身就是 ASCII text，不是錯——但在懷疑「key endpoint 回的不是 binary」時這條 log 看一眼省事）。
 
 ### 3.4 Step 3: merge with ffmpeg (byte-concat！)
 
@@ -153,7 +153,7 @@ ffmpeg -f mpegts -i pipe:0 -c copy -bsf:a aac_adtstoasc [-t 7299] -y out.mp4
 
 stdin 用 `subprocess.Popen` + 兩個 background drain thread 抽 stderr / stdout，主 thread `shutil.copyfileobj` 把 1216 個 .ts 依序串進 stdin（1MB buffer）。
 
-**為什麼不用 `-f concat`**：見 [ch 08 §1](./08-bug-case-studies.md#1-hls-半長-merge-bug-v236)。簡單講：concat demuxer 沒 explicit `duration` directives 時靠 input 自己 reported PTS 計算 offset，jav101 的 segments 各自 PTS 從 0 開始 → demuxer offset 算錯 → 靜默丟一半 packets → 出 3158s 而非 7299s。byte-concat（TS 設計就是可串接）走 mpegts demuxer 看到一條連續 stream，沒有 offset 計算。
+**為什麼不用 `-f concat`**：見 [ch 08 §1](./08-bug-case-studies.md#1-hls-半長-merge-bug-v236)。簡單講：concat demuxer 沒 explicit `duration` directives 時靠 input 自己 reported PTS 計算 offset，當 segments 各自 PTS 從 0 開始（HLS 完全合法）→ demuxer offset 算錯 → 靜默丟一半 packets → 出半長 mp4。byte-concat（TS 設計就是可串接）走 mpegts demuxer 看到一條連續 stream，沒有 offset 計算。
 
 `-bsf:a aac_adtstoasc` 把 AAC ADTS frame 改成 ASC（mp4 容器要的）。`-t {target_duration}` 是上限，避免某些 anti-leech stream 在 .ts 裡塞 EXTINF 之外的 padding。
 

@@ -78,7 +78,7 @@ resolution       VARCHAR(20)                       -- "1920x1080"，從 m3u8 mas
 duration         INTEGER                           -- m3u8 EXTINF 加總（秒）— 「declared」
 segment_count    INTEGER                           -- m3u8 列出的 segment 數
 user_agent       TEXT
-output_subdir    TEXT                              -- normalized 過的相對路徑（例如 "missav"）
+output_subdir    TEXT                              -- normalized 過的相對路徑（例如 "site_a"）
 actual_duration  INTEGER                           -- ffprobe 量出來的實際時長
 suspect_reason   TEXT                              -- 非 null 表示「這支看起來不對」
 ```
@@ -133,7 +133,7 @@ GROUP BY status;
   headers?: Record<string,string>, // captured headers (含 Cookie)
   source_page?: string,          // 偵測到 URL 的原 page URL
   format?: "m3u8"|"mpd"|"mp4"|"mov", // URL 副檔名不明顯時的提示
-  output_subdir?: string         // 例如 "missav"，下載到 /downloads/missav/
+  output_subdir?: string         // 例如 "site_a"，下載到 /downloads/site_a/
 }
 ```
 

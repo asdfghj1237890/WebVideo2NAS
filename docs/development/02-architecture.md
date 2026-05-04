@@ -19,12 +19,12 @@ API + worker 共用同一個 image (`ghcr.io/asdfghj1237890/webvideo2nas`)，靠
 
 ## 2. 一次完整下載的流程
 
-以 user 在 missav 看影片、點 chrome ext sidepanel 的 send 為例：
+以 user 在某影片頁面看片、點 chrome ext sidepanel 的 send 為例：
 
 ```
 [Browser]                    [API]                  [Redis]            [Worker]              [Disk]
     │
-    │  user 開 missav 頁，<video> 載入 m3u8
+    │  user 打開影片頁，<video> 載入 m3u8
     │ ─── webRequest.onBeforeRequest 攔截 ────┐
     │                                         │ background.js 把 URL + tab id 存進
     │                                         │ currentTabUrls[tabId]
@@ -55,7 +55,7 @@ API + worker 共用同一個 image (`ghcr.io/asdfghj1237890/webvideo2nas`)，靠
     │                                                                                        │ ─── ffmpeg -f mpegts -i pipe:0 -c copy ───┐
     │                                                                                        │     (byte-concat 1216 segs into stdin)    │
     │                                                                                        │                                            ▼
-    │                                                                                        │   ────────────────────────────────────► /downloads/missav/...mp4
+    │                                                                                        │   ────────────────────────────────────► /downloads/<subdir>/...mp4
     │                                                                                        │
     │                                                                                        │ UPDATE jobs SET status='completed'
     │                                                                                        │ INSERT job_metadata (actual_duration, suspect_reason)
