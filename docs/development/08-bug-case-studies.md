@@ -153,7 +153,64 @@ process.stdin.close()
 
 關鍵點：整個 worker test suite **沒有任何 end-to-end 測試**會餵真實 .ts segments 進真實 ffmpeg、再 ffprobe output 看 duration。整個 ffmpeg merge step 都是用 Popen mock 驗 command-line flag，merge 內部行為從來沒被測過。
 
-### 1.6 還有哪些下載路徑可能有同類 bug
+### 1.6 從測試架構看：這個 gap 是設計取捨，不是疏忽
+
+§1.5 列了「哪幾條 test 漏掉」。但更重要的問題是：**為什麼整個 test 體系裡沒有一條會抓到這類 bug？**這不是某條 test 沒寫好，是測試架構的設計選擇本來就沒蓋到這塊。
+
+#### 目前的 test 層級
+
+| 層 | 工具 | 覆蓋什麼 | 不覆蓋什麼 |
+|---|---|---|---|
+| Worker unit | pytest + `subprocess.Popen` mock | 我們寫的 Python 內部邏輯：command flag 字串、retry / timeout、segment 過濾 | ffmpeg 跑完真的會吐什麼 |
+| API unit | pytest + sqlite in-memory | request 驗證、SSRF guard、output_subdir normalize | 真 PostgreSQL 行為、Redis race |
+| API smoke | docker compose + `test-api.sh` | API 端點的 HTTP 合約 | worker 真的下載任何東西 |
+| Chrome ext unit | vitest + jsdom | DOM helper、URL classifier、訊息 routing | 跟真 Chrome SW 互動 |
+
+**所有這些 layer 的共同特性**：每一條都「往內看」——驗我們**自己寫的 code** 的內部邏輯。沒有任何一條「往外看」——驗**外部工具**（ffmpeg、ffprobe、curl_cffi、Postgres）給定我們合法輸入之後產出的東西對不對。
+
+#### Popen mock 是 deliberate trade-off
+
+worker 把 ffmpeg / curl_cffi / requests 全部 mock 掉是有原因的：
+
+- **快**——unit test 全套 < 1 秒；真 ffmpeg 起 process 至少 100 ms+
+- **hermetic**——不需要 CI runner 裝 ffmpeg / 起 PostgreSQL / 連網
+- **deterministic**——不擔心 ffmpeg 版本、檔案 IO timing、CDN 回應變動
+- **聚焦**——專心驗*我們寫的邏輯*，不浪費 cycle 驗 ffmpeg 自己
+
+這個 trade-off 沒問題，**問題是它的代價沒有被另一層 test 補回來**。
+
+#### 純語法驗證 vs 純語意驗證
+
+換個角度想，`subprocess.Popen` mock 對 ffmpeg 做的是「**純語法驗證**」——驗 command flag 字串拼對不對：
+
+```py
+assert "-f" in cmd and cmd[cmd.index("-f")+1] == "mpegts"
+assert "-i" in cmd and cmd[cmd.index("-i")+1] == "pipe:0"
+assert "-c" in cmd and cmd[cmd.index("-c")+1] == "copy"
+```
+
+但完全沒有「**語意驗證**」——這條命令真的跑下去會吐對的東西嗎？
+
+這次的 bug 就是 **語意 contract 失效**：command flag (`-f concat -i list.txt -c copy`) **完全合法**、test 100% 過、但 ffmpeg 對「PTS 從 0 開始的多段 .ts」這個 input 的處理**不符合我們的預期**（我們以為它會像 byte-concat 那樣處理，它實際上做了 offset 計算然後算錯）。Test 看不到這個 mismatch，因為 test 根本沒讓 ffmpeg 真的跑。
+
+#### 同類 bug 的影子
+
+只要 root cause 在「外部工具給定我們合法輸入之後的行為」，目前的 test 體系就看不到。例子：
+
+- **ffmpeg muxer 對某 codec 組合的 bug**——例如把某種 codec 包進 mp4 容器產生 corruption
+- **ffmpeg 版本 regression**——某天 docker base image 拉的 ffmpeg 從 6.x 升 7.x，behavior 改了
+- **curl_cffi 對某 TLS fingerprint 的 fallback 行為**——某站突然要求新 fingerprint、舊版 fallback 拉到空 response
+- **Postgres 14 → 15 某個 SQL 語意變動**——index 或 transaction isolation 行為差異
+
+每一條都可以照同樣 pattern 寫 post-mortem：root cause 在外部工具、我們的 code 完全合理、unit test 全綠、production 出包。
+
+#### 為什麼一直沒補
+
+要補必須跨進「**真的把外部工具跑起來看結果**」這個 cost tier，從 milliseconds 等級的 unit test 跳到 seconds（甚至 docker 起 stack 是 minutes）等級的 integration test。CI 時間預算、test infrastructure 維護成本、fixture 製作成本——每一條都比 unit test 高一個量級。
+
+到目前為止 ROI 一直站在「把那些時間拿來開發 feature」那邊。**直到這次踩到 bug 為止**——bug class 第一次具體化、cost tier 跨越的價值有了憑證。§1.8 列的選項 A 就是「跨過這個 cost tier」的最便宜版本：只 cover ffmpeg merge 一條路徑，不全 cover、也不起 docker。~80 LOC + 兩個 fixture。
+
+### 1.7 還有哪些下載路徑可能有同類 bug
 
 merge step 只有 HLS 路徑會踩到 concat-demuxer 問題。其他路徑用不同 ffmpeg 命令：
 
@@ -171,7 +228,7 @@ merge step 只有 HLS 路徑會踩到 concat-demuxer 問題。其他路徑用不
 - **anti-hotlink 替換** — CDN 對某些 segment 回 PNG，downloader 的 `_is_valid_ts_content` 會擋下，這條已經有
 - **m3u8 真的在 EXTINF 裡灌水** — 跟這次 bug 的 symptom 完全一樣（都是 actual << declared），只有 probe 個別 segment 才能區分。**目前 `_diagnose_segment_durations` 只在每個 download 後採樣印 log，不 fail 也不 flag**——只是 best-effort 觀察
 
-### 1.7 補 cover 的方向（從便宜到貴）
+### 1.8 補 cover 的方向（從便宜到貴）
 
 #### 選項 A：真 ffmpeg + .ts fixture 的 e2e merge test
 
@@ -231,7 +288,7 @@ ffmpeg -f lavfi -i testsrc=duration=2:size=320x240:rate=30 -c:v libx264 -reset_t
 
 **ROI**：偏 production 監控不是 CI 攔截，release 後才會發現。
 
-### 1.8 推薦實作順序
+### 1.9 推薦實作順序
 
 | 階段 | 選項 | 規模 | ROI |
 |---|---|---|---|
@@ -240,7 +297,7 @@ ffmpeg -f lavfi -i testsrc=duration=2:size=320x240:rate=30 -c:v libx264 -reset_t
 | 3 (長期) | D: production SLI | metrics infra | release 後監控 |
 | 4 (跳過) | C: 端對端 docker-in-docker | 慢 | A 已夠 cover 這個 bug class |
 
-### 1.9 「如果現在重做這個 bug 會被抓到嗎？」
+### 1.10 「如果現在重做這個 bug 會被抓到嗎？」
 
 | 環境 | 結果 |
 |---|---|
@@ -248,7 +305,7 @@ ffmpeg -f lavfi -i testsrc=duration=2:size=320x240:rate=30 -c:v libx264 -reset_t
 | 選項 D 已實作 | ✅ SLI alert (release 後) |
 | **目前狀態 (v2.3.9)** | ⚠️ 靠 SUSPECT heuristic（actual < declared × 0.85 → flag）抓。但這是**事後 flag**，merge 完才會發現 |
 
-### 1.10 修法 timeline
+### 1.11 修法 timeline
 
 | 版本 | Commit | 內容 |
 |---|---|---|
@@ -256,7 +313,7 @@ ffmpeg -f lavfi -i testsrc=duration=2:size=320x240:rate=30 -c:v libx264 -reset_t
 | v2.3.6 | [`f51f972`](https://github.com/asdfghj1237890/WebVideo2NAS/commit/f51f972) | byte-concat TS via stdin — `ffmpeg -f mpegts -i pipe:0`，**真正修法** |
 | v2.3.7 | [`d78f28d`](https://github.com/asdfghj1237890/WebVideo2NAS/commit/d78f28d) | 修 v2.3.6 對應的 test 在 BytesIO close 之後 `getvalue()` 會炸的問題 |
 
-### 1.11 學到的東西
+### 1.12 學到的東西
 
 1. **stub-level test 對 ffmpeg 命令是 false confidence**。Popen mock 驗的是「命令字串長對」，不是「ffmpeg 跑完真的會吐對的東西」。worker pipeline 缺一條 e2e test（選項 A）把這條補上。
 

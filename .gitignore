@@ -96,3 +96,7 @@ failed/
 !.env.example
 !ENV_TEMPLATE.md
 
+# Project-local Claude Code rules (personal, per-developer)
+CLAUDE.md
+.claude/
+
