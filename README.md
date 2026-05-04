@@ -344,6 +344,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.21] - 2026-05-04
+
+#### Fixed
+- **Detection wasn't actually per-tab when two tabs shared an origin** (the canonical multi-tab bulk-send case for this extension — opening multiple JAV pages on the same site). The per-tab list (`currentTabUrls[tabId]`) was clean, but `getSortedUrlsForTabWithOrphans()` then merged in entries from the global `orphanUrlInfos` store using `pageOrigin === tabOrigin` matching. Tab 1's service-worker / no-tabId captures (whose `pageUrl` recorded Tab 1's page) leaked into Tab 2's view because both tabs shared the origin — switching from Tab 1 to Tab 2 still showed Tab 1's URLs in the sidepanel and that's what the user clicked Send on. Tightened orphan attach to require **exact `info.pageUrl === tabUrl`**: an orphan can only show in the tab whose current page URL exactly matches the page that captured it. This is strictly per-tab — orphans without a captured `pageUrl` simply don't appear (acceptable; they were rare to begin with). PWAs / SW-fetched manifests where `pageUrl` is recorded continue to attach to exactly one tab as expected. Verified with a multi-tab simulation: under the old logic, a Tab 1 SW orphan appeared in both Tab 1 and Tab 2; under the new logic, it appears only in Tab 1. The v2.1.20 same-origin substitution guard remains as a defence-in-depth layer
+
 ### [2.1.20] - 2026-05-04
 
 #### Fixed
@@ -718,7 +723,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.20  
+**Version**: 2.1.21  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 

@@ -316,37 +316,29 @@ function getSortedUrlsForTabWithOrphans(tabId, tabUrl) {
   pruneOrphans();
 
   const tabList = Array.isArray(currentTabUrls[tabId]) ? currentTabUrls[tabId] : [];
-  const tabOrigin = safeOrigin(tabUrl);
-  if (!tabOrigin) return getSortedUrlsForTab(tabId);
-
-  // Collect origins already known to belong to this tab (CDNs, media domains, etc.).
-  const tabKnownOrigins = new Set([tabOrigin]);
-  for (const item of tabList) {
-    const o = item && item.url ? safeOrigin(item.url) : null;
-    if (o) tabKnownOrigins.add(o);
-  }
 
   const merged = tabList.slice();
   const seen = new Set(merged.map(x => x && x.url).filter(Boolean));
 
-  for (const info of orphanUrlInfos) {
-    if (!info || !info.url) continue;
-    if (seen.has(info.url)) continue;
-
-    // Only attach orphans that likely belong to this tab (same initiator/documentUrl origin).
-    const pageOrigin = safeOrigin(info.pageUrl);
-    const urlOrigin = safeOrigin(info.url);
-
-    // Primary: page origin matches current tab.
-    // Fallback: if page origin is missing/unknown, allow matching against known origins
-    // already seen in this tab (helps SW-based and CDN-hosted manifests).
-    const belongsToTab =
-      (pageOrigin && pageOrigin === tabOrigin) ||
-      (!pageOrigin && urlOrigin && tabKnownOrigins.has(urlOrigin));
-
-    if (belongsToTab) {
-      merged.push(info);
-      seen.add(info.url);
+  // Orphans (service-worker / no-tabId requests) attach to a tab ONLY when
+  // the orphan's recorded page URL exactly matches this tab's current URL.
+  // The previous code matched by origin — which leaked across tabs whenever
+  // the user had two pages of the same site open (the canonical multi-tab
+  // bulk-send case for this extension). Switching from Tab 1 to Tab 2 still
+  // showed Tab 1's video URLs because both tabs shared an origin and both
+  // pulled the same orphans from the global store. Strict per-tab now: if
+  // the orphan can't be tied to a *specific* tab via its pageUrl, it stays
+  // invisible (acceptable trade-off — orphans are rare; PWAs that capture a
+  // pageUrl still attach to exactly one tab; sites without a captured
+  // pageUrl simply don't get detection through this path).
+  if (tabUrl) {
+    for (const info of orphanUrlInfos) {
+      if (!info || !info.url) continue;
+      if (seen.has(info.url)) continue;
+      if (info.pageUrl && info.pageUrl === tabUrl) {
+        merged.push(info);
+        seen.add(info.url);
+      }
     }
   }
 
