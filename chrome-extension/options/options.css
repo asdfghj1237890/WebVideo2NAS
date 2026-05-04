@@ -336,10 +336,12 @@ input:focus-visible, select:focus-visible { outline: none; }
   word-break: break-all;
 }
 .hidden-mode-table tbody tr:last-child td { border-bottom: none; }
-.hidden-mode-table .col-code      { width: 22%; font-weight: 600; }
-.hidden-mode-table .col-submitted { width: 22%; color: var(--text-dim); }
-.hidden-mode-table .col-status    { width: 22%; }
-.hidden-mode-table .col-url       { width: 34%; }
+.hidden-mode-table .col-code      { width: 14%; font-weight: 600; }
+.hidden-mode-table .col-title     { width: 30%; color: var(--text); }
+.hidden-mode-table .col-title-empty { color: var(--text-faint); }
+.hidden-mode-table .col-submitted { width: 18%; color: var(--text-dim); }
+.hidden-mode-table .col-status    { width: 16%; }
+.hidden-mode-table .col-url       { width: 22%; }
 .hidden-mode-table .col-url a {
   color: var(--text-mid); text-decoration: none;
 }

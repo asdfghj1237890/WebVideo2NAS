@@ -931,12 +931,23 @@ function maybeFireAvTaskAutoSend(tabId, manifestUrl) {
   // emitting registerDetectedUrl, but on some sites the headers race lands
   // immediately after; sendToNAS()'s findBestCapturedEntry() handles either
   // ordering, so we can fire right away.
-  const title = getStoredPageTitle(manifestUrl) || `[${pending.code}]`;
-  // pageUrl: the source page the AV task opened. Need to look it up from
-  // the tab's current URL since we don't preserve it on the pending entry
-  // (the JS-driven SPA may have redirected from the original).
+  //
+  // Title resolution priority (best → worst):
+  //   1. tab.title at THIS moment — set by the page's <title> by the time
+  //      the player JS has fired the m3u8 request; on missav this is the
+  //      full video name (e.g. "NTTR-015 - 寝取られ NTR... - MissAV").
+  //   2. getStoredPageTitle() cache — earlier registerDetectedUrl invocation
+  //      may have populated this via attachTabTitle's async tabs.get.
+  //   3. `[code]` placeholder — last resort so the job is at least
+  //      identifiable in /api/jobs.
+  // We deliberately prefer (1) over (2) because the cached title might
+  // have been captured during initial loading (before the SPA's title
+  // update) whereas the at-send-time read reflects the page's settled state.
   chrome.tabs.get(tabId, (tab) => {
     const pageUrl = tab && tab.url ? tab.url : '';
+    const liveTitle = (tab && tab.title) ? String(tab.title).trim() : '';
+    const cachedTitle = getStoredPageTitle(manifestUrl);
+    const title = liveTitle || cachedTitle || `[${pending.code}]`;
     sendToNAS(manifestUrl, title, pageUrl)
       .then(() => {
         avHistoryUpdate(pending.historyId, {

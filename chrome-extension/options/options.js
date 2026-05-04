@@ -709,7 +709,7 @@ async function renderHiddenModeHistory(rowsArg) {
   if (rows.length === 0) {
     tbody.innerHTML = `
       <tr class="empty-row">
-        <td colspan="4" id="hiddenModeHistoryEmpty">no tasks yet — input a code in the side panel</td>
+        <td colspan="5" id="hiddenModeHistoryEmpty">no tasks yet — input a code in the side panel</td>
       </tr>
     `;
     return;
@@ -718,6 +718,11 @@ async function renderHiddenModeHistory(rowsArg) {
   const html = rows.map(row => {
     const code     = row.code || '?';
     const url      = row.url  || '';
+    // Title is captured at send time (background.js reads tab.title from
+    // the helper tab — typically the missav page's <title>). Falls back
+    // to em-dash for rows that haven't reached `sent` yet, since the page
+    // may not have settled its title before timeout/cancel.
+    const title    = row.jobTitle || '';
     const status   = row.status || 'unknown';
     const submitTs = row.submittedAt ? new Date(row.submittedAt) : null;
     const submitDisplay = submitTs ? submitTs.toLocaleString() : '';
@@ -727,6 +732,7 @@ async function renderHiddenModeHistory(rowsArg) {
     return `
       <tr class="status-${escapeAttr(status)}">
         <td class="col-code">${escapeHtml(code)}</td>
+        <td class="col-title" title="${escapeAttr(title)}">${title ? escapeHtml(title) : '<span class="col-title-empty">—</span>'}</td>
         <td class="col-submitted">${escapeHtml(submitDisplay)}</td>
         <td class="col-status">${escapeHtml(statusText)}</td>
         <td class="col-url"><a href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a></td>

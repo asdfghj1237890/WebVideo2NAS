@@ -344,6 +344,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.2.2] - 2026-05-04
+
+#### Changed
+- **AV-task auto-send now uses the source page's `<title>` as the job title** instead of the bare `[code]` placeholder. When the helper tab's m3u8 fires, `maybeFireAvTaskAutoSend()` reads `tab.title` from `chrome.tabs.get()` at that moment — by then the page's static `<title>` has loaded (this is what the player JS depends on too) so we get the actual video name (e.g. `NTTR-015 - 寝取られ NTR... - MissAV`). Falls through `tab.title` → `getStoredPageTitle()` cache → `[code]` placeholder, in that priority order. The cached path is kept as a fallback because some sites' SPAs update title slightly later than the m3u8 fetch, so the live read isn't always populated yet at the precise moment of detection.
+- **Options `hidden_mode.toml` table gains a `title` column** (between `code` and `submitted`) showing the same value, so the history is glanceable without having to chase the URL link. Sized to take 30% of the table width — long missav titles wrap rather than truncating mid-character. Empty cells render `—` for rows that didn't reach `sent` (e.g. timed-out tasks where the page never settled).
+
+#### Notes
+- Worker-side filename truncation (v2.1.19's 240-byte UTF-8 cap on the filesystem stem) handles the long, multi-byte missav titles cleanly — the file written to disk will keep as much of the title as fits, cut on a UTF-8 boundary, with `.mp4` and any collision-suffix appended.
+
 ### [2.2.1] - 2026-05-04
 
 #### Changed
@@ -775,7 +784,7 @@ Both added via the existing idempotent `_ensure_schema()` migration in API + wor
 
 ---
 
-**Version**: 2.2.1  
+**Version**: 2.2.2  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
