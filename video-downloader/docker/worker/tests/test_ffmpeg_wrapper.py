@@ -1,12 +1,55 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import ffmpeg_wrapper
 from ffmpeg_wrapper import FFmpegMerger, merge_segments
 
 
+class _FakePopen:
+    """Stand-in for subprocess.Popen that captures the command, simulates
+    a successful ffmpeg run by creating the output file, and exposes
+    BytesIO streams so the drain threads in FFmpegMerger.merge() can
+    read EOF immediately and exit cleanly."""
+
+    def __init__(self, command, stdin=None, stdout=None, stderr=None, **kwargs):
+        self.command = list(command)
+        self.returncode = 0
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(b"")
+        self.stderr = io.BytesIO(b"")
+        # Output file is the last positional argument in the ffmpeg cmd.
+        Path(self.command[-1]).write_bytes(b"mp4")
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+    def poll(self):
+        return self.returncode
+
+    def communicate(self, input=None, timeout=None):
+        return (b"", b"")
+
+
+def _patch_popen(monkeypatch):
+    captured = {"instances": []}
+
+    def factory(command, **kwargs):
+        p = _FakePopen(command, **kwargs)
+        captured["instances"].append(p)
+        return p
+
+    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "Popen", factory)
+    return captured
+
+
 def test_create_concat_file_escapes_single_quotes(tmp_path, monkeypatch):
+    """Re-encode fallback still uses the concat-list file, so the escape
+    helper has to keep working."""
     monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
 
     seg = tmp_path / "seg'1.ts"
@@ -19,61 +62,60 @@ def test_create_concat_file_escapes_single_quotes(tmp_path, monkeypatch):
     merger._create_concat_file(str(concat))
 
     content = concat.read_text(encoding="utf-8")
-    # The absolute path contains a single quote which must be escaped for ffmpeg concat format.
     assert "\\''" in content
     assert content.startswith("file '")
 
 
-def test_merge_segments_cleans_up_concat_file(tmp_path, monkeypatch):
+def test_merge_uses_stdin_byte_concat_with_mpegts_input(tmp_path, monkeypatch):
+    """merge() must pipe segments into ffmpeg via stdin and tell it the
+    stream is mpegts. This is the fix for the jav101 case where the old
+    -f concat demuxer dropped ~57% of packets even with valid TS
+    segments."""
     monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
 
-    # Create dummy segment files.
     seg1 = tmp_path / "segment_00000.ts"
     seg2 = tmp_path / "segment_00001.ts"
-    seg1.write_bytes(b"a")
-    seg2.write_bytes(b"b")
+    seg1.write_bytes(b"a" * 376)  # 2 TS packets worth of dummy bytes
+    seg2.write_bytes(b"b" * 376)
 
     output = tmp_path / "out.mp4"
+    captured = _patch_popen(monkeypatch)
 
-    def _fake_run(command, stdout=None, stderr=None, text=None, timeout=None):
-        # Simulate ffmpeg success by writing a non-empty output file.
-        Path(command[-1]).write_bytes(b"mp4")
-
-        class _P:
-            returncode = 0
-            stderr = ""
-
-        return _P()
-
-    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "run", _fake_run)
-
-    ok = merge_segments([str(seg1), str(seg2)], str(output), concat_dir=str(tmp_path), try_re_encode=False)
+    ok = merge_segments(
+        [str(seg1), str(seg2)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+    )
     assert ok is True
     assert output.exists() and output.stat().st_size > 0
-    assert not (tmp_path / "concat_list.txt").exists()
+
+    assert len(captured["instances"]) == 1
+    cmd = captured["instances"][0].command
+    # Input format must be explicit mpegts — without -f, ffmpeg can't
+    # demux a raw stdin pipe.
+    assert "-f" in cmd and cmd[cmd.index("-f") + 1] == "mpegts"
+    # Input must be stdin pipe.
+    assert "-i" in cmd and cmd[cmd.index("-i") + 1] == "pipe:0"
+    # Copy mode (no re-encoding).
+    assert "-c" in cmd and cmd[cmd.index("-c") + 1] == "copy"
+    # Old concat-demuxer flags must NOT be present.
+    assert "concat" not in cmd, "must not use -f concat demuxer in copy path"
+    assert "-safe" not in cmd
+
+    # Merger must write each segment's bytes into ffmpeg stdin in order.
+    piped = captured["instances"][0].stdin.getvalue()
+    assert piped == seg1.read_bytes() + seg2.read_bytes()
 
 
-def test_merge_segments_caps_duration_with_target(tmp_path, monkeypatch):
-    """target_duration must add `-t <seconds>` so anti-leech .ts padding is trimmed."""
+def test_merge_caps_duration_with_target(tmp_path, monkeypatch):
+    """target_duration → `-t <seconds>` before the output file."""
     monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
 
     seg = tmp_path / "segment_00000.ts"
     seg.write_bytes(b"a")
     output = tmp_path / "out.mp4"
-
-    captured = {}
-
-    def _fake_run(command, stdout=None, stderr=None, text=None, timeout=None):
-        captured["command"] = list(command)
-        Path(command[-1]).write_bytes(b"mp4")
-
-        class _P:
-            returncode = 0
-            stderr = ""
-
-        return _P()
-
-    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "run", _fake_run)
+    captured = _patch_popen(monkeypatch)
 
     ok = merge_segments(
         [str(seg)],
@@ -84,38 +126,22 @@ def test_merge_segments_caps_duration_with_target(tmp_path, monkeypatch):
     )
     assert ok is True
 
-    cmd = captured["command"]
-    # `-t 38` must appear before the output file (output-side option).
+    cmd = captured["instances"][0].command
     assert "-t" in cmd, f"expected -t flag in command, got: {cmd}"
     t_idx = cmd.index("-t")
     assert cmd[t_idx + 1] == "38"
     assert t_idx < len(cmd) - 1, "-t must precede the output file"
-    # And not consumed by an earlier position that would treat it as input option for concat
-    assert cmd[t_idx - 1] != "-i"
 
 
-def test_merge_segments_omits_t_when_target_is_none(tmp_path, monkeypatch):
+def test_merge_omits_t_when_target_is_none(tmp_path, monkeypatch):
     """No target_duration → no -t flag (preserves prior behaviour)."""
     monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
 
     seg = tmp_path / "segment_00000.ts"
     seg.write_bytes(b"a")
     output = tmp_path / "out.mp4"
-
-    captured = {}
-
-    def _fake_run(command, stdout=None, stderr=None, text=None, timeout=None):
-        captured["command"] = list(command)
-        Path(command[-1]).write_bytes(b"mp4")
-
-        class _P:
-            returncode = 0
-            stderr = ""
-
-        return _P()
-
-    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "run", _fake_run)
+    captured = _patch_popen(monkeypatch)
 
     ok = merge_segments([str(seg)], str(output), concat_dir=str(tmp_path), try_re_encode=False)
     assert ok is True
-    assert "-t" not in captured["command"]
+    assert "-t" not in captured["instances"][0].command
