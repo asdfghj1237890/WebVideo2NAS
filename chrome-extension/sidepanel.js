@@ -642,7 +642,14 @@ function renderDetectedUrls(opts) {
           `}
         </div>
         ${hasIp ? `
-          <div class="ip-warn"><strong>${escapeHtml(t('url.ipWarning.title'))}</strong><br>${tHtml('url.ipWarning.body')}</div>
+          <details class="ip-warn">
+            <summary class="ip-warn-summary">
+              <span class="ip-warn-icon" aria-hidden="true">!</span>
+              <span class="ip-warn-title">${escapeHtml(t('url.ipWarning.title'))}</span>
+              <span class="ip-warn-expand" aria-hidden="true">▶</span>
+            </summary>
+            <div class="ip-warn-body">${tHtml('url.ipWarning.body')}</div>
+          </details>
         ` : ''}
         <div class="tile-body">
           <div class="tile-title" title="${escapeHtml(url)}">${escapeHtml(title)}</div>

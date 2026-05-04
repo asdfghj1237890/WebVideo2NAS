@@ -542,17 +542,58 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .grid.dense .tile-meta { font-size: 10px; }
 .tile-meta .meta-sep { color: var(--text-faint); }
 
-/* ==== IP warning (kept from original) ==== */
+/* ==== IP warning ==== */
+/* Used to be a static multi-line block — in narrow grid columns the ~140 char
+   body wrapped to 25+ lines and ballooned a single tile's height, wrecking
+   grid alignment (the M3U8 #1 case in the bug report). Now a <details>
+   collapsible: collapsed = single-line summary, click to expand the full
+   guidance. Same warn-token colour family as before. */
 .ip-warn {
-  font-size: 11px; color: var(--warn);
+  margin: 6px 8px 8px;
+  border: 1px solid oklch(78% 0.12 75 / 0.30);
   background: oklch(78% 0.12 75 / 0.08);
-  border: 1px solid oklch(78% 0.12 75 / 0.25);
-  border-radius: 4px;
-  padding: 6px 8px; margin: 0 8px 8px;
-  line-height: 1.45;
-  font-family: var(--mono);
+  border-radius: 5px;
+  overflow: hidden;
+  font-family: var(--font);
 }
-.ip-warn strong { font-weight: 700; }
+.ip-warn-summary {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 8px;
+  cursor: pointer; user-select: none; list-style: none;
+  font-size: 11px;
+  /* Lock the summary to one line so the tile height is bounded even
+     when the title translation is unusually long. */
+  white-space: nowrap; overflow: hidden;
+}
+.ip-warn-summary::-webkit-details-marker { display: none; }
+.ip-warn-icon {
+  flex: 0 0 auto;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: oklch(78% 0.12 75 / 0.30);
+  color: var(--warn);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700;
+}
+.ip-warn-title {
+  flex: 1 1 auto; min-width: 0;
+  color: var(--warn); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.ip-warn-expand {
+  flex: 0 0 auto;
+  color: var(--text-faint); font-size: 9px;
+  transition: transform 200ms ease;
+}
+.ip-warn[open] .ip-warn-expand { transform: rotate(90deg); }
+.ip-warn-body {
+  padding: 8px;
+  border-top: 1px solid oklch(78% 0.12 75 / 0.25);
+  font-size: 11px; line-height: 1.5;
+  color: var(--warn);
+  font-family: var(--mono);
+  white-space: pre-line;  /* preserve the i18n body's intentional \n breaks */
+}
+.ip-warn-body strong { font-weight: 700; }
 
 /* ==== Empty state ==== */
 .empty-state {

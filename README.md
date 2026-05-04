@@ -344,6 +344,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.1.18] - 2026-05-04
+
+#### Fixed
+- **IP-restricted URL warning blew up tile height in narrow grid columns.** The `.ip-warn` block rendered its full ~140-character explanatory body inline in the tile, so in a `isMany` 3-column layout the text wrapped to 25+ lines and the tile holding an IP-restricted URL became 5–6× taller than its siblings, wrecking grid alignment. Reworked as a `<details>` collapsible matching the failed-job error pattern: collapsed default shows a single-line summary (`! IP-Restricted URL Detected ▶`) bounded by `white-space: nowrap`, click to expand the full guidance. Tile heights stay even, the warning is still discoverable, and the body uses `white-space: pre-line` so the i18n body's intentional newlines are preserved when expanded
+
 ### [2.1.17] - 2026-05-04
 
 #### Fixed
@@ -701,7 +706,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-**Version**: 2.1.17  
+**Version**: 2.1.18  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 
