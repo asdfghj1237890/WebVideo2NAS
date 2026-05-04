@@ -198,6 +198,118 @@ describe('background.js pure helpers', () => {
     expect(ctx.safeOrigin('not a url')).toBe(null);
   });
 
+  it('findBestCapturedEntry never crosses tabs even on same-origin sites (multi-tab regression)', () => {
+    // Regression: with origin-prefix scoring, sending from tab B/C in a
+    // multi-tab same-site session would pick up tab A's most-recent
+    // captured manifest (because every capture matched the origin and the
+    // tie-breaker was timestamp). Result: A/B/C all downloaded video A.
+    // Now the substitution is hard-filtered by tabId.
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+    });
+    const now = 5_000_000;
+    withFixedNow(ctx, now);
+
+    const tabA = 100;
+    const tabB = 200;
+    const tabC = 300;
+    const videoA = 'https://cdn.missav.ws/v/code-A.m3u8?token=AAA';
+    const videoB = 'https://cdn.missav.ws/v/code-B.m3u8?token=BBB';
+    const videoC = 'https://cdn.missav.ws/v/code-C.m3u8?token=CCC';
+
+    ctx.__eval(`capturedHeaders = ${JSON.stringify({
+      [videoA]: {
+        headers: { Cookie: 'a=1' },
+        timestamp: now - 1_000,         // most recent — would have won under old scoring
+        initiator: 'https://missav.ws',
+        tabId: tabA,
+      },
+      [videoB]: {
+        headers: { Cookie: 'b=1' },
+        timestamp: now - 30_000,
+        initiator: 'https://missav.ws',
+        tabId: tabB,
+      },
+      [videoC]: {
+        headers: { Cookie: 'c=1' },
+        timestamp: now - 60_000,
+        initiator: 'https://missav.ws',
+        tabId: tabC,
+      },
+    })};`);
+
+    // Sending from tab B must pick tab B's capture, not tab A's, despite A
+    // being more recent and all three sharing origin.
+    const fromB = ctx.findBestCapturedEntry(videoB, 'https://missav.ws', tabB);
+    expect(fromB).not.toBeNull();
+    expect(fromB.url).toBe(videoB);
+
+    const fromC = ctx.findBestCapturedEntry(videoC, 'https://missav.ws', tabC);
+    expect(fromC.url).toBe(videoC);
+
+    const fromA = ctx.findBestCapturedEntry(videoA, 'https://missav.ws', tabA);
+    expect(fromA.url).toBe(videoA);
+  });
+
+  it('findBestCapturedEntry without sourceTabId falls back to strict initiator equality', () => {
+    // When the caller can't supply a tab anchor (orphan / service-worker
+    // capture path), substitution must NOT use the old origin-prefix logic.
+    // It must require entry.initiator === sourcePageUrl exactly, otherwise
+    // same-origin different-page captures would still leak.
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+    });
+    const now = 5_000_000;
+    withFixedNow(ctx, now);
+
+    const pageA = 'https://missav.ws/dm18/code-A';
+    const pageB = 'https://missav.ws/dm18/code-B';
+    const videoA = 'https://cdn.missav.ws/v/code-A.m3u8?token=AAA';
+    const videoB = 'https://cdn.missav.ws/v/code-B.m3u8?token=BBB';
+
+    ctx.__eval(`capturedHeaders = ${JSON.stringify({
+      [videoA]: { headers: { Cookie: 'a=1' }, timestamp: now - 1_000, initiator: pageA, tabId: -1 },
+      [videoB]: { headers: { Cookie: 'b=1' }, timestamp: now - 30_000, initiator: pageB, tabId: -1 },
+    })};`);
+
+    // No sourceTabId — must fall back to initiator equality. Sending
+    // for tab-B's URL with pageB anchor must not pick videoA (different page).
+    const fromB = ctx.findBestCapturedEntry(videoB, pageB, null);
+    expect(fromB).not.toBeNull();
+    expect(fromB.url).toBe(videoB);
+
+    // No sourceTabId AND no sourcePageUrl — refuse substitution outright
+    // rather than guessing across tabs.
+    const ambiguous = ctx.findBestCapturedEntry(videoB, '', null);
+    expect(ambiguous).toBeNull();
+  });
+
+  it('findBestCapturedEntry within one tab still re-keys clean URL → tokenized variant', () => {
+    // Substitution's whole purpose: when the user clicks Send on the
+    // detected clean URL, but the player actually fetched a tokenized
+    // variant (whose Cookie/Referer we captured), we want to swap to the
+    // tokenized one. Same-tab filter must NOT break this.
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+    });
+    const now = 5_000_000;
+    withFixedNow(ctx, now);
+
+    const tab = 42;
+    const cleanUrl   = 'https://cdn.example.com/v/master.m3u8';
+    const tokenUrl   = 'https://cdn.example.com/v/master.m3u8?auth=abc&exp=999';
+
+    ctx.__eval(`capturedHeaders = ${JSON.stringify({
+      [cleanUrl]: { headers: {}, timestamp: now - 60_000, initiator: 'https://example.com', tabId: tab },
+      [tokenUrl]: { headers: { Cookie: 'sid=1' }, timestamp: now - 1_000, initiator: 'https://example.com', tabId: tab },
+    })};`);
+
+    const best = ctx.findBestCapturedEntry(cleanUrl, 'https://example.com', tab);
+    // Tokenized variant scores higher (search + cookie + recent), and the
+    // same-tab filter doesn't disqualify it.
+    expect(best.url).toBe(tokenUrl);
+  });
+
   it('getStoredPageTitle pins the title to the URL\'s source tab (multi-tab regression)', () => {
     // Regression: previously the side panel passed the *active* tab's title
     // when sending to NAS, so a URL detected in tab A would get tab B's

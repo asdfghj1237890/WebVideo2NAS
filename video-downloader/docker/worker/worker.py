@@ -197,28 +197,84 @@ class DownloadWorker:
             return None
 
     @staticmethod
-    def _compute_suspect_reason(declared_duration, actual_duration, file_size_bytes):
+    def _resolve_actual_duration(probe_duration, declared_duration,
+                                 segments_downloaded, total_segments,
+                                 job_id=None):
+        """Best-guess "actual duration" for HLS jobs after merge.
+
+        ffprobe's `format.duration` is sometimes wrong on mp4 files that
+        ffmpeg wrote via the concat demuxer with `-c copy` over many TS
+        segments — the moov atom's `mvhd.duration` ends up understated
+        (e.g. 3158s reported vs the real 7299s playback) even though the
+        packet PTS still play through to the end.
+
+        When (a) every segment downloaded successfully AND (b) probe is
+        materially shorter than the m3u8's declared EXTINF total, trust
+        the declared value. Segment-count completeness is a strong
+        guarantee that the file is whole; if probe disagrees, probe is
+        the one that's wrong. Returns:
+          - probe_duration when no fallback is warranted (most cases)
+          - declared duration when the fallback fires
+          - probe_duration (which may be None) otherwise
+        """
+        if probe_duration is None:
+            return None
+        try:
+            declared = int(declared_duration) if declared_duration else 0
+        except Exception:
+            declared = 0
+        if declared <= 0:
+            return probe_duration
+
+        full_success = (
+            segments_downloaded is not None
+            and total_segments is not None
+            and total_segments > 0
+            and segments_downloaded >= total_segments
+        )
+        if not full_success:
+            return probe_duration
+
+        if probe_duration < declared * 0.85:
+            tag = f"Job {job_id}: " if job_id else ""
+            logger.info(
+                f"{tag}ffprobe returned {probe_duration}s but all "
+                f"{segments_downloaded}/{total_segments} segments downloaded "
+                f"and m3u8 declared {declared}s — using declared as actual "
+                f"duration (probe was likely confused by concat'd TS)"
+            )
+            return declared
+        return probe_duration
+
+    @staticmethod
+    def _compute_suspect_reason(declared_duration, actual_duration, file_size_bytes,
+                                segments_downloaded=None, total_segments=None):
         """Decide whether a completed file looks materially under-downloaded.
 
         Returns a short human-readable reason string when something is off,
-        or `None` when the file looks fine. Two heuristics layered:
+        or `None` when the file looks fine. Three heuristics layered:
 
-        1. Duration shortfall — if the m3u8's declared EXTINF total exists
-           and ffprobe came back, flag when actual < 85% of declared. The
+        1. Bitrate sanity check — file_size / actual_duration ≥ 50 KB/s.
+           Real videos sit comfortably above this; anti-hotlink content
+           (JPEGs/PNGs disguised as .ts) sits well below. Always runs when
+           we have actual_duration, regardless of declared/actual ratio.
+
+        2. Duration shortfall — flag when actual < 85% of declared. The
            classic token-expired failure mode left v2.1.6 jobs at ~9% of
            declared, so 85% has a comfortable margin against legitimate
-           encoder rounding (typically 0.5–2%).
+           encoder rounding (typically 0.5–2%). Skipped when EVERY segment
+           downloaded successfully — duration shortfall in that case is
+           almost always the m3u8's EXTINF total being wrong about the
+           source (jav101 over-reports duration on AES-128 playlists,
+           etc.) rather than a partial download.
 
-        2. Bitrate floor — when ffprobe couldn't read a duration but we did
-           get a file, fall back to "is the file plausibly a video at all?"
-           by checking that file_size / declared_duration ≥ 50 KB/s. Below
-           that, the file is almost certainly anti-hotlink JPEGs or a few
-           scattered segments.
+        3. Bitrate floor against declared — when ffprobe couldn't read a
+           duration but we did get a file, fall back to file_size /
+           declared_duration ≥ 50 KB/s.
 
-        Both checks are conservative on purpose: false positives push the
-        user toward an unnecessary re-fetch (annoying but harmless), false
-        negatives leave a stub file unflagged (the original bug we're
-        trying to detect). Bias toward false positives.
+        `segments_downloaded` / `total_segments` are optional (backfill
+        doesn't have them); when missing, we conservatively keep the
+        duration-shortfall check enabled.
         """
         try:
             declared = int(declared_duration) if declared_duration else 0
@@ -228,21 +284,50 @@ class DownloadWorker:
         if declared <= 0:
             return None  # No basis for comparison.
 
+        full_segment_success = (
+            segments_downloaded is not None
+            and total_segments is not None
+            and total_segments > 0
+            and segments_downloaded >= total_segments
+        )
+
         if actual_duration is not None:
             try:
                 actual = int(actual_duration)
             except Exception:
                 actual = 0
-            if actual > 0 and actual < declared * 0.85:
-                pct = int(round(actual * 100 / declared))
-                return (
-                    f"actual duration {actual}s is only {pct}% of declared "
-                    f"{declared}s — likely partial download (token expiry / "
-                    f"anti-hotlink). Re-fetch via the source page."
-                )
+
+            if actual > 0:
+                # Bitrate sanity check first — catches anti-hotlink content
+                # whether or not segment counts say "100% success" (the CDN
+                # could have returned 200 OK + identical PNG for every
+                # segment; AES decryption succeeds on any byte stream).
+                try:
+                    kbps = (int(file_size_bytes) / 1024.0) / float(actual)
+                except Exception:
+                    kbps = None
+                if kbps is not None and kbps < 50:
+                    return (
+                        f"file is {kbps:.1f} KB/s over {actual}s — too thin "
+                        f"to be a real video, likely anti-hotlink content. "
+                        f"Re-fetch via the source page."
+                    )
+
+                # Duration shortfall — only meaningful when the download
+                # itself was incomplete. Skipping this check for full-
+                # success downloads avoids false positives on hosts whose
+                # m3u8 over-reports duration (jav101 etc.).
+                if not full_segment_success and actual < declared * 0.85:
+                    pct = int(round(actual * 100 / declared))
+                    return (
+                        f"actual duration {actual}s is only {pct}% of declared "
+                        f"{declared}s — likely partial download (token expiry / "
+                        f"anti-hotlink). Re-fetch via the source page."
+                    )
             return None
 
-        # ffprobe failed; fall back to a bitrate sanity check.
+        # ffprobe failed; fall back to a bitrate sanity check against
+        # declared duration.
         try:
             kbps = (int(file_size_bytes) / 1024.0) / float(declared)
         except Exception:
@@ -1262,11 +1347,20 @@ class DownloadWorker:
             # flagged here so the user can re-fetch via the chrome sidepanel
             # without manually inspecting every file.
             declared_duration = playlist_info.get('duration')
-            actual_duration = self._probe_duration_seconds(output_file)
+            probe_duration = self._probe_duration_seconds(output_file)
+            actual_duration = self._resolve_actual_duration(
+                probe_duration=probe_duration,
+                declared_duration=declared_duration,
+                segments_downloaded=len(segment_files),
+                total_segments=len(downloader.segments),
+                job_id=job_id,
+            )
             suspect_reason = self._compute_suspect_reason(
                 declared_duration=declared_duration,
                 actual_duration=actual_duration,
                 file_size_bytes=file_size,
+                segments_downloaded=len(segment_files),
+                total_segments=len(downloader.segments),
             )
             self._save_suspect_metadata(
                 job_id=job_id,

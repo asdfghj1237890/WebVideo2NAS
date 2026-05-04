@@ -165,6 +165,74 @@ function safeOrigin(u) {
   }
 }
 
+function tryGetUrl(u) {
+  try { return new URL(u); } catch (_) { return null; }
+}
+
+function hasCookieHeader(headers) {
+  if (!headers) return false;
+  for (const k of Object.keys(headers)) {
+    if (typeof k === 'string' && k.toLowerCase() === 'cookie') return true;
+  }
+  return false;
+}
+
+// Pick the best captured-headers entry to substitute in for `targetUrl`
+// when sending to NAS. The substitute lets us re-key from a "clean" URL the
+// user clicked to the tokenized URL the player actually fetched (with the
+// matching cookies/Referer captured at fetch time).
+//
+// Same-tab hard filter — the substitute MUST come from the same tab that
+// the user clicked Send from. Without this, when tabs A/B/C are all on the
+// same site, every capture matches the origin prefix and the
+// most-recent-timestamp tie-breaker silently swaps in another tab's video
+// URL — so sending from tab B/C ends up downloading tab A's video.
+//
+// `sourceTabId` is the tab the user clicked Send from. When unknown
+// (orphan/service-worker capture path), fall back to strict initiator
+// equality, which is still tighter than the old origin-prefix scoring
+// because a full URL doesn't match a different page on the same origin.
+function findBestCapturedEntry(targetUrl, sourcePageUrl, sourceTabId) {
+  const t = tryGetUrl(targetUrl);
+  if (!t) return null;
+
+  let best = null;
+  const hasSourceTab = (typeof sourceTabId === 'number' && sourceTabId >= 0);
+
+  for (const [k, entry] of Object.entries(capturedHeaders)) {
+    const ku = tryGetUrl(k);
+    if (!ku || !entry) continue;
+
+    // Only consider manifest captures (m3u8/mpd or Content-Type detected)
+    const kl = k.toLowerCase();
+    const isManifestByExt = kl.includes('.m3u8') || kl.includes('.mpd');
+    const isManifestByFormat = !!getDetectedFormat(k);
+    if (!isManifestByExt && !isManifestByFormat) continue;
+
+    if (hasSourceTab) {
+      if (entry.tabId !== sourceTabId) continue;
+    } else {
+      if (!sourcePageUrl) continue;
+      if (entry.initiator !== sourcePageUrl) continue;
+    }
+
+    let score = 10; // anchor (same-tab or same-page confirmed by hard filter)
+    if (ku.origin === t.origin) score += 5;
+    if (ku.pathname === t.pathname) score += 2;
+    // Prefer tokenized URLs (query params) as they often map to full playlists
+    if (ku.search && ku.search.length > 1) score += 3;
+    // Prefer captured requests that already carried Cookie headers
+    if (hasCookieHeader(entry.headers)) score += 3;
+    if (entry.timestamp && (Date.now() - entry.timestamp) < 60_000) score += 1;
+
+    if (!best || score > best.score ||
+        (score === best.score && (entry.timestamp || 0) > (best.entry.timestamp || 0))) {
+      best = { url: k, entry, score };
+    }
+  }
+  return best;
+}
+
 // Attach a thumbnail (poster match → page og:image) to each URL row.
 function enrichWithThumbnails(rows, tabId) {
   const cache = pageThumbnailsByTab[tabId];
@@ -740,14 +808,14 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   const urlLower = url ? url.toLowerCase() : '';
   const isVideoUrl = url && isCandidateVideoUrl(url);
   if (isVideoUrl) {
-    sendToNAS(url, tab.title, tab.url);
+    sendToNAS(url, tab.title, tab.url, tab && tab.id != null ? tab.id : null);
   } else {
     // Try to find video URL in current tab
     const tabUrls = currentTabUrls[tab.id];
     if (tabUrls && tabUrls.length > 0) {
       // Send the best candidate (prefer "now playing" heuristics)
       const best = getSortedUrlsForTab(tab.id)[0];
-      sendToNAS(best.url, tab.title, tab.url);
+      sendToNAS(best.url, tab.title, tab.url, tab.id);
     } else {
       showNotification('Error', 'No video URL found on this page');
     }
@@ -1055,7 +1123,7 @@ function maybeFireAvTaskAutoSend(tabId, manifestUrl) {
     const liveTitle = (tab && tab.title) ? String(tab.title).trim() : '';
     const cachedTitle = getStoredPageTitle(manifestUrl);
     const title = liveTitle || cachedTitle || `[${pending.code}]`;
-    sendToNAS(manifestUrl, title, pageUrl)
+    sendToNAS(manifestUrl, title, pageUrl, tabId)
       .then(() => {
         avHistoryUpdate(pending.historyId, {
           status: 'sent',
@@ -1111,8 +1179,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 });
 
-// Send URL to NAS
-async function sendToNAS(url, pageTitle, pageUrl) {
+// Send URL to NAS. `sourceTabId` is the tab the user clicked Send from
+// (sidepanel passes its activeTabId; context-menu passes tab.id; AV-task
+// auto-send passes the helper tab id). It anchors the captured-header
+// substitution to that exact tab so multi-tab same-site sessions don't leak
+// each other's video URLs through findBestCapturedEntry. Optional — when
+// missing, substitution falls back to strict initiator equality.
+async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
   try {
     const formatHint = getDetectedFormat(url);
     if (!isCandidateVideoUrl(url) && !formatHint) {
@@ -1141,100 +1214,23 @@ async function sendToNAS(url, pageTitle, pageUrl) {
     let finalHeaders = {};
     let urlToSend = url;
 
-    function tryGetUrl(u) {
-      try { return new URL(u); } catch (_) { return null; }
-    }
-
-    function originOf(u) {
-      const uu = tryGetUrl(u);
-      return uu ? uu.origin : null;
-    }
-
-    function hasCookieHeader(headers) {
-      if (!headers) return false;
-      for (const k of Object.keys(headers)) {
-        if (typeof k === 'string' && k.toLowerCase() === 'cookie') return true;
-      }
-      return false;
-    }
-
-    function findBestCapturedEntry(targetUrl, sourcePageUrl) {
-      const t = tryGetUrl(targetUrl);
-      if (!t) return null;
-
-      let best = null;
-      const sourceOrigin = originOf(sourcePageUrl);
-
-      for (const [k, entry] of Object.entries(capturedHeaders)) {
-        const ku = tryGetUrl(k);
-        if (!ku || !entry) continue;
-
-        // Only consider manifest captures (m3u8/mpd or Content-Type detected)
-        const kl = k.toLowerCase();
-        const isManifestByExt = kl.includes('.m3u8') || kl.includes('.mpd');
-        const isManifestByFormat = !!getDetectedFormat(k);
-        if (!isManifestByExt && !isManifestByFormat) continue;
-
-        // Match on the SOURCE PAGE'S origin, not the currently active tab.
-        // The previous +10 used `chrome.tabs.query({active:true})` which is the
-        // tab the user happens to be looking at right now — not the tab the
-        // URL was detected on. When the user switches tabs and then clicks a
-        // tile from the previous tab, that mismatch caused another tab's
-        // captured manifest to score highest and OVERWRITE the URL the user
-        // actually clicked. Origin is intrinsic to the URL/page, so it
-        // survives tab switches and tab close/reopen.
-        let score = 0;
-        if (sourceOrigin && entry.initiator && entry.initiator.startsWith(sourceOrigin)) score += 10;
-        if (ku.origin === t.origin) score += 5;
-        if (ku.pathname === t.pathname) score += 2;
-        // Prefer tokenized URLs (query params) as they often map to full playlists
-        if (ku.search && ku.search.length > 1) score += 3;
-        // Prefer captured requests that already carried Cookie headers
-        if (hasCookieHeader(entry.headers)) score += 3;
-        if (entry.timestamp && (Date.now() - entry.timestamp) < 60_000) score += 1;
-
-        if (!best) {
-          best = { url: k, entry, score };
-          continue;
-        }
-
-        if (score > best.score) {
-          best = { url: k, entry, score };
-          continue;
-        }
-
-        if (score === best.score && (entry.timestamp || 0) > (best.entry.timestamp || 0)) {
-          best = { url: k, entry, score };
-        }
-      }
-      return best;
-    }
-
     let captured = capturedHeaders[url];
-    const best = findBestCapturedEntry(url, pageUrl);
+    const best = findBestCapturedEntry(url, pageUrl, sourceTabId);
 
-    // Use the best captured m3u8 when it's a strong match for this URL's
-    // SOURCE page+origin, even if we have an exact key hit. Exact matches are
-    // often "clean" URLs (no token) while the real player request contains
-    // query params. Hard requirement: the substitute must be from the SAME
-    // origin as the URL the user actually clicked — never substitute across
-    // origins, which would silently send a video from a different site.
-    const sourceOrigin = originOf(pageUrl);
-    const targetOrigin = originOf(url);
-    const bestUrlOrigin = best ? originOf(best.url) : null;
-    const sameOrigin = !!best && (
-      (sourceOrigin && best.entry.initiator && best.entry.initiator.startsWith(sourceOrigin)) ||
-      (targetOrigin && bestUrlOrigin && bestUrlOrigin === targetOrigin)
-    );
-
+    // Use the best captured m3u8 when it's a strong match, even if we have
+    // an exact key hit. Exact matches are often "clean" URLs (no token)
+    // while the real player request contains query params. The same-tab
+    // hard filter inside findBestCapturedEntry guarantees `best` (when
+    // present) came from the source tab — no cross-origin or cross-tab
+    // substitution is possible at this point.
     const shouldUseBest =
-      !!best && sameOrigin &&
+      !!best &&
       (captured == null || best.score >= 15 || (best.entry && best.entry.timestamp && captured.timestamp && best.entry.timestamp > captured.timestamp));
 
     if (shouldUseBest) {
       captured = best.entry;
       urlToSend = best.url;
-      console.log('Using best captured manifest for this URL\'s source page:', urlToSend);
+      console.log('Using best captured manifest for this URL\'s source tab:', urlToSend);
     }
     
     if (captured && captured.headers) {
@@ -1602,6 +1598,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // to a generic placeholder.
     const titleToUse =
       getStoredPageTitle(request.url) || request.title || 'Untitled Video';
+    // Anchor the captured-header substitution to the tab the user clicked
+    // Send from. Without this, same-site multi-tab sessions leak each
+    // other's URLs through findBestCapturedEntry's origin scoring (see the
+    // hard filter there for the full story).
+    const sourceTabId = (typeof request.tabId === 'number' && request.tabId >= 0)
+      ? request.tabId : null;
 
     // Hold the message channel open until sendToNAS settles. Without `return
     // true` + a deferred sendResponse, Chrome considers this handler done the
@@ -1610,7 +1612,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // → cookies.getAll → fetch). When the user fires Send across multiple
     // tabs in quick succession, the first 1–2 land but the later ones lose
     // their in-flight chains to SW termination and never reach the NAS.
-    sendToNAS(request.url, titleToUse, request.pageUrl)
+    sendToNAS(request.url, titleToUse, request.pageUrl, sourceTabId)
       .then(() => sendResponse({ success: true }))
       .catch((err) => {
         console.error('sendToNAS failed:', err);

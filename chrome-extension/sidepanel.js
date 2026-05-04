@@ -928,11 +928,16 @@ async function sendToNAS(url, pageUrl) {
     // Background looks up the title that was captured when this URL was first
     // detected (getStoredPageTitle) and falls back to a placeholder if
     // missing. We still pass i18n-aware fallback so the language matches.
+    //
+    // tabId anchors the captured-header substitution to this exact tab.
+    // Without it, sending from tab B/C in a same-site multi-tab session
+    // could rewrite the URL to tab A's video (origin-prefix scoring leak).
     await sendMessageWithRetry({
       action: 'sendToNAS',
       url: url,
       title: t('video.untitled'),
-      pageUrl: pageUrl || ''
+      pageUrl: pageUrl || '',
+      tabId: activeTabId
     });
 
     showToast(t('toast.sending'));
