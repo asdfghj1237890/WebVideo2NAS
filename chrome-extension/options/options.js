@@ -695,11 +695,13 @@ async function renderHiddenModeHistory(rowsArg) {
   }
 
   // Sidebar count badge — only show when non-zero so the badge slot stays
-  // tidy on first install.
+  // tidy on first install. Cap display at "99+" so the pill never has to
+  // render 3 digits (which busts the rounded shape since AV_HISTORY_MAX
+  // can now reach 200).
   const countBadge = $('hiddenModeTaskCount');
   if (countBadge) {
     if (rows.length > 0) {
-      countBadge.textContent = String(rows.length);
+      countBadge.textContent = rows.length > 99 ? '99+' : String(rows.length);
       countBadge.removeAttribute('hidden');
     } else {
       countBadge.setAttribute('hidden', '');

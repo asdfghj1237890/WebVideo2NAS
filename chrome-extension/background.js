@@ -35,7 +35,7 @@ const VIDEO_META_MAX_ENTRIES = 500;
 let avPendingTabs = {};
 const AV_TASK_TIMEOUT_MS = 60_000; // 60s for the page to load + emit a manifest
 const AV_TASK_AUTOCLOSE_DELAY_MS = 4_000; // give the worker a chance to grab fresh cookies
-const AV_HISTORY_MAX = 100; // bounded history kept in chrome.storage.local.avTaskHistory
+const AV_HISTORY_MAX = 200; // bounded history kept in chrome.storage.local.avTaskHistory
 
 // User settings
 let userSettings = {
