@@ -31,10 +31,11 @@ const VIDEO_META_MAX_ENTRIES = 500;
 // Hidden-mode AV-task pipeline: tabs we opened on the user's behalf so the
 // site's own JS can produce a fresh m3u8. Keyed by tabId; expires after the
 // timeout regardless of outcome so the user gets feedback.
-// Value: { code, requestedAt, fired: bool, timeoutHandle }
+// Value: { code, requestedAt, fired: bool, timeoutHandle, historyId }
 let avPendingTabs = {};
 const AV_TASK_TIMEOUT_MS = 60_000; // 60s for the page to load + emit a manifest
 const AV_TASK_AUTOCLOSE_DELAY_MS = 4_000; // give the worker a chance to grab fresh cookies
+const AV_HISTORY_MAX = 100; // bounded history kept in chrome.storage.local.avTaskHistory
 
 // User settings
 let userSettings = {
@@ -808,18 +809,80 @@ function formatApiErrorDetail(errorJson, httpStatus) {
 
 // ---------- Hidden-mode AV-task pipeline ----------
 
+// Persistent task history. Single source of truth for both the side panel's
+// "recent tasks" list and the options page's full table. Lives in
+// chrome.storage.local (per-device — avTaskHistory can grow large with URLs,
+// stays out of the 100KB chrome.storage.sync ceiling).
+//
+// Row shape: { id, code, url, status, message?, submittedAt, sentAt?,
+//              manifestUrl?, jobId?, jobTitle? }
+// Newest first. Bounded to AV_HISTORY_MAX so the table stays snappy.
+//
+// Serialised through a single-slot promise chain so concurrent
+// fetch+update bursts (user mashing Enter on different codes) don't lose
+// rows the way a naive read-modify-write would.
+let _avHistoryChain = Promise.resolve();
+function _avHistoryDo(work) {
+  const next = _avHistoryChain.then(work);
+  _avHistoryChain = next.catch((err) => {
+    console.error('avTaskHistory mutation failed:', err);
+  });
+  return next;
+}
+
+function avHistoryAppend(entry) {
+  return _avHistoryDo(async () => {
+    const stored = await chrome.storage.local.get(['avTaskHistory']);
+    const list = Array.isArray(stored.avTaskHistory) ? stored.avTaskHistory : [];
+    list.unshift(entry);
+    if (list.length > AV_HISTORY_MAX) list.length = AV_HISTORY_MAX;
+    await chrome.storage.local.set({ avTaskHistory: list });
+    return entry;
+  });
+}
+
+function avHistoryUpdate(historyId, patch) {
+  return _avHistoryDo(async () => {
+    const stored = await chrome.storage.local.get(['avTaskHistory']);
+    const list = Array.isArray(stored.avTaskHistory) ? stored.avTaskHistory : [];
+    const idx = list.findIndex(x => x && x.id === historyId);
+    if (idx === -1) return null;
+    list[idx] = { ...list[idx], ...patch };
+    await chrome.storage.local.set({ avTaskHistory: list });
+    return list[idx];
+  });
+}
+
+function _newHistoryId() {
+  // Crypto-strong random suffix; avoids collisions when the user fires
+  // tasks faster than ms-resolution timestamps.
+  return `av_${Date.now()}_${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
+
 // Open the user's URL in a background tab and start a timeout. The
 // detection pipeline calls maybeFireAvTaskAutoSend() when a manifest
-// shows up; that path handles the actual Send.
+// shows up; that path handles the actual Send. Also writes a `pending`
+// row to avTaskHistory so the options table can show progress.
 async function handleAvTaskFetch(request) {
   const url = request && request.url;
   const code = request && request.code;
   if (!url || !code) {
     return { error: 'avTaskFetch missing url/code' };
   }
+  const historyId = _newHistoryId();
+  await avHistoryAppend({
+    id: historyId,
+    code,
+    url,
+    status: 'pending',
+    submittedAt: Date.now(),
+  });
+
   try {
     const tab = await chrome.tabs.create({ url, active: false });
     if (!tab || tab.id == null) {
+      await avHistoryUpdate(historyId, { status: 'failed', message: 'failed to open tab' });
+      broadcastAvTaskUpdate(code, 'failed', 'failed to open tab');
       return { error: 'failed to open tab' };
     }
     // Track this tab so registerDetectedUrl knows to auto-send the first
@@ -828,7 +891,9 @@ async function handleAvTaskFetch(request) {
       const pending = avPendingTabs[tab.id];
       if (!pending || pending.fired) return;
       console.warn('AV task timed out without detecting a manifest:', code, url);
-      broadcastAvTaskUpdate(code, 'failed', 'Timed out — no manifest detected. Try opening the page manually.');
+      const msg = 'Timed out — no manifest detected. Try opening the page manually.';
+      avHistoryUpdate(historyId, { status: 'failed', message: msg });
+      broadcastAvTaskUpdate(code, 'failed', msg);
       cleanupAvTask(tab.id);
     }, AV_TASK_TIMEOUT_MS);
 
@@ -837,10 +902,14 @@ async function handleAvTaskFetch(request) {
       requestedAt: Date.now(),
       fired: false,
       timeoutHandle: handle,
+      historyId,
     };
-    return { success: true, tabId: tab.id };
+    return { success: true, tabId: tab.id, historyId };
   } catch (e) {
-    return { error: (e && e.message) || 'tabs.create threw' };
+    const msg = (e && e.message) || 'tabs.create threw';
+    await avHistoryUpdate(historyId, { status: 'failed', message: msg });
+    broadcastAvTaskUpdate(code, 'failed', msg);
+    return { error: msg };
   }
 }
 
@@ -870,6 +939,12 @@ function maybeFireAvTaskAutoSend(tabId, manifestUrl) {
     const pageUrl = tab && tab.url ? tab.url : '';
     sendToNAS(manifestUrl, title, pageUrl)
       .then(() => {
+        avHistoryUpdate(pending.historyId, {
+          status: 'sent',
+          sentAt: Date.now(),
+          manifestUrl,
+          jobTitle: title,
+        });
         broadcastAvTaskUpdate(pending.code, 'sent');
         // Auto-close the helper tab a few seconds after Send so any
         // late header captures (cookies refreshed by player JS) still
@@ -880,7 +955,9 @@ function maybeFireAvTaskAutoSend(tabId, manifestUrl) {
         }, AV_TASK_AUTOCLOSE_DELAY_MS);
       })
       .catch((err) => {
-        broadcastAvTaskUpdate(pending.code, 'failed', (err && err.message) || 'sendToNAS failed');
+        const msg = (err && err.message) || 'sendToNAS failed';
+        avHistoryUpdate(pending.historyId, { status: 'failed', message: msg });
+        broadcastAvTaskUpdate(pending.code, 'failed', msg);
         cleanupAvTask(tabId);
       });
   });
@@ -908,7 +985,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (avPendingTabs[tabId]) {
     const pending = avPendingTabs[tabId];
     if (!pending.fired) {
-      broadcastAvTaskUpdate(pending.code, 'failed', 'Tab closed before manifest detected.');
+      const msg = 'Tab closed before manifest detected.';
+      avHistoryUpdate(pending.historyId, { status: 'failed', message: msg });
+      broadcastAvTaskUpdate(pending.code, 'failed', msg);
     }
     cleanupAvTask(tabId);
   }

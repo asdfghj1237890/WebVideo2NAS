@@ -1312,12 +1312,11 @@ async function cancelJob(jobId) {
 }
 
 // ---------- Hidden mode (AV-task quick-input) ----------
-// In-memory list of tasks fired this session. Each entry is
-// { code, url, status: 'pending'|'sent'|'failed', message, ts }.
-// Cleared on side-panel reload — the persisted job in the NAS DB is the
-// real source of truth, this list is just per-session feedback.
-const avTasks = [];
-const AV_TASKS_MAX = 8;
+// Shared persistence: chrome.storage.local.avTaskHistory is the single
+// source of truth for both this side panel and the options page's
+// hidden_mode.toml table. Background.js writes; we just render the
+// most-recent slice and listen for changes.
+const AV_TASKS_VISIBLE = 8;
 
 function applyHiddenModeVisibility() {
   const block = document.getElementById('avTaskBlock');
@@ -1331,8 +1330,19 @@ function applyHiddenModeVisibility() {
     if (labelEl) labelEl.textContent = t('av.submit');
     const input = document.getElementById('avCodeInput');
     if (input) input.placeholder = t('av.placeholder');
+    refreshAvTasksFromStorage();
   } else {
     block.setAttribute('hidden', '');
+  }
+}
+
+async function refreshAvTasksFromStorage() {
+  try {
+    const stored = await chrome.storage.local.get(['avTaskHistory']);
+    const list = Array.isArray(stored.avTaskHistory) ? stored.avTaskHistory : [];
+    renderAvTasks(list.slice(0, AV_TASKS_VISIBLE));
+  } catch (_) {
+    renderAvTasks([]);
   }
 }
 
@@ -1355,47 +1365,34 @@ function submitAvTask(rawCode) {
   }
   const url = template.replace('{code}', encodeURIComponent(safeCode));
 
-  // Optimistically add a row; background.js will message back when the
-  // m3u8 is detected and Send fires.
-  const task = { code: safeCode, url, status: 'pending', ts: Date.now() };
-  avTasks.unshift(task);
-  while (avTasks.length > AV_TASKS_MAX) avTasks.pop();
-  renderAvTasks();
-
-  // Clear input for the next code.
+  // Clear input immediately for the next code.
   const input = document.getElementById('avCodeInput');
   if (input) input.value = '';
 
+  // Background.js writes the history row (status='pending') before
+  // chrome.tabs.create returns; the storage.onChanged listener below
+  // re-renders us. We don't need an optimistic local insert.
   chrome.runtime.sendMessage(
     { action: 'avTaskFetch', code: safeCode, url },
-    (response) => {
-      // Sender Promise rejection (Chrome MV3) lands in lastError; treat
-      // it as a transient retry case the same way bulk-send does.
-      if (chrome.runtime.lastError) {
-        task.status = 'failed';
-        task.message = chrome.runtime.lastError.message || 'message failed';
-      } else if (response && response.error) {
-        task.status = 'failed';
-        task.message = response.error;
-      } else {
-        // Background acked — keep status 'pending' until the auto-send
-        // confirmation arrives via the avTaskUpdate broadcast below.
-      }
-      renderAvTasks();
+    () => {
+      // Acks are best-effort; lastError fires when sidepanel was the only
+      // listener and the SW restarted. The history row in storage is the
+      // authoritative state, so we ignore the ack content here.
+      void chrome.runtime.lastError;
     }
   );
 }
 
-function renderAvTasks() {
+function renderAvTasks(rows) {
   const list = document.getElementById('avTasksList');
   if (!list) return;
-  if (avTasks.length === 0) {
+  if (!rows || rows.length === 0) {
     list.innerHTML = '';
     return;
   }
-  list.innerHTML = avTasks.map(task => `
-    <div class="av-task-row is-${escapeHtml(task.status)}">
-      <span class="av-task-code">${escapeHtml(task.code)}</span>
+  list.innerHTML = rows.map(task => `
+    <div class="av-task-row is-${escapeHtml(task.status || 'unknown')}">
+      <span class="av-task-code">${escapeHtml(task.code || '?')}</span>
       <span class="av-task-status">${escapeHtml(avStatusLabel(task))}</span>
     </div>
   `).join('');
@@ -1405,19 +1402,19 @@ function avStatusLabel(task) {
   if (task.status === 'pending') return t('av.status.pending');
   if (task.status === 'sent')    return t('av.status.sent');
   if (task.status === 'failed')  return task.message || t('av.status.failed');
-  return task.status;
+  return task.status || '';
 }
 
-// Listen for background.js broadcasts when an AV task progresses.
-// Background sends `{ action: 'avTaskUpdate', code, status, message }`.
-chrome.runtime.onMessage.addListener((msg) => {
-  if (!msg || msg.action !== 'avTaskUpdate') return;
-  // Don't shadow the imported t() i18n helper — use a different name here.
-  const task = avTasks.find(x => x.code === msg.code);
-  if (!task) return;
-  task.status = msg.status || task.status;
-  if (msg.message) task.message = msg.message;
-  renderAvTasks();
+// Live updates: the options-page table + this list both refresh whenever
+// background.js writes to avTaskHistory. No need for the old code-keyed
+// `avTaskUpdate` runtime broadcast (still fired for backwards compat
+// inside background, but not consumed here anymore).
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local' || !changes.avTaskHistory) return;
+  const list = changes.avTaskHistory.newValue;
+  if (Array.isArray(list)) {
+    renderAvTasks(list.slice(0, AV_TASKS_VISIBLE));
+  }
 });
 
 // ---------- Toast ----------

@@ -97,6 +97,19 @@
             <span class="nav-label">prefs.toml</span>
           </button>
 
+          <button class="nav-item" type="button" data-nav="hidden_mode">
+            <span class="nav-arrow">▸</span>
+            <span class="nav-icon">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            </span>
+            <span class="nav-label">hidden_mode.toml</span>
+            <span class="nav-count" id="hiddenModeTaskCount" hidden>0</span>
+          </button>
+
           <button class="nav-item" type="button" data-nav="about">
             <span class="nav-arrow">▸</span>
             <span class="nav-icon">
@@ -255,6 +268,31 @@
               </div>
 
               <div class="spacer"></div>
+              <div class="section-head">[locale]</div>
+              <div class="kv">
+                <span class="key">language</span>
+                <span class="eq">=</span>
+                <select id="uiLanguage" class="toml-select">
+                  <option value="">"auto"</option>
+                  <option value="zh-TW">"zh-TW"</option>
+                  <option value="zh-CN">"zh-CN"</option>
+                  <option value="en">"en"</option>
+                  <option value="ja">"ja"</option>
+                  <option value="ko">"ko"</option>
+                  <option value="fr">"fr"</option>
+                  <option value="es">"es"</option>
+                  <option value="pt">"pt"</option>
+                </select>
+                <span class="comment-inline" id="langComment"># side panel ui</span>
+              </div>
+            </section>
+
+            <!-- ====== hidden_mode.toml ====== -->
+            <section class="pane" data-pane="hidden_mode">
+              <div class="comment"># AV-task quick-input — opt-in feature</div>
+              <div class="comment"># enabled = true → side panel shows the task input</div>
+              <div class="spacer"></div>
+
               <div class="section-head">[hidden_mode]</div>
               <div class="kv">
                 <span class="key">enabled</span>
@@ -272,22 +310,29 @@
               </div>
 
               <div class="spacer"></div>
-              <div class="section-head">[locale]</div>
-              <div class="kv">
-                <span class="key">language</span>
-                <span class="eq">=</span>
-                <select id="uiLanguage" class="toml-select">
-                  <option value="">"auto"</option>
-                  <option value="zh-TW">"zh-TW"</option>
-                  <option value="zh-CN">"zh-CN"</option>
-                  <option value="en">"en"</option>
-                  <option value="ja">"ja"</option>
-                  <option value="ko">"ko"</option>
-                  <option value="fr">"fr"</option>
-                  <option value="es">"es"</option>
-                  <option value="pt">"pt"</option>
-                </select>
-                <span class="comment-inline" id="langComment"># side panel ui</span>
+              <div class="section-head">
+                <span>[task_history]</span>
+                <button id="hiddenModeHistoryClearBtn" class="inline-btn" type="button">
+                  <span id="hiddenModeHistoryClearText">clear</span>
+                </button>
+              </div>
+              <div class="comment"># live updates — newest first, capped at 100 rows</div>
+              <div class="hidden-mode-table-wrap">
+                <table class="hidden-mode-table" id="hiddenModeHistoryTable">
+                  <thead>
+                    <tr>
+                      <th id="hiddenModeColCode">code</th>
+                      <th id="hiddenModeColSubmitted">submitted</th>
+                      <th id="hiddenModeColStatus">status</th>
+                      <th id="hiddenModeColUrl">url</th>
+                    </tr>
+                  </thead>
+                  <tbody id="hiddenModeHistoryBody">
+                    <tr class="empty-row">
+                      <td colspan="4" id="hiddenModeHistoryEmpty">no tasks yet — input a code in the side panel</td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </section>
 

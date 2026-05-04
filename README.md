@@ -344,6 +344,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.2.1] - 2026-05-04
+
+#### Changed
+- **Hidden mode is now its own settings tab** instead of a sub-section of `prefs.toml`. New nav item `hidden_mode.toml` between `prefs.toml` and `about` carries: the enable toggle, the URL template, and a **persistent task history table** (newest first, capped at 100 rows) showing every code the user has fired with its status (`pending` / `sent` / `failed`), submitted timestamp, and original URL. Sidebar count badge ticks up so a quick glance at the nav shows how much is in the queue.
+- **Single source of truth for AV-task state**: `chrome.storage.local.avTaskHistory`. Background.js writes lifecycle events through a serialised promise queue (no read-modify-write races even when the user mashes Enter on several codes — verified with a 5-concurrent-write simulation: 5/5 rows preserved, order intact, no lost updates). The side panel's recent-tasks list and the options page's table both read this storage and re-render via `chrome.storage.onChanged`, so any progress shows in both surfaces simultaneously.
+- Sidepanel `.av-tasks` list dropped its in-memory session array — same storage as the options table, just sliced to the most recent 8.
+- Options table includes a `clear` button next to the `[task_history]` heading.
+
+#### Notes
+- Storage migration is automatic — first read returns an empty list. No data loss for v2.2.0 users since that version's tasks were session-only and weren't persisted.
+- `avTaskUpdate` runtime broadcast is still emitted from background.js for compatibility but no longer consumed; sidepanel + options both read storage directly.
+
 ### [2.2.0] - 2026-05-04
 
 #### Added
@@ -763,7 +775,7 @@ Both added via the existing idempotent `_ensure_schema()` migration in API + wor
 
 ---
 
-**Version**: 2.2.0  
+**Version**: 2.2.1  
 **Last Updated**: 2026-05-04  
 **Port**: 52052 (NAS host port → API container :8000)
 

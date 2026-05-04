@@ -1,10 +1,11 @@
 // Options Page Script for WebVideo2NAS — terminal/dotfile UI.
 
 const NAV_FILES = {
-  connection: 'connection.toml',
-  profiles:   'profiles.toml',
-  prefs:      'prefs.toml',
-  about:      'about',
+  connection:  'connection.toml',
+  profiles:    'profiles.toml',
+  prefs:       'prefs.toml',
+  hidden_mode: 'hidden_mode.toml',
+  about:       'about',
 };
 
 let currentNav = 'connection';
@@ -679,6 +680,64 @@ async function copyApiKey() {
   }
 }
 
+// ---------- Hidden-mode task history ----------
+async function renderHiddenModeHistory(rowsArg) {
+  const tbody = $('hiddenModeHistoryBody');
+  if (!tbody) return;
+  let rows = rowsArg;
+  if (!Array.isArray(rows)) {
+    try {
+      const stored = await chrome.storage.local.get(['avTaskHistory']);
+      rows = Array.isArray(stored.avTaskHistory) ? stored.avTaskHistory : [];
+    } catch (_) {
+      rows = [];
+    }
+  }
+
+  // Sidebar count badge — only show when non-zero so the badge slot stays
+  // tidy on first install.
+  const countBadge = $('hiddenModeTaskCount');
+  if (countBadge) {
+    if (rows.length > 0) {
+      countBadge.textContent = String(rows.length);
+      countBadge.removeAttribute('hidden');
+    } else {
+      countBadge.setAttribute('hidden', '');
+    }
+  }
+
+  if (rows.length === 0) {
+    tbody.innerHTML = `
+      <tr class="empty-row">
+        <td colspan="4" id="hiddenModeHistoryEmpty">no tasks yet — input a code in the side panel</td>
+      </tr>
+    `;
+    return;
+  }
+
+  const html = rows.map(row => {
+    const code     = row.code || '?';
+    const url      = row.url  || '';
+    const status   = row.status || 'unknown';
+    const submitTs = row.submittedAt ? new Date(row.submittedAt) : null;
+    const submitDisplay = submitTs ? submitTs.toLocaleString() : '';
+    const statusText = status === 'failed' && row.message
+      ? `${status}: ${row.message}`
+      : status;
+    return `
+      <tr class="status-${escapeAttr(status)}">
+        <td class="col-code">${escapeHtml(code)}</td>
+        <td class="col-submitted">${escapeHtml(submitDisplay)}</td>
+        <td class="col-status">${escapeHtml(statusText)}</td>
+        <td class="col-url"><a href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a></td>
+      </tr>
+    `;
+  }).join('');
+  tbody.innerHTML = html;
+}
+
+function escapeAttr(s) { return escapeHtml(s); }
+
 // ---------- Init ----------
 document.addEventListener('DOMContentLoaded', async () => {
   i18n = (typeof window !== 'undefined' && window.WV2N_I18N) ? window.WV2N_I18N : null;
@@ -778,6 +837,28 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('hiddenModeUrlTemplate').addEventListener('blur', async () => {
     await savePreferences();
   });
+
+  // Hidden-mode task history table — single source of truth is
+  // chrome.storage.local.avTaskHistory, written by background.js. Initial
+  // render + live updates via storage.onChanged so concurrent fetches
+  // appear without manual refresh.
+  await renderHiddenModeHistory();
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === 'local' && changes.avTaskHistory) {
+      renderHiddenModeHistory(changes.avTaskHistory.newValue || []);
+    }
+  });
+  const clearBtn = $('hiddenModeHistoryClearBtn');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', async () => {
+      try {
+        await chrome.storage.local.set({ avTaskHistory: [] });
+        // storage.onChanged listener will re-render. Defensive immediate
+        // render in case the listener race lands after the user clicks.
+        renderHiddenModeHistory([]);
+      } catch (_) { /* ignore */ }
+    });
+  }
   $('uiLanguage').addEventListener('change', async () => {
     await savePreferences();
     applyUiLanguage(($('uiLanguage').value || '').trim());

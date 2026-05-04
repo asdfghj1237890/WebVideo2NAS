@@ -292,6 +292,68 @@ input:focus-visible, select:focus-visible { outline: none; }
   height: 26px;
   font-weight: 700;
   transition: color 320ms;
+  display: flex; align-items: center; gap: 10px;
+}
+.section-head .inline-btn {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* Hidden-mode task history table — lives at the bottom of hidden_mode.toml.
+   Read-only view of chrome.storage.local.avTaskHistory; row colour echoes
+   the side panel's status hues (warn for pending, accent for sent, err
+   for failed) so the visual language stays consistent across the two
+   surfaces that show this data. */
+.hidden-mode-table-wrap {
+  margin-top: 8px;
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  background: var(--bg0);
+  overflow: hidden;
+}
+.hidden-mode-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  table-layout: fixed;
+}
+.hidden-mode-table thead th {
+  text-align: left;
+  padding: 8px 10px;
+  font-weight: 600;
+  color: var(--text-mid);
+  border-bottom: 1px solid var(--glass-border);
+  background: var(--bg1, rgba(255,255,255,0.02));
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+}
+.hidden-mode-table tbody td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--glass-border);
+  color: var(--text);
+  vertical-align: top;
+  word-break: break-all;
+}
+.hidden-mode-table tbody tr:last-child td { border-bottom: none; }
+.hidden-mode-table .col-code      { width: 22%; font-weight: 600; }
+.hidden-mode-table .col-submitted { width: 22%; color: var(--text-dim); }
+.hidden-mode-table .col-status    { width: 22%; }
+.hidden-mode-table .col-url       { width: 34%; }
+.hidden-mode-table .col-url a {
+  color: var(--text-mid); text-decoration: none;
+}
+.hidden-mode-table .col-url a:hover { color: var(--accent); text-decoration: underline; }
+
+.hidden-mode-table tr.status-pending .col-status { color: var(--warn, oklch(78% 0.12 75)); }
+.hidden-mode-table tr.status-sent    .col-status { color: var(--accent); font-weight: 600; }
+.hidden-mode-table tr.status-failed  .col-status { color: var(--err, oklch(70% 0.18 25)); }
+
+.hidden-mode-table tr.empty-row td {
+  color: var(--text-dim);
+  text-align: center;
+  font-style: italic;
+  padding: 20px 10px;
 }
 .spacer { height: 26px; }
 .kv {
