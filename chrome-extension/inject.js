@@ -122,4 +122,53 @@
     });
     return origSend.apply(this, arguments);
   };
+
+  // --- Patch JSON.parse (v2.3.18 deepsearch port from CocoCut) ---
+  // The fetch/XHR scans above only look at the first 500 bytes of a
+  // response and only fire when the body STARTS with #EXTM3U or <MPD.
+  // Many sites wrap the manifest URL inside a JSON API response, e.g.
+  //   {"video": {"hls": "https://cdn.example.com/.../master.m3u8"}}
+  // — those URLs never appear at byte 0 of the response, so they're
+  // missed. CocoCut's deepsearch hooks JSON.parse and walks every
+  // parsed object looking for m3u8/mpd URLs in any string field. We
+  // port the same idea here. Worker / AES-key hooks from CocoCut are
+  // intentionally NOT ported (Worker injection is fragile across
+  // origins; AES keys are usually fetched via #EXT-X-KEY URI which
+  // we already capture).
+  var MEDIA_URL_RE = /https?:\/\/[^\s"'<>\\]+\.(m3u8|mpd)(\?[^\s"'<>\\]*)?/gi;
+  var SCAN_MAX_DEPTH = 10;
+
+  function scanForMediaUrls(value, depth) {
+    if (depth === undefined) depth = 0;
+    if (depth > SCAN_MAX_DEPTH) return;
+    if (typeof value === 'string') {
+      var m;
+      MEDIA_URL_RE.lastIndex = 0;  // global regex — reset state per call
+      while ((m = MEDIA_URL_RE.exec(value)) !== null) {
+        notify(m[0], m[1].toLowerCase());
+      }
+      return;
+    }
+    if (typeof value !== 'object' || value === null) return;
+    if (Array.isArray(value)) {
+      for (var i = 0; i < value.length; i++) scanForMediaUrls(value[i], depth + 1);
+      return;
+    }
+    for (var key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        scanForMediaUrls(value[key], depth + 1);
+      }
+    }
+  }
+
+  var origJsonParse = JSON.parse;
+  JSON.parse = function() {
+    var result = origJsonParse.apply(this, arguments);
+    try {
+      scanForMediaUrls(result);
+    } catch (_) {
+      // Never break the page on scan errors — this is a passive observer.
+    }
+    return result;
+  };
 })();
