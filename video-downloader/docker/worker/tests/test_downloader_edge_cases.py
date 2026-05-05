@@ -265,6 +265,49 @@ def test_backoff_uses_jitter(monkeypatch, tmp_path):
     assert 4.0 <= sleeps[2] < 8.0
 
 
+# --- fMP4 (CMAF) acceptance ------------------------------------------------
+#
+# v2.3.12: _is_valid_ts_content was generalized to also accept fragmented MP4
+# segments (.m4s — ISO base media file format box layout). These tests pin
+# the box-type whitelist so future renames or "cleanup" don't accidentally
+# revert HLS-fMP4 support.
+
+
+def _make_fmp4_segment(box_type: bytes, payload_size: int = 256) -> bytes:
+    """Build a minimal fMP4 box: [4-byte length][4-byte type][payload]."""
+    assert len(box_type) == 4
+    total_len = 8 + payload_size
+    return total_len.to_bytes(4, byteorder='big') + box_type + b'\x00' * payload_size
+
+
+@pytest.mark.parametrize("box_type", [b'moof', b'styp', b'ftyp', b'sidx', b'mdat', b'moov'])
+def test_is_valid_ts_content_accepts_fmp4_boxes(tmp_path, box_type):
+    d = SegmentDownloader(segments=[], output_dir=str(tmp_path), session=object())
+    ok, reason = d._is_valid_ts_content(_make_fmp4_segment(box_type))
+    assert ok is True, f"box type {box_type!r} should be accepted, got reason: {reason}"
+    assert reason == ""
+
+
+def test_is_valid_ts_content_rejects_unknown_4cc(tmp_path):
+    """A random 4-char string at offset 4 is NOT a valid box type."""
+    d = SegmentDownloader(segments=[], output_dir=str(tmp_path), session=object())
+    fake = (200).to_bytes(4, byteorder='big') + b'XXXX' + b'\x00' * 200
+    ok, reason = d._is_valid_ts_content(fake)
+    assert ok is False
+    assert 'fMP4' in reason or 'TS' in reason
+
+
+def test_is_valid_ts_content_block_page_takes_precedence_over_fmp4(tmp_path):
+    """If the response is HTML but coincidentally has 'moof' at offset 4
+    (unlikely but defensive), the block-page check should still flag it."""
+    d = SegmentDownloader(segments=[], output_dir=str(tmp_path), session=object())
+    # HTML response — block-page check fires before fMP4 check
+    html = b'<!DOCTYPE html>' + b' ' * 300
+    ok, reason = d._is_valid_ts_content(html)
+    assert ok is False
+    assert 'HTML' in reason
+
+
 def test_backoff_jitter_not_constant(monkeypatch, tmp_path):
     """Across multiple invocations, the same retry_count must not always
     sleep the same value — that's the whole point of jitter."""

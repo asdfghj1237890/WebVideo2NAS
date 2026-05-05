@@ -163,3 +163,85 @@ def test_merge_omits_t_when_target_is_none(tmp_path, monkeypatch):
     ok = merge_segments([str(seg)], str(output), concat_dir=str(tmp_path), try_re_encode=False)
     assert ok is True
     assert "-t" not in captured["instances"][0].command
+
+
+# --- HLS-fMP4 (CMAF) merge -------------------------------------------------
+#
+# v2.3.12: ffmpeg_wrapper learned to merge .m4s segments. Two things differ
+# from the TS path: stdin format flag is `mp4` not `mpegts`, and the AAC
+# ADTS-to-ASC bitstream filter is omitted (TS-specific). The init segment
+# (referenced by m3u8 #EXT-X-MAP) is prepended so ffmpeg sees ftyp+moov
+# before any moof/mdat.
+
+
+def test_merge_uses_mp4_stdin_format_for_fmp4(tmp_path, monkeypatch):
+    """is_fmp4=True → -f mp4 (not mpegts) and skip aac_adtstoasc."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    init = tmp_path / "init.mp4"
+    seg1 = tmp_path / "segment_00000.m4s"
+    seg2 = tmp_path / "segment_00001.m4s"
+    init.write_bytes(b"ftypisom" * 8)  # placeholder init bytes
+    seg1.write_bytes(b"moofdata" * 8)
+    seg2.write_bytes(b"moofdata" * 8)
+
+    output = tmp_path / "out.mp4"
+    captured = _patch_popen(monkeypatch)
+
+    ok = merge_segments(
+        [str(seg1), str(seg2)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+        is_fmp4=True,
+        init_segment_path=str(init),
+    )
+    assert ok is True
+
+    cmd = captured["instances"][0].command
+    # fMP4 stdin format
+    assert "-f" in cmd and cmd[cmd.index("-f") + 1] == "mp4", \
+        f"expected -f mp4 for fMP4, got command: {cmd}"
+    # aac_adtstoasc must NOT be present (it's TS-specific and breaks fMP4)
+    assert "aac_adtstoasc" not in cmd, "aac_adtstoasc must be omitted for fMP4"
+    # Init segment bytes must come BEFORE media segments in stdin
+    piped = captured["instances"][0].stdin.captured
+    assert piped == init.read_bytes() + seg1.read_bytes() + seg2.read_bytes()
+
+
+def test_merge_keeps_mpegts_path_intact_for_ts(tmp_path, monkeypatch):
+    """Sanity: is_fmp4=False (default) preserves the existing TS pipeline,
+    including the aac_adtstoasc bitstream filter."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+    captured = _patch_popen(monkeypatch)
+
+    ok = merge_segments([str(seg)], str(output), concat_dir=str(tmp_path), try_re_encode=False)
+    assert ok is True
+    cmd = captured["instances"][0].command
+    assert cmd[cmd.index("-f") + 1] == "mpegts"
+    assert "aac_adtstoasc" in cmd
+
+
+def test_merge_with_re_encode_skipped_for_fmp4(tmp_path, monkeypatch):
+    """The re-encode fallback uses the concat demuxer, which can't handle
+    .m4s segments without inline init. is_fmp4 → return False without
+    invoking ffmpeg, so the caller surfaces the byte-concat result."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.m4s"
+    seg.write_bytes(b"moofdata" * 8)
+    output = tmp_path / "out.mp4"
+
+    merger = FFmpegMerger(
+        [str(seg)], str(output),
+        concat_dir=str(tmp_path),
+        is_fmp4=True,
+    )
+    # Should return False immediately without ever spawning ffmpeg
+    captured = _patch_popen(monkeypatch)
+    assert merger.merge_with_re_encode() is False
+    assert captured["instances"] == [], "ffmpeg must not be invoked for fMP4 re-encode path"

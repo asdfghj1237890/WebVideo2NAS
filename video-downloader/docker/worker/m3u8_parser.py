@@ -215,6 +215,18 @@ class M3U8Parser:
         total_duration = 0.0
 
         media_sequence = getattr(playlist, "media_sequence", 0) or 0
+
+        # HLS-fMP4 / CMAF: an #EXT-X-MAP box declares an init segment that
+        # carries the moov/ftyp boxes the media segments need to decode.
+        # The m3u8 lib exposes it via segment.init_section (same object
+        # forwards across segments until a new #EXT-X-MAP appears). We only
+        # capture the FIRST init segment URL — multi-init streams are rare
+        # and would need per-segment init handling that we don't do today.
+        init_segment_url: Optional[str] = None
+        first_init = playlist.segments[0].init_section if playlist.segments else None
+        if first_init is not None and first_init.uri:
+            init_segment_url = urljoin(playlist.base_uri or self.url, first_init.uri)
+            logger.info(f"Detected fMP4 init segment: {init_segment_url.split('?', 1)[0]}")
         
         for segment in playlist.segments:
             # Get absolute URL for segment
@@ -271,6 +283,15 @@ class M3U8Parser:
         if has_encryption:
             logger.info(f"Playlist is encrypted with {encryption_info['method']}")
         
+        # Heuristic: if either an init segment is present OR the first segment
+        # URL has an fMP4 extension, we treat the whole playlist as fMP4.
+        # Downloader uses this to skip the TS sync-byte validation, and
+        # ffmpeg_wrapper uses it to switch the stdin format flag.
+        is_fmp4 = init_segment_url is not None or any(
+            seg['url'].split('?', 1)[0].lower().endswith(('.m4s', '.mp4', '.cmfv', '.cmfa'))
+            for seg in segments[:1]
+        )
+
         return {
             'segments': segments,
             'duration': int(total_duration),
@@ -279,7 +300,9 @@ class M3U8Parser:
             'has_encryption': has_encryption,
             'encryption_key_uri': encryption_info.get('key_uri') if encryption_info else None,
             'encryption_iv': encryption_info.get('iv') if encryption_info else None,
-            'base_url': playlist.base_uri or self.url
+            'base_url': playlist.base_uri or self.url,
+            'is_fmp4': is_fmp4,
+            'init_segment_url': init_segment_url,
         }
     
     def _get_encryption_info(self, playlist: m3u8.M3U8) -> Optional[Dict]:

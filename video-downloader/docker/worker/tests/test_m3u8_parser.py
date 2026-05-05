@@ -120,3 +120,73 @@ seg0.ts
     parser = M3U8Parser(url, headers={}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
     result = parser._parse_media_playlist(playlist, content)
     assert result["segments"][0]["key"]["iv"] is None
+
+
+# --- HLS-fMP4 (CMAF) detection ---------------------------------------------
+#
+# v2.3.12: parser exposes init_segment_url + is_fmp4 so the worker knows to
+# download the #EXT-X-MAP target and pass is_fmp4=True to ffmpeg_wrapper.
+
+
+def test_parse_media_playlist_extracts_init_segment_for_fmp4():
+    url = "https://cdn.example.com/vod/playlist.m3u8"
+    content = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:6
+#EXT-X-MAP:URI=\"init.mp4\"
+#EXTINF:5.0,
+seg-1-v1-a1.m4s
+#EXTINF:5.0,
+seg-2-v1-a1.m4s
+#EXT-X-ENDLIST
+"""
+    playlist = m3u8.loads(content, uri=url)
+    parser = M3U8Parser(url, headers={}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
+    result = parser._parse_media_playlist(playlist, content)
+
+    assert result["is_fmp4"] is True
+    assert result["init_segment_url"] == "https://cdn.example.com/vod/init.mp4"
+    assert result["segment_count"] == 2
+    assert result["segments"][0]["url"].endswith(".m4s")
+
+
+def test_parse_media_playlist_detects_fmp4_from_extension_without_init():
+    """Some streams use .m4s/.mp4 extensions but omit #EXT-X-MAP. Detect via
+    extension fallback so the downloader still routes to fMP4 validation."""
+    url = "https://cdn.example.com/vod/playlist.m3u8"
+    content = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:6
+#EXTINF:5.0,
+chunk-1.m4s
+#EXTINF:5.0,
+chunk-2.m4s
+#EXT-X-ENDLIST
+"""
+    playlist = m3u8.loads(content, uri=url)
+    parser = M3U8Parser(url, headers={}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
+    result = parser._parse_media_playlist(playlist, content)
+
+    assert result["is_fmp4"] is True
+    assert result["init_segment_url"] is None  # no #EXT-X-MAP
+
+
+def test_parse_media_playlist_marks_classic_ts_as_not_fmp4():
+    """Plain .ts MPEG-TS playlists must not be flagged as fMP4 — would route
+    them through the wrong ffmpeg stdin format."""
+    url = "https://cdn.example.com/vod/playlist.m3u8"
+    content = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+seg0.ts
+#EXTINF:10,
+seg1.ts
+#EXT-X-ENDLIST
+"""
+    playlist = m3u8.loads(content, uri=url)
+    parser = M3U8Parser(url, headers={}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
+    result = parser._parse_media_playlist(playlist, content)
+
+    assert result["is_fmp4"] is False
+    assert result["init_segment_url"] is None

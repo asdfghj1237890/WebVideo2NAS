@@ -14,6 +14,7 @@ import shutil
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
+from typing import Optional
 from urllib.parse import urlparse
 import signal
 import ipaddress
@@ -1041,6 +1042,61 @@ class DownloadWorker:
             logger.error(f"Job {job_id} failed: {e}", exc_info=True)
             self._handle_job_failure(job_id, job, str(e))
     
+    def _download_init_segment(
+        self,
+        url: str,
+        headers: dict,
+        session,
+        temp_dir: str,
+    ) -> Optional[str]:
+        """Download the HLS-fMP4 init segment (referenced by #EXT-X-MAP).
+
+        The init segment carries ftyp/moov boxes that the media segments
+        need to decode. It is small (typically <50KB) and downloaded just
+        once per job, before the parallel media-segment download starts.
+
+        Returns the on-disk path on success, None on failure. Validates the
+        first bytes look like an MP4 box (`ftyp` at offset 4) — if it
+        doesn't, the source is probably a block page or wrong content type
+        and there's no point continuing.
+
+        Retries up to 3 times with simple backoff. No Referer-strategy
+        fallback (the same Referer that works for media segments works for
+        init), no concurrency throttle (one request, can't burst).
+        """
+        from pathlib import Path
+        init_path = Path(temp_dir) / "init.mp4"
+        max_attempts = 3
+        last_err: Optional[str] = None
+        for attempt in range(max_attempts):
+            try:
+                response = session.get(
+                    url,
+                    headers=headers,
+                    timeout=30,
+                    stream=False,
+                )
+                response.raise_for_status()
+                content = response.content
+                if not content or len(content) < 16:
+                    raise ValueError(f"Init segment too small: {len(content)} bytes")
+                # Sanity: an init segment must start with 'ftyp' box at offset 4
+                if content[4:8] != b'ftyp':
+                    raise ValueError(
+                        f"Init segment doesn't look like fMP4 (offset 4 = {content[4:8]!r}, expected 'ftyp')"
+                    )
+                with open(init_path, 'wb') as f:
+                    f.write(content)
+                logger.info(f"Init segment downloaded: {len(content)} bytes -> {init_path}")
+                return str(init_path)
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"Init segment download attempt {attempt + 1}/{max_attempts} failed: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(1.0 * (attempt + 1))
+        logger.error(f"Init segment download failed after {max_attempts} attempts: {last_err}")
+        return None
+
     def _process_m3u8_download(self, job_id: str, job: dict):
         """Process m3u8 stream download"""
         from m3u8_parser import parse_m3u8
@@ -1202,14 +1258,28 @@ class DownloadWorker:
             # Step 2: Download segments (5% - 85%)
             logger.info("Step 2: Downloading segments")
             temp_dir = tempfile.mkdtemp(prefix=f"m3u8_{job_id}_")
-            
+
             # For segments, keep the original source page Referer (as browsers do)
             # The downloader will try multiple Referer strategies if this fails
             segment_headers = headers.copy()
-            
+
             # Log what Referer/Origin we're using
             logger.info(f"Segment Referer: {segment_headers.get('Referer', 'None')}")
             logger.info(f"Segment Origin: {segment_headers.get('Origin', 'None')}")
+
+            # HLS-fMP4 / CMAF: download the init segment ONCE before media
+            # segments. Required for ffmpeg to decode the moof/mdat chunks
+            # that follow — without the init segment's moov/ftyp, the merged
+            # output is undecodable.
+            init_segment_path: Optional[str] = None
+            init_segment_url = playlist_info.get('init_segment_url')
+            if init_segment_url:
+                logger.info(f"Step 2a: Fetching fMP4 init segment from {init_segment_url.split('?', 1)[0]}")
+                init_segment_path = self._download_init_segment(
+                    init_segment_url, segment_headers, shared_session, temp_dir
+                )
+                if init_segment_path is None:
+                    raise Exception("Failed to download fMP4 init segment — cannot merge fragmented MP4 stream")
             
             downloader = SegmentDownloader(
                 segments=playlist_info['segments'],
@@ -1331,12 +1401,16 @@ class DownloadWorker:
 
             # Merge segments. Hard-cap output to the m3u8's declared total so anti-leech
             # streams (whose .ts files pad past EXTINF) don't bloat the merged file.
+            # For HLS-fMP4: prepend init segment (already downloaded above) and switch
+            # ffmpeg's stdin format flag.
             success = merge_segments(
                 segment_files=segment_files,
                 output_file=output_file,
                 threads=int(os.getenv('FFMPEG_THREADS', 4)),
                 concat_dir=temp_dir,
                 target_duration=playlist_info.get('duration'),
+                is_fmp4=playlist_info.get('is_fmp4', False),
+                init_segment_path=init_segment_path,
             )
             
             if not success:

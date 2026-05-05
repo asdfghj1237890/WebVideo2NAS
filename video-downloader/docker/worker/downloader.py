@@ -124,12 +124,17 @@ class SegmentDownloader:
     
     def _is_valid_ts_content(self, data: bytes) -> tuple[bool, str]:
         """
-        Validate if the content is a valid MPEG-TS file.
+        Validate if the content is a valid downloaded media segment.
+
+        Accepts both MPEG-TS (.ts) and fragmented MP4 / CMAF (.m4s, .mp4)
+        — name kept for back-compat with existing tests, but the function
+        is no longer TS-only as of v2.3.12.
+
         Returns (is_valid, error_reason) tuple.
         """
         if not data or len(data) < TS_PACKET_SIZE:
             return False, "Content too small"
-        
+
         # Check for image files (anti-hotlinking protection)
         if data[:3] == JPEG_MAGIC:
             return False, "Server returned JPEG image (anti-hotlinking protection)"
@@ -137,28 +142,34 @@ class SegmentDownloader:
             return False, "Server returned PNG image (anti-hotlinking protection)"
         if data[:4] == GIF_MAGIC:
             return False, "Server returned GIF image (anti-hotlinking protection)"
-        
+
         # Check if it starts with HTML (error page)
         if data[:5].lower() in (b'<!doc', b'<html', b'<?xml'):
             return False, "Server returned HTML error page"
-        
+
         # Check for common error text patterns
         lower_start = data[:500].lower()
         if b'error' in lower_start or b'forbidden' in lower_start or b'denied' in lower_start:
             return False, "Server returned error response"
-        
-        # Check for TS sync byte at expected positions
-        # TS packets are 188 bytes, sync byte should appear at 0, 188, 376, etc.
+
+        # Fragmented MP4 / CMAF segment: ISO base media file format box layout
+        # is [4-byte length][4-byte box type][...]. Media segments typically
+        # start with 'moof' (movie fragment) or 'styp' (segment type); init
+        # segments start with 'ftyp'. Treat any of these as valid media.
+        if len(data) >= 8 and data[4:8] in (
+            b'moof', b'styp', b'ftyp', b'sidx', b'mdat', b'moov'
+        ):
+            return True, ""
+
+        # MPEG-TS: sync byte 0x47 at 188-byte packet boundaries
         sync_count = 0
         for i in range(0, min(len(data), TS_PACKET_SIZE * 5), TS_PACKET_SIZE):
             if data[i:i+1] == TS_SYNC_BYTE:
                 sync_count += 1
-        
-        # If we found sync bytes at expected positions, it's likely valid
         if sync_count >= 2:
             return True, ""
-        
-        return False, "Invalid TS format (no sync bytes found)"
+
+        return False, "Invalid segment format (not TS sync bytes, not fMP4 box)"
 
     def _is_obviously_blocked_response(self, data: bytes, content_type: str = "") -> tuple[bool, str]:
         """

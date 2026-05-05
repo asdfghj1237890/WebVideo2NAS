@@ -24,7 +24,14 @@ class FFmpegMerger:
         threads: int = 4,
         concat_dir: Optional[str] = None,
         target_duration: Optional[int] = None,
+        is_fmp4: bool = False,
+        init_segment_path: Optional[str] = None,
     ):
+        # For HLS-fMP4: the init segment (ftyp + moov) MUST come first in
+        # the byte-concat stream — without it the moof/mdat fragments are
+        # undecodable. Caller passes the on-disk path and we prepend it.
+        if init_segment_path:
+            segment_files = [init_segment_path] + list(segment_files)
         self.segment_files = segment_files
         self.output_file = output_file
         self.threads = threads
@@ -32,8 +39,9 @@ class FFmpegMerger:
         # Hard-cap output duration to the m3u8's declared total so anti-leech
         # streams that pad each .ts beyond its EXTINF don't bloat the merged file.
         self.target_duration = target_duration
+        self.is_fmp4 = is_fmp4
         self.ffmpeg_path: Optional[str] = None
-        
+
         # Verify FFmpeg is available
         if not self._check_ffmpeg():
             raise RuntimeError("FFmpeg not found in system PATH")
@@ -80,16 +88,31 @@ class FFmpegMerger:
             logger.error("No segment files provided")
             return False
 
-        logger.info(f"Merging {len(self.segment_files)} segments into {self.output_file} via stdin byte-concat")
+        # HLS-fMP4 (CMAF) and HLS-TS need different stdin format flags and
+        # different bitstream filters. fMP4 audio is already in AAC-ASC
+        # form (no ADTS headers) so the aac_adtstoasc filter would error.
+        if self.is_fmp4:
+            stdin_format = 'mp4'
+            container_label = 'fragmented MP4'
+        else:
+            stdin_format = 'mpegts'
+            container_label = 'MPEG-TS'
+        logger.info(
+            f"Merging {len(self.segment_files)} segments ({container_label}) "
+            f"into {self.output_file} via stdin byte-concat"
+        )
 
         command = [
             self.ffmpeg_path or 'ffmpeg',
-            '-f', 'mpegts',           # Tell ffmpeg the stdin stream is MPEG-TS
+            '-f', stdin_format,       # Tell ffmpeg the stdin stream format
             '-i', 'pipe:0',           # Read from stdin
             '-c', 'copy',             # No re-encoding
-            '-bsf:a', 'aac_adtstoasc', # Repackage AAC ADTS → ASC for mp4 container
-            '-threads', str(self.threads),
         ]
+        if not self.is_fmp4:
+            # Repackage AAC ADTS → ASC for mp4 container (TS-only — fMP4
+            # already ships AAC in ASC form).
+            command += ['-bsf:a', 'aac_adtstoasc']
+        command += ['-threads', str(self.threads)]
         if self.target_duration and self.target_duration > 0:
             command += ['-t', str(self.target_duration)]
             logger.info(f"Capping output duration at {self.target_duration}s (from m3u8 EXTINF total)")
@@ -189,7 +212,20 @@ class FFmpegMerger:
         """
         if not self.segment_files:
             return False
-        
+
+        # The concat demuxer treats each input as an independent decodable
+        # stream. fMP4 .m4s segments aren't decodable alone (they need the
+        # init segment's moov/ftyp), so the concat demuxer would error per
+        # segment. Skip the re-encode fallback for fMP4 and let the byte-
+        # concat result propagate.
+        if self.is_fmp4:
+            logger.warning(
+                "Re-encode fallback not supported for fMP4 streams "
+                "(concat demuxer can't parse .m4s without inline init). "
+                "Returning False so caller can surface the byte-concat error."
+            )
+            return False
+
         logger.info("Attempting merge with re-encoding (slower)")
         
         # Use same concat file location as merge()
@@ -247,6 +283,8 @@ def merge_segments(
     try_re_encode: bool = True,
     concat_dir: Optional[str] = None,
     target_duration: Optional[int] = None,
+    is_fmp4: bool = False,
+    init_segment_path: Optional[str] = None,
 ) -> bool:
     """
     Convenience function to merge segments
@@ -260,11 +298,22 @@ def merge_segments(
         target_duration: Optional hard-cap (seconds) on output. Pass the m3u8 EXTINF
             total to defend against anti-leech streams whose .ts files contain padding
             beyond their declared duration.
+        is_fmp4: True for HLS-fMP4 / CMAF (.m4s segments). Switches ffmpeg's
+            stdin format flag from mpegts to mp4 and skips the aac_adtstoasc
+            bitstream filter (which is TS-specific and would error on fMP4).
+        init_segment_path: For HLS-fMP4 only. Path to the init segment
+            (referenced by m3u8 #EXT-X-MAP) — prepended to segment_files so
+            ffmpeg sees ftyp+moov boxes before any moof/mdat.
 
     Returns:
         True if successful
     """
-    merger = FFmpegMerger(segment_files, output_file, threads, concat_dir, target_duration=target_duration)
+    merger = FFmpegMerger(
+        segment_files, output_file, threads, concat_dir,
+        target_duration=target_duration,
+        is_fmp4=is_fmp4,
+        init_segment_path=init_segment_path,
+    )
     concat_file = Path(concat_dir or Path(output_file).parent) / "concat_list.txt"
     
     try:
