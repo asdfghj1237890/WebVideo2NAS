@@ -110,6 +110,9 @@ services:
       - HOST_CONCURRENCY_CAP=${HOST_CONCURRENCY_CAP:-}
       - HOST_CONCURRENCY_OVERRIDES=${HOST_CONCURRENCY_OVERRIDES:-}
       - HOST_CONCURRENCY_TTL=${HOST_CONCURRENCY_TTL:-300}
+      # HTTP/1.1 force (v2.3.14+). Default off — let curl negotiate H2 via
+      # ALPN to match real Chrome behavior. See .env.example for why.
+      - FORCE_HTTP1_1=${FORCE_HTTP1_1:-false}
       - STORAGE_PATH=/downloads
     volumes:
       - /volume1/video-downloader/downloads:/downloads
@@ -149,6 +152,9 @@ services:
       - HOST_CONCURRENCY_CAP=${HOST_CONCURRENCY_CAP:-}
       - HOST_CONCURRENCY_OVERRIDES=${HOST_CONCURRENCY_OVERRIDES:-}
       - HOST_CONCURRENCY_TTL=${HOST_CONCURRENCY_TTL:-300}
+      # HTTP/1.1 force (v2.3.14+). Default off — let curl negotiate H2 via
+      # ALPN to match real Chrome behavior. See .env.example for why.
+      - FORCE_HTTP1_1=${FORCE_HTTP1_1:-false}
       - STORAGE_PATH=/downloads
     volumes:
       - /volume1/video-downloader/downloads:/downloads
@@ -188,6 +194,9 @@ services:
       - HOST_CONCURRENCY_CAP=${HOST_CONCURRENCY_CAP:-}
       - HOST_CONCURRENCY_OVERRIDES=${HOST_CONCURRENCY_OVERRIDES:-}
       - HOST_CONCURRENCY_TTL=${HOST_CONCURRENCY_TTL:-300}
+      # HTTP/1.1 force (v2.3.14+). Default off — let curl negotiate H2 via
+      # ALPN to match real Chrome behavior. See .env.example for why.
+      - FORCE_HTTP1_1=${FORCE_HTTP1_1:-false}
       - STORAGE_PATH=/downloads
     volumes:
       - /volume1/video-downloader/downloads:/downloads

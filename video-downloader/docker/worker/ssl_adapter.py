@@ -54,6 +54,23 @@ def tls_verify_enabled() -> bool:
     return True
 
 
+def _force_http1_1() -> bool:
+    """
+    Whether to force HTTP/1.1 instead of letting curl negotiate.
+
+    Default: False — let ALPN negotiate (modern CDNs and real Chrome speak
+    HTTP/2). Forcing HTTP/1.1 was a v1.x workaround for a CDN that returned
+    'keep-alive' headers (illegal in HTTP/2). That CDN isn't relevant any
+    more, and the force was actively counterproductive against anti-bot
+    systems like phncdn that fingerprint on TLS+HTTP-version: a request
+    with chrome TLS impersonation but HTTP/1.1 transport doesn't match any
+    real browser, which is itself a bot signal.
+
+    Set FORCE_HTTP1_1=true only if you hit a CDN that genuinely breaks H2.
+    """
+    return _env_flag("FORCE_HTTP1_1", False)
+
+
 class LegacySSLAdapter(HTTPAdapter):
     """
     HTTPAdapter with custom SSL context that supports legacy ciphers.
@@ -106,10 +123,12 @@ class BrowserSession:
         # TLS verification is secure-by-default; opt-out via env (see tls_verify_enabled()).
         if 'verify' not in kwargs:
             kwargs['verify'] = tls_verify_enabled()
-        # Force HTTP/1.1 to avoid issues with servers that send invalid HTTP/2 headers
-        # Some CDNs return 'keep-alive' header which is invalid in HTTP/2
-        from curl_cffi.const import CurlHttpVersion
-        if 'http_version' not in kwargs:
+        # HTTP version: default to ALPN negotiation (lets curl pick H2 for
+        # CDNs that support it, which matches real Chrome behavior). The
+        # legacy "force H1.1" path is opt-in via FORCE_HTTP1_1 env — see
+        # _force_http1_1() docstring for the why.
+        if 'http_version' not in kwargs and _force_http1_1():
+            from curl_cffi.const import CurlHttpVersion
             kwargs['http_version'] = CurlHttpVersion.V1_1
         return kwargs
     
