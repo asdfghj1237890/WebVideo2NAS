@@ -15,8 +15,10 @@ from downloader import (
     _TRANSPORT_ERRORS,
     _PerHostAdaptiveDelay,
     _adaptive_delay,
+    _reset_host_headers_for_tests,
     classify_failures,
     explain_failures,
+    get_host_headers_for,
 )
 
 
@@ -28,8 +30,10 @@ def _reset_adaptive_delay_singleton():
     so backoff/jitter tests don't pick up extra sleeps from earlier
     tests' state pollution."""
     _adaptive_delay.reset_for_tests()
+    _reset_host_headers_for_tests()
     yield
     _adaptive_delay.reset_for_tests()
+    _reset_host_headers_for_tests()
 
 
 def _make_valid_ts_sample(packet_count: int = 5) -> bytes:
@@ -950,6 +954,112 @@ def test_download_all_cleans_pacing_state_even_on_callback_exception(tmp_path):
         "download_all's finally must clear pacing state even when an "
         "exception propagates out of the with-block"
     )
+
+
+# --- v2.3.17: per-host header overrides ---------------------------------
+
+
+def test_get_host_headers_for_returns_empty_when_no_env(monkeypatch):
+    """No HOST_HEADERS_FILE env → no overrides, no warning, no exception."""
+    monkeypatch.delenv("HOST_HEADERS_FILE", raising=False)
+    assert get_host_headers_for("any.host.test") == {}
+
+
+def test_get_host_headers_for_returns_empty_when_file_missing(monkeypatch, tmp_path):
+    """HOST_HEADERS_FILE points to non-existent file → empty + log warning."""
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(tmp_path / "nope.json"))
+    assert get_host_headers_for("any.host.test") == {}
+
+
+def test_get_host_headers_for_exact_match(monkeypatch, tmp_path):
+    cfg = tmp_path / "headers.json"
+    cfg.write_text('{"phncdn.com": {"X-Custom": "abc"}}', encoding="utf-8")
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("phncdn.com") == {"X-Custom": "abc"}
+
+
+def test_get_host_headers_for_suffix_match(monkeypatch, tmp_path):
+    """phncdn.com config should match ev-h.phncdn.com (suffix)."""
+    cfg = tmp_path / "headers.json"
+    cfg.write_text('{"phncdn.com": {"X-Auth": "tok"}}', encoding="utf-8")
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("ev-h.phncdn.com") == {"X-Auth": "tok"}
+    assert get_host_headers_for("hv-h.phncdn.com") == {"X-Auth": "tok"}
+    assert get_host_headers_for("deep.sub.phncdn.com") == {"X-Auth": "tok"}
+
+
+def test_get_host_headers_for_longest_match_wins(monkeypatch, tmp_path):
+    """Specific subdomain config beats parent config."""
+    cfg = tmp_path / "headers.json"
+    cfg.write_text(
+        '{"phncdn.com": {"X-A": "parent"}, "ev-h.phncdn.com": {"X-A": "specific"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("ev-h.phncdn.com") == {"X-A": "specific"}
+    assert get_host_headers_for("hv-h.phncdn.com") == {"X-A": "parent"}  # falls back
+
+
+def test_get_host_headers_for_unrelated_host(monkeypatch, tmp_path):
+    cfg = tmp_path / "headers.json"
+    cfg.write_text('{"phncdn.com": {"X": "Y"}}', encoding="utf-8")
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("youtube.com") == {}
+
+
+def test_get_host_headers_for_does_not_match_substring(monkeypatch, tmp_path):
+    """`phncdn.com` must NOT match `fakephncdn.com` — only `.suffix` matches."""
+    cfg = tmp_path / "headers.json"
+    cfg.write_text('{"phncdn.com": {"X": "Y"}}', encoding="utf-8")
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("fakephncdn.com") == {}
+    assert get_host_headers_for("phncdn.com.evil.com") == {}
+
+
+def test_get_host_headers_for_invalid_json_returns_empty(monkeypatch, tmp_path):
+    """Malformed JSON → empty + warning, doesn't raise."""
+    cfg = tmp_path / "headers.json"
+    cfg.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("phncdn.com") == {}
+
+
+def test_get_host_headers_for_non_dict_root_returns_empty(monkeypatch, tmp_path):
+    """JSON parses but root is not an object — invalid, return empty."""
+    cfg = tmp_path / "headers.json"
+    cfg.write_text('["just", "an", "array"]', encoding="utf-8")
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("any.host") == {}
+
+
+def test_get_host_headers_for_skips_bad_entries(monkeypatch, tmp_path):
+    """Per-host entries with non-dict values are skipped, others kept."""
+    cfg = tmp_path / "headers.json"
+    cfg.write_text(
+        '{"good.host": {"X": "Y"}, "bad.host": "not a dict"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("good.host") == {"X": "Y"}
+    assert get_host_headers_for("bad.host") == {}
+
+
+def test_get_host_headers_for_lowercases_hostnames(monkeypatch, tmp_path):
+    """Config keys and lookup keys are case-insensitive."""
+    cfg = tmp_path / "headers.json"
+    cfg.write_text('{"PHNCDN.COM": {"X": "Y"}}', encoding="utf-8")
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    assert get_host_headers_for("phncdn.com") == {"X": "Y"}
+    assert get_host_headers_for("ev-h.PHNCDN.com") == {"X": "Y"}
 
 
 # --- v2.3.16: mobile_ua fallback strategy (CocoCut-inspired) -----------

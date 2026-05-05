@@ -3,6 +3,7 @@ Segment Downloader
 Multi-threaded downloader for m3u8 video segments
 """
 
+import json
 import logging
 import os
 import random
@@ -246,6 +247,111 @@ class _PerHostAdaptiveDelay:
 
 # Module singleton. Tests can call `reset_for_tests()` between cases.
 _adaptive_delay = _PerHostAdaptiveDelay()
+
+
+# --- Per-host header overrides (v2.3.17) ---------------------------------
+#
+# Some hosts need custom headers beyond what the extension captured —
+# e.g. an Authorization token for a CDN that rotates per-account, or a
+# fixed User-Agent that the operator knows works for one specific site.
+# Configured via HOST_HEADERS_FILE (path to JSON):
+#
+#   {
+#     "phncdn.com": {"User-Agent": "...", "X-Custom": "..."},
+#     "cdn.example.org": {"Authorization": "Bearer ..."}
+#   }
+#
+# Match: exact OR suffix (same as host_throttle's _resolve_cap), longest
+# match wins. Applied LAST in _try_download_with_headers so they beat
+# both defaults and strategy modifications — the user explicitly told us
+# "always send X for this host", we honor that across all referer probes.
+#
+# Loaded lazily on first use, cached for the worker's lifetime. Restart
+# the worker to pick up file changes.
+
+_HOST_HEADERS_BY_HOST: Optional[Dict[str, Dict[str, str]]] = None
+_HOST_HEADERS_LOAD_LOCK = threading.Lock()
+
+
+def _load_host_headers() -> Dict[str, Dict[str, str]]:
+    """Load HOST_HEADERS_FILE (JSON) and return host→headers mapping.
+
+    Returns {} on missing env, missing file, parse errors, or shape errors —
+    never raises. Logs warnings for bad input so operators can debug.
+    All hostnames are lowercased; all header names/values are coerced
+    to str.
+    """
+    path = os.environ.get('HOST_HEADERS_FILE')
+    if not path:
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        logger.warning(f"HOST_HEADERS_FILE={path} not found, no per-host header overrides")
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"HOST_HEADERS_FILE={path} could not be parsed: {e}; no per-host header overrides")
+        return {}
+
+    if not isinstance(raw, dict):
+        logger.warning(
+            f"HOST_HEADERS_FILE: expected JSON object at root, got {type(raw).__name__}; "
+            "no per-host header overrides"
+        )
+        return {}
+
+    cleaned: Dict[str, Dict[str, str]] = {}
+    for host, headers in raw.items():
+        if not isinstance(host, str) or not isinstance(headers, dict):
+            logger.warning(
+                f"HOST_HEADERS_FILE: bad entry for {host!r} (host must be str, "
+                f"headers must be dict), skipped"
+            )
+            continue
+        cleaned[host.strip().lower()] = {str(k): str(v) for k, v in headers.items()}
+    if cleaned:
+        logger.info(
+            f"Loaded per-host header overrides from {path}: "
+            f"{len(cleaned)} host(s) configured ({list(cleaned.keys())})"
+        )
+    return cleaned
+
+
+def get_host_headers_for(host: str) -> Dict[str, str]:
+    """Return per-host header overrides for `host`, or {} if none configured.
+
+    Match: exact OR suffix (`phncdn.com` matches `ev-h.phncdn.com`,
+    `hv-h.phncdn.com`, etc.). Most-specific (longest) hostname wins
+    when multiple entries match.
+    """
+    global _HOST_HEADERS_BY_HOST
+    if _HOST_HEADERS_BY_HOST is None:
+        with _HOST_HEADERS_LOAD_LOCK:
+            if _HOST_HEADERS_BY_HOST is None:
+                _HOST_HEADERS_BY_HOST = _load_host_headers()
+
+    if not _HOST_HEADERS_BY_HOST or not host:
+        return {}
+    host = host.lower()
+
+    best_match: Optional[Dict[str, str]] = None
+    best_len = 0
+    for cfg_host, headers in _HOST_HEADERS_BY_HOST.items():
+        if host == cfg_host or host.endswith('.' + cfg_host):
+            if len(cfg_host) > best_len:
+                best_match = headers
+                best_len = len(cfg_host)
+    return best_match if best_match is not None else {}
+
+
+def _reset_host_headers_for_tests() -> None:
+    """Test helper — drop the cached HOST_HEADERS_FILE so a test that
+    sets HOST_HEADERS_FILE via monkeypatch can have it picked up on the
+    next get_host_headers_for() call."""
+    global _HOST_HEADERS_BY_HOST
+    with _HOST_HEADERS_LOAD_LOCK:
+        _HOST_HEADERS_BY_HOST = None
 
 
 # --- Failure classification ------------------------------------------------
@@ -828,6 +934,15 @@ class SegmentDownloader:
         if host:
             with self._touched_hosts_lock:
                 self._touched_hosts.add(host)
+
+        # v2.3.17: per-host header overrides take precedence over both
+        # defaults and strategy modifications. Operator explicitly told us
+        # "always send these headers for this host" via HOST_HEADERS_FILE,
+        # we honor that across all referer-strategy probes (e.g. forcing
+        # a specific Authorization token even when mobile_ua probe runs).
+        host_overrides = get_host_headers_for(host)
+        if host_overrides:
+            headers = {**headers, **host_overrides}
 
         # CocoCut-style inter-segment pacing. acquire_pace_slot() atomically
         # reserves THIS caller's start time so concurrent same-host workers
