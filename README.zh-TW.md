@@ -15,7 +15,8 @@
 - **使用方式（Usage）**：下方「使用方式」與 Extension 操作
 - **設定（Configuration）**：常用 `.env` 與 Extension 設定
 - **疑難排解（Troubleshooting）**：常見連線/權限檢查
-- **完整文件（英文）**：請看 `README.md` 與 `docs/`
+- **開發者文件（中文）**：[`docs/development/`](docs/development/) — 8 章涵蓋架構、Chrome ext、worker pipeline、API、測試、CI/release、bug case studies
+- **完整文件（英文）**：`README.md` 與 `docs/`
 
 ## Overview（概覽）
 整體流程很簡單：
@@ -70,7 +71,7 @@ curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/hea
 # → {"status":"healthy"}
 ```
 
-> 想鎖版本：`.env` 裡設 `IMAGE_TAG=1.9.2`（預設 `latest`）。
+> 想鎖版本：`.env` 裡設 `IMAGE_TAG=2.3.9`（或任一 [release tag](https://github.com/asdfghj1237890/WebVideo2NAS/releases)；預設 `latest`）。
 
 <details>
 <summary><strong>用 Synology Container Manager（DSM UI）取代 SSH</strong></summary>
