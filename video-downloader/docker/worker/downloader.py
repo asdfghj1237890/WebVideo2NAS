@@ -57,6 +57,123 @@ logger = logging.getLogger(__name__)
 TS_SYNC_BYTE = b'\x47'
 TS_PACKET_SIZE = 188
 
+
+# --- Failure classification ------------------------------------------------
+#
+# Used both for early-abort decisions during the download (anti-hotlink /
+# auth-error / throttle spike → fail fast instead of grinding through every
+# segment × every retry) and for the user-facing message when the success-
+# ratio threshold trips. Without this, the historical "Likely expired CDN
+# auth token" message was hardcoded and misleading whenever the actual
+# failure was per-IP throttle, which presents as transport errors not 4xx.
+
+_FAILURE_CATEGORIES = ('transport', 'http_auth', 'anti_hotlink', 'format', 'other')
+
+
+def _classify_failure(error_str: str) -> str:
+    """Bucket a single error string into one failure category.
+
+    Order matters: a "Server returned JPEG image (anti-hotlinking
+    protection)" error mentions both the image format AND the protection
+    mechanism, so we want it tagged as anti_hotlink rather than format.
+    Transport errors are checked first because curl-prefixed messages are
+    unambiguous and never overlap the other categories.
+    """
+    err = (error_str or '').lower()
+
+    # Transport-layer (network never delivered a usable HTTP response):
+    #   curl 7  = couldn't connect
+    #   curl 28 = timeout (connect or transfer)
+    #   curl 35 = recv failure / connection reset
+    #   curl 56 = recv failure / connection closed abruptly
+    if any(s in err for s in (
+        'curl: (7)', 'curl: (28)', 'curl: (35)', 'curl: (56)',
+        'timed out', 'connection reset', 'closed abruptly',
+        'connectionerror',
+    )):
+        return 'transport'
+
+    # Anti-hotlink (server returned an image placeholder instead of media):
+    # check before http_auth because some block responses also have 403/etc.
+    if any(s in err for s in ('anti-hotlinking', 'jpeg', 'png image', 'gif image')):
+        return 'anti_hotlink'
+
+    # HTTP auth/forbidden — usually expired Referer-signed URLs or token.
+    if any(s in err for s in ('401', '403', '474', 'forbidden', 'unauthorized')):
+        return 'http_auth'
+
+    # Validator rejected the body (too small, no TS sync, no fMP4 box).
+    if any(s in err for s in (
+        'invalid segment format', 'invalid ts format',
+        'sync byte', 'too small',
+    )):
+        return 'format'
+
+    return 'other'
+
+
+def classify_failures(failed_segments: List[Dict]) -> Dict[str, int]:
+    """Count failures by category. Returns dict with all 5 keys (zero-filled).
+
+    `failed_segments` is the SegmentDownloader.failed_segments list — each
+    item is `{'segment': ..., 'error': str}`. None / empty input returns
+    all zeros.
+    """
+    counts = {k: 0 for k in _FAILURE_CATEGORIES}
+    for item in failed_segments or []:
+        category = _classify_failure(item.get('error', ''))
+        counts[category] = counts.get(category, 0) + 1
+    return counts
+
+
+def explain_failures(failed_segments: List[Dict]) -> str:
+    """Craft a one-line user-facing recommendation based on the dominant
+    failure mode.
+
+    - No failures → empty string.
+    - >=70% of failures are one mode → specific recommendation for that mode.
+    - Mixed → breakdown with counts so the user can read the worker log
+      with context.
+    """
+    counts = classify_failures(failed_segments)
+    failed = sum(counts.values())
+    if failed == 0:
+        return ""
+
+    sorted_modes = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    top_mode, top_count = sorted_modes[0]
+
+    if top_count / failed >= 0.7 and top_mode != 'other':
+        if top_mode == 'transport':
+            return (
+                f"{top_count}/{failed} segments failed with curl transport errors "
+                f"(timeouts / connection resets / abrupt closes) — likely per-IP "
+                f"CDN throttle. Lower HOST_CONCURRENCY_CAP or MAX_DOWNLOAD_WORKERS, "
+                f"or wait 15+ minutes for the CDN's per-IP cooldown."
+            )
+        if top_mode == 'http_auth':
+            return (
+                f"{top_count}/{failed} segments failed with HTTP 401/403/474 — "
+                f"CDN auth token likely expired. Refresh the source page in the "
+                f"browser and retry."
+            )
+        if top_mode == 'anti_hotlink':
+            return (
+                f"{top_count}/{failed} segments returned image placeholders "
+                f"(anti-hotlink protection). Refresh the source page (cookies/"
+                f"Referer signature stale) and retry."
+            )
+        if top_mode == 'format':
+            return (
+                f"{top_count}/{failed} segments failed format validation "
+                f"(neither TS nor fMP4). Stream may use an unsupported container — "
+                f"check worker logs."
+            )
+
+    # Mixed or 'other' dominant — give a breakdown instead of a wrong recommendation
+    breakdown = ", ".join(f"{k}={v}" for k, v in sorted_modes if v > 0)
+    return f"Mixed failure modes ({breakdown}). Check worker logs for per-segment errors."
+
 # Common file magic bytes for detecting anti-hotlink responses
 JPEG_MAGIC = b'\xff\xd8\xff'
 PNG_MAGIC = b'\x89PNG'

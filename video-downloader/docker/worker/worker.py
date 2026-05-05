@@ -1100,7 +1100,7 @@ class DownloadWorker:
     def _process_m3u8_download(self, job_id: str, job: dict):
         """Process m3u8 stream download"""
         from m3u8_parser import parse_m3u8
-        from downloader import SegmentDownloader
+        from downloader import SegmentDownloader, classify_failures, explain_failures
         from ffmpeg_wrapper import merge_segments
         from ssl_adapter import create_impersonated_session
         import tempfile
@@ -1316,28 +1316,56 @@ class DownloadWorker:
                     progress_state["last_reported_progress"] = download_progress
                     progress_state["next_check_time"] = now + check_interval_sec
                 
-                # Check if too many segments failed during download
+                # Early-abort guards: if the failure pattern is unambiguous,
+                # bail out now instead of grinding through every remaining
+                # segment × every retry. Saves multiple minutes when the
+                # CDN has clearly cut us off.
+                #
+                # Threshold logic:
+                #   anti_hotlink → 5 absolute. The downloader treats hotlink
+                #     responses as terminal (no retry), so the count equals
+                #     the number of segments hit. 5 is enough signal that
+                #     the CDN token is dead.
+                #   http_auth / transport → dominance-based. Either of these
+                #     can be sporadic noise (one bad request) or systemic
+                #     (token expired / per-IP throttle). Only abort when
+                #     the bucket is BOTH non-trivial in absolute count AND
+                #     >=70% of all failures, so we don't false-positive on
+                #     a small playlist with a couple of unlucky timeouts.
                 failed_count = len(downloader.failed_segments)
                 if failed_count > 5:
-                    # Count anti-hotlink protection errors
-                    hotlink_count = sum(
-                        1 for item in downloader.failed_segments 
-                        if 'anti-hotlinking' in item['error'].lower() or 'JPEG' in item['error'] or 'PNG' in item['error']
-                    )
-                    
-                    if hotlink_count >= 5:
-                        logger.error(f"Anti-hotlinking protection detected: {hotlink_count} segments blocked")
-                        raise Exception(f"Download aborted: Server blocked segment downloads (anti-hotlinking protection). Try refreshing the source page and retrying.")
-                    
-                    # Count HTTP 401/403/474 errors (auth/forbidden — usually expired CDN tokens)
-                    http_error_count = sum(
-                        1 for item in downloader.failed_segments
-                        if '401' in item['error'] or '403' in item['error'] or '474' in item['error']
-                    )
+                    counts = classify_failures(downloader.failed_segments)
+                    DOMINANCE = 0.7
+                    MIN_FOR_ABORT = 5
 
-                    if http_error_count > 20:
-                        logger.error(f"Too many HTTP 401/403/474 errors detected: {http_error_count} segments failed")
-                        raise Exception(f"Download aborted: {http_error_count} segments failed with HTTP 401/403/474 errors (URL/token expired or blocked)")
+                    def _dominant(c):
+                        return c >= MIN_FOR_ABORT and c / failed_count >= DOMINANCE
+
+                    if counts['anti_hotlink'] >= 5:
+                        logger.error(f"Anti-hotlinking protection detected: {counts['anti_hotlink']} segments blocked")
+                        raise Exception(
+                            "Download aborted: Server blocked segment downloads "
+                            "(anti-hotlinking protection). Try refreshing the source "
+                            "page and retrying."
+                        )
+
+                    if _dominant(counts['http_auth']):
+                        logger.error(f"HTTP 401/403/474 dominant: {counts['http_auth']}/{failed_count} failures")
+                        raise Exception(
+                            f"Download aborted: {counts['http_auth']}/{failed_count} segments failed with "
+                            "HTTP 401/403/474 errors (URL/token expired or blocked). "
+                            "Refresh the source page and retry."
+                        )
+
+                    if _dominant(counts['transport']):
+                        logger.error(f"Transport errors dominant: {counts['transport']}/{failed_count} failures (curl timeouts/RSTs)")
+                        raise Exception(
+                            f"Download aborted: {counts['transport']}/{failed_count} segments failed with "
+                            "curl transport errors (timeouts / connection resets). Likely "
+                            "per-IP CDN throttle — lower HOST_CONCURRENCY_CAP, set a "
+                            "stricter HOST_CONCURRENCY_OVERRIDES entry for this host, or "
+                            "wait 15+ minutes for the IP cooldown."
+                        )
             
             segment_files = downloader.download_all(progress_callback)
 
@@ -1347,14 +1375,19 @@ class DownloadWorker:
             # Refuse to ship a stub file made from a tiny fraction of segments.
             # Anti-leech CDNs often return a few tokens worth of segments and 401 the rest;
             # without this guard the worker happily merges 5/54 into a "complete" video.
+            # The recommendation in the abort message is now derived from the actual
+            # failure distribution (classifier-driven) rather than a hardcoded "auth
+            # token expired" string that was misleading whenever the real cause was
+            # per-IP throttle (transport errors).
             total_segments = len(downloader.segments)
             min_success_ratio = float(os.getenv('MIN_SEGMENT_SUCCESS_RATIO', '0.9'))
             if total_segments > 0 and len(segment_files) / total_segments < min_success_ratio:
+                explanation = explain_failures(downloader.failed_segments) or \
+                    "Check worker logs for per-segment errors."
                 downloader.cleanup()
                 raise Exception(
                     f"Download aborted: only {len(segment_files)}/{total_segments} segments succeeded "
-                    f"(<{int(min_success_ratio * 100)}%). Likely expired CDN auth token — "
-                    f"refresh the source page and retry."
+                    f"(<{int(min_success_ratio * 100)}%). {explanation}"
                 )
 
             logger.info(f"Downloaded {len(segment_files)} segments")

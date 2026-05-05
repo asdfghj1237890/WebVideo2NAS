@@ -10,6 +10,8 @@ from downloader import (
     PNG_MAGIC,
     GIF_MAGIC,
     _TRANSPORT_ERRORS,
+    classify_failures,
+    explain_failures,
 )
 
 
@@ -343,3 +345,139 @@ def test_backoff_jitter_not_constant(monkeypatch, tmp_path):
     assert sleeps[0] != sleeps[1], (
         f"Expected jittered backoff to differ across runs, got {sleeps}"
     )
+
+
+# --- Failure classification ------------------------------------------------
+#
+# v2.3.13: classify_failures + explain_failures replace ad-hoc substring
+# counting in worker.py with a single bucketing function. These tests pin
+# the classification rules so future reorgs (rename of error strings,
+# refactor of validators) don't silently mis-bucket failures into the
+# wrong recommendation.
+
+
+def test_classify_failures_buckets_curl_transport_codes():
+    """curl 7/28/35/56 + their text variants all classify as transport."""
+    failures = [
+        {'error': 'Failed to perform, curl: (7) Couldnt connect to server'},
+        {'error': 'Failed to perform, curl: (28) Operation timed out after 30001 ms with 0 bytes received'},
+        {'error': 'Failed to perform, curl: (35) Recv failure: Connection reset by peer'},
+        {'error': 'Failed to perform, curl: (56) Connection closed abruptly'},
+    ]
+    counts = classify_failures(failures)
+    assert counts['transport'] == 4
+    assert counts['http_auth'] == 0
+    assert counts['anti_hotlink'] == 0
+    assert counts['format'] == 0
+    assert counts['other'] == 0
+
+
+def test_classify_failures_buckets_http_auth_codes():
+    failures = [
+        {'error': '403 Client Error: Forbidden for url: https://example.com/seg.ts'},
+        {'error': 'HTTP 401 Unauthorized'},
+        {'error': '474 error from CDN edge'},
+    ]
+    counts = classify_failures(failures)
+    assert counts['http_auth'] == 3
+
+
+def test_classify_failures_anti_hotlink_takes_priority_over_image_format():
+    """A 'JPEG image (anti-hotlinking protection)' error mentions both
+    image AND protection — must classify as anti_hotlink, not other."""
+    failures = [
+        {'error': 'Server returned JPEG image (anti-hotlinking protection)'},
+        {'error': 'Server returned PNG image (anti-hotlinking protection)'},
+        {'error': 'Server returned GIF image (anti-hotlinking protection)'},
+    ]
+    counts = classify_failures(failures)
+    assert counts['anti_hotlink'] == 3
+    assert counts['format'] == 0
+
+
+def test_classify_failures_format_errors():
+    failures = [
+        {'error': 'Invalid segment format (not TS sync bytes, not fMP4 box)'},
+        {'error': 'Invalid TS format (no sync bytes found)'},
+        {'error': 'Content too small'},
+        {'error': 'Segment too small: 100 bytes'},
+    ]
+    counts = classify_failures(failures)
+    assert counts['format'] == 4
+
+
+def test_classify_failures_unknown_falls_to_other():
+    failures = [
+        {'error': 'something we dont recognize'},
+        {'error': ''},
+    ]
+    counts = classify_failures(failures)
+    assert counts['other'] == 2
+
+
+def test_classify_failures_empty_input_returns_zeros():
+    assert classify_failures([]) == {'transport': 0, 'http_auth': 0, 'anti_hotlink': 0, 'format': 0, 'other': 0}
+    assert classify_failures(None) == {'transport': 0, 'http_auth': 0, 'anti_hotlink': 0, 'format': 0, 'other': 0}
+
+
+def test_explain_failures_empty_input_returns_empty_string():
+    assert explain_failures([]) == ""
+    assert explain_failures(None) == ""
+
+
+def test_explain_failures_transport_dominant_recommends_throttle_fix():
+    """When >=70% of failures are transport, the message must mention
+    throttle and the env var levers (HOST_CONCURRENCY_CAP / MAX_DOWNLOAD_WORKERS)."""
+    failures = [{'error': 'curl: (28) Operation timed out'} for _ in range(8)] + \
+               [{'error': '403 Forbidden'} for _ in range(2)]  # 80% transport
+    msg = explain_failures(failures)
+    assert 'throttle' in msg.lower()
+    assert 'host_concurrency_cap' in msg.lower() or 'max_download_workers' in msg.lower()
+    assert 'cooldown' in msg.lower()
+
+
+def test_explain_failures_http_auth_dominant_recommends_refresh():
+    failures = [{'error': 'HTTP 403 Forbidden'} for _ in range(10)]
+    msg = explain_failures(failures)
+    assert 'token' in msg.lower() or 'auth' in msg.lower()
+    assert 'refresh' in msg.lower()
+
+
+def test_explain_failures_anti_hotlink_dominant_recommends_refresh():
+    failures = [{'error': 'JPEG image (anti-hotlinking protection)'} for _ in range(10)]
+    msg = explain_failures(failures)
+    assert 'anti-hotlink' in msg.lower() or 'image placeholder' in msg.lower()
+    assert 'refresh' in msg.lower()
+
+
+def test_explain_failures_format_dominant_recommends_check_logs():
+    failures = [{'error': 'Invalid segment format (not TS sync bytes, not fMP4 box)'} for _ in range(10)]
+    msg = explain_failures(failures)
+    assert 'format' in msg.lower() or 'container' in msg.lower()
+    assert 'log' in msg.lower()
+
+
+def test_explain_failures_mixed_below_threshold_gives_breakdown():
+    """When no single mode reaches 70%, the message must give the count
+    breakdown so the user can read the worker log with context — not a
+    wrong recommendation tied to whichever mode happens to be largest."""
+    failures = (
+        [{'error': 'curl: (28) timeout'} for _ in range(3)] +
+        [{'error': '403 Forbidden'} for _ in range(3)] +
+        [{'error': 'JPEG image (anti-hotlinking protection)'} for _ in range(3)]
+    )
+    msg = explain_failures(failures)
+    assert 'mixed' in msg.lower()
+    # All three categories should appear in the breakdown
+    assert 'transport=3' in msg
+    assert 'http_auth=3' in msg
+    assert 'anti_hotlink=3' in msg
+
+
+def test_explain_failures_other_dominant_falls_back_to_breakdown():
+    """If 'other' (unknown) is the largest bucket, don't pretend we know
+    what to recommend — give the breakdown instead."""
+    failures = [{'error': 'mystery error'} for _ in range(10)]
+    msg = explain_failures(failures)
+    assert 'mixed' in msg.lower()
+    assert 'other=10' in msg

@@ -47,7 +47,7 @@ import os
 import random
 import threading
 import time
-from typing import Optional
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -75,25 +75,77 @@ end
 _DEFAULT_MAX_WAIT = 600.0  # 10 minutes
 
 
+def parse_overrides(raw: str) -> List[Tuple[str, int]]:
+    """Parse the HOST_CONCURRENCY_OVERRIDES env value into [(suffix, cap), ...].
+
+    Format:  ``host:cap;host:cap;...``  (semicolon between entries)
+    Example: ``phncdn.com:8;cdn.example.org:32``
+
+    Whitespace around entries is tolerated. Bad entries (no ':', non-int cap,
+    cap <= 0) are logged and skipped — never raises.
+
+    Returned list is sorted by hostname length DESCENDING so longest match
+    wins when _resolve_cap walks the list (e.g. ``ev-h.phncdn.com:16`` beats
+    ``phncdn.com:8`` for that exact host).
+    """
+    if not raw or not raw.strip():
+        return []
+    overrides: List[Tuple[str, int]] = []
+    for entry in raw.split(';'):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ':' not in entry:
+            logger.warning(f"HOST_CONCURRENCY_OVERRIDES: bad entry (no ':'): {entry!r}, skipped")
+            continue
+        host_part, cap_part = entry.rsplit(':', 1)
+        host_part = host_part.strip().lower()
+        if not host_part:
+            logger.warning(f"HOST_CONCURRENCY_OVERRIDES: empty host in entry {entry!r}, skipped")
+            continue
+        try:
+            cap = int(cap_part.strip())
+        except ValueError:
+            logger.warning(f"HOST_CONCURRENCY_OVERRIDES: cap not an integer in {entry!r}, skipped")
+            continue
+        if cap <= 0:
+            logger.warning(f"HOST_CONCURRENCY_OVERRIDES: cap must be > 0 in {entry!r}, skipped")
+            continue
+        overrides.append((host_part, cap))
+    return sorted(overrides, key=lambda x: len(x[0]), reverse=True)
+
+
 class HostThrottle:
     """Per-host distributed semaphore using Redis.
 
     Thread-safe. Single instance can be shared across all download threads
     in a worker process; multiple workers share state via Redis keys.
+
+    Cap resolution:
+      - Each acquire() resolves the cap for the URL's host via _resolve_cap
+      - Per-host overrides take precedence over the default
+      - Suffix match: ``phncdn.com`` matches ``ev-h.phncdn.com``,
+        ``hv-h.phncdn.com``, etc. (longest-match wins)
+      - If no override matches AND no default cap is set → passthrough
+        (acquire returns False, no slot held, no throttling for that host)
     """
 
     def __init__(
         self,
         redis_client,
-        cap: int = 16,
+        default_cap: Optional[int] = None,
+        overrides: Optional[List[Tuple[str, int]]] = None,
         key_prefix: str = "host_inflight",
         ttl_seconds: int = 300,
         max_wait: float = _DEFAULT_MAX_WAIT,
     ):
-        if cap <= 0:
-            raise ValueError(f"cap must be positive, got {cap}")
+        if default_cap is not None and default_cap <= 0:
+            raise ValueError(f"default_cap must be positive or None, got {default_cap}")
         self._redis = redis_client
-        self._cap = cap
+        self._default_cap = default_cap
+        # Already sorted by parse_overrides; sort defensively in case caller
+        # passed an unsorted list (e.g. test fixtures).
+        self._overrides = sorted(overrides or [], key=lambda x: len(x[0]), reverse=True)
         self._key_prefix = key_prefix
         self._ttl = ttl_seconds
         self._max_wait = max_wait
@@ -106,40 +158,68 @@ class HostThrottle:
             self._script = None
 
     @property
-    def cap(self) -> int:
-        return self._cap
+    def default_cap(self) -> Optional[int]:
+        return self._default_cap
+
+    @property
+    def overrides(self) -> List[Tuple[str, int]]:
+        return list(self._overrides)
+
+    def _resolve_cap(self, host: str) -> Optional[int]:
+        """Resolve the cap that applies to this host.
+
+        Returns:
+            int  — the per-host cap to enforce
+            None — no cap configured for this host (acquire becomes a no-op
+                   so unrelated CDNs aren't slowed down by another CDN's
+                   throttle config)
+        """
+        if not host:
+            return None
+        host = host.lower()
+        # Overrides are sorted longest-first, so the first match is the most
+        # specific applicable rule (e.g. ev-h.phncdn.com beats phncdn.com).
+        for suffix, cap in self._overrides:
+            if host == suffix or host.endswith('.' + suffix):
+                return cap
+        return self._default_cap
 
     def _key(self, host: str) -> str:
         return f"{self._key_prefix}:{host}"
 
-    def _try_acquire_once(self, host: str) -> int:
+    def _try_acquire_once(self, host: str, cap: int) -> int:
         """Atomically check cap and increment if room. Returns new count or 0 if at cap.
 
         Raises whatever Redis raises — caller decides whether to swallow.
         """
         key = self._key(host)
         if self._script is not None:
-            return int(self._script(keys=[key], args=[self._cap, self._ttl]))
+            return int(self._script(keys=[key], args=[cap, self._ttl]))
         return int(
-            self._redis.eval(_LUA_TRY_ACQUIRE, 1, key, self._cap, self._ttl)
+            self._redis.eval(_LUA_TRY_ACQUIRE, 1, key, cap, self._ttl)
         )
 
     def acquire(self, url_or_host: str) -> bool:
         """Block until a slot is available for this host.
 
         Returns True if a slot was acquired (caller MUST call release()),
-        False if Redis errored or max_wait elapsed (caller proceeds without
-        a slot, MUST NOT call release).
+        False if no cap applies / Redis errored / max_wait elapsed (caller
+        proceeds without a slot, MUST NOT call release).
         """
         host = self._extract_host(url_or_host)
         if not host:
+            return False
+        cap = self._resolve_cap(host)
+        if cap is None:
+            # No cap configured for this host — passthrough (no throttle,
+            # no slot to release).
             return False
         deadline = time.monotonic() + self._max_wait
         backoff = 0.05  # 50ms initial
         warned_timeout = False
         while True:
             try:
-                count = self._try_acquire_once(host)
+                count = self._try_acquire_once(host, cap)
             except Exception as e:
                 # Redis hiccup — don't block downloads on it.
                 logger.warning(
@@ -153,7 +233,7 @@ class HostThrottle:
                 if not warned_timeout:
                     logger.warning(
                         f"HostThrottle timed out waiting for slot on {host} "
-                        f"(cap={self._cap}); proceeding without throttle. "
+                        f"(cap={cap}); proceeding without throttle. "
                         f"Possible counter leak — TTL will reset within {self._ttl}s."
                     )
                 return False
@@ -200,38 +280,63 @@ _INSTANCE: Optional[HostThrottle] = None
 _INSTANCE_LOCK = threading.Lock()
 
 
+def _parse_default_cap() -> Optional[int]:
+    """Parse HOST_CONCURRENCY_CAP env. Returns int or None (disabled)."""
+    raw = os.getenv("HOST_CONCURRENCY_CAP")
+    if not raw or raw.strip().lower() in ("0", "false", "off", ""):
+        return None
+    try:
+        cap = int(raw)
+    except ValueError:
+        logger.warning(f"Invalid HOST_CONCURRENCY_CAP={raw!r}, ignored")
+        return None
+    if cap <= 0:
+        return None
+    return cap
+
+
 def init(redis_client) -> Optional[HostThrottle]:
-    """Initialize the singleton from environment. Idempotent — safe to call multiple times."""
+    """Initialize the singleton from environment. Idempotent — safe to call multiple times.
+
+    Reads:
+      HOST_CONCURRENCY_CAP        — global default cap (int) or unset/0 to disable
+      HOST_CONCURRENCY_OVERRIDES  — per-host overrides, ``host:cap;host:cap``
+      HOST_CONCURRENCY_TTL        — slot TTL in seconds (default 300)
+
+    If both default cap is unset AND overrides is empty, the singleton is None
+    and downloader skips throttling entirely (no Redis traffic).
+    """
     global _INSTANCE
-    cap_raw = os.getenv("HOST_CONCURRENCY_CAP")
-    if not cap_raw or cap_raw.strip().lower() in ("0", "false", "off", ""):
+    default_cap = _parse_default_cap()
+    overrides = parse_overrides(os.getenv("HOST_CONCURRENCY_OVERRIDES", ""))
+
+    if default_cap is None and not overrides:
         with _INSTANCE_LOCK:
             _INSTANCE = None
         logger.info(
-            "HostThrottle disabled (HOST_CONCURRENCY_CAP unset or 0). "
-            "Per-host concurrency is bounded only by MAX_DOWNLOAD_WORKERS "
+            "HostThrottle disabled (HOST_CONCURRENCY_CAP and HOST_CONCURRENCY_OVERRIDES "
+            "both unset). Per-host concurrency is bounded only by MAX_DOWNLOAD_WORKERS "
             "per process."
         )
         return None
-    try:
-        cap = int(cap_raw)
-    except ValueError:
-        logger.warning(
-            f"Invalid HOST_CONCURRENCY_CAP={cap_raw!r}, throttle disabled"
-        )
-        with _INSTANCE_LOCK:
-            _INSTANCE = None
-        return None
-    if cap <= 0:
-        with _INSTANCE_LOCK:
-            _INSTANCE = None
-        return None
+
     ttl = int(os.getenv("HOST_CONCURRENCY_TTL", "300"))
     with _INSTANCE_LOCK:
-        _INSTANCE = HostThrottle(redis_client, cap=cap, ttl_seconds=ttl)
+        _INSTANCE = HostThrottle(
+            redis_client,
+            default_cap=default_cap,
+            overrides=overrides,
+            ttl_seconds=ttl,
+        )
+    parts = []
+    if default_cap is not None:
+        parts.append(f"default={default_cap}")
+    else:
+        parts.append("default=passthrough")
+    for suffix, cap in overrides:
+        parts.append(f"{suffix}={cap}")
     logger.info(
-        f"HostThrottle enabled: cap={cap} per-host across all workers, "
-        f"slot TTL={ttl}s"
+        f"HostThrottle enabled: {', '.join(parts)}, slot TTL={ttl}s"
     )
     return _INSTANCE
 
