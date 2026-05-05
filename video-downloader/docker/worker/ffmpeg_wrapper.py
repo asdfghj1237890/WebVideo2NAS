@@ -8,7 +8,7 @@ import subprocess
 import os
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,7 @@ class FFmpegMerger:
         target_duration: Optional[int] = None,
         is_fmp4: bool = False,
         init_segment_path: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ):
         # For HLS-fMP4: the init segment (ftyp + moov) MUST come first in
         # the byte-concat stream — without it the moof/mdat fragments are
@@ -40,6 +41,15 @@ class FFmpegMerger:
         # streams that pad each .ts beyond its EXTINF don't bloat the merged file.
         self.target_duration = target_duration
         self.is_fmp4 = is_fmp4
+        # Optional callback returning True if the caller wants the merge
+        # aborted. Polled (a) between each segment streamed to ffmpeg's
+        # stdin and (b) every second while waiting for ffmpeg to exit.
+        # On cancellation we kill ffmpeg and remove any partial output.
+        # Default None = no cancellation polling (existing HLS behavior).
+        # Codex review #13 added this so the MPD path's video/audio merge
+        # responds to user cancellation within ~1s instead of blocking
+        # for the full 900s merge timeout.
+        self.cancel_check = cancel_check
         self.ffmpeg_path: Optional[str] = None
 
         # Verify FFmpeg is available
@@ -50,6 +60,16 @@ class FFmpegMerger:
         """Check if FFmpeg is available"""
         self.ffmpeg_path = shutil.which('ffmpeg')
         return self.ffmpeg_path is not None
+
+    def _remove_partial_output(self) -> None:
+        """Best-effort cleanup of a partial output file after cancellation
+        or kill. Never raises — used in error paths."""
+        try:
+            output_path = Path(self.output_file)
+            if output_path.exists():
+                output_path.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to remove partial output {self.output_file}: {e}")
     
     def _create_concat_file(self, concat_file_path: str):
         """Create concat demuxer file for FFmpeg"""
@@ -153,8 +173,13 @@ class FFmpegMerger:
             # Stream segments into ffmpeg's stdin in order. shutil.copyfileobj
             # uses an internal 1MB buffer — bounded memory regardless of
             # total segment size.
+            cancelled = False
             try:
                 for seg in self.segment_files:
+                    if self.cancel_check is not None and self.cancel_check():
+                        logger.info("FFmpeg merge cancelled while streaming segments")
+                        cancelled = True
+                        break
                     with open(seg, 'rb') as f:
                         shutil.copyfileobj(f, process.stdin, length=1024 * 1024)
             except BrokenPipeError:
@@ -165,13 +190,42 @@ class FFmpegMerger:
                 except Exception:
                     pass
 
-            try:
-                process.wait(timeout=900)  # 15 minutes
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                logger.error("FFmpeg merge timed out after 15 minutes")
+            if cancelled:
+                # Cancellation observed mid-stream — kill ffmpeg, drop
+                # partial output, return False so caller can clean up.
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+                self._remove_partial_output()
                 return False
+
+            # Wait for ffmpeg to finish, polling cancellation every second
+            # so a user-cancelled long merge doesn't block for 900s.
+            poll_interval = 1.0
+            elapsed = 0.0
+            poll_timeout = 900.0
+            while True:
+                try:
+                    process.wait(timeout=poll_interval)
+                    break  # process exited cleanly
+                except subprocess.TimeoutExpired:
+                    elapsed += poll_interval
+                    if self.cancel_check is not None and self.cancel_check():
+                        logger.info("FFmpeg merge cancelled while waiting for ffmpeg exit")
+                        try:
+                            process.kill()
+                            process.wait(timeout=5)
+                        except Exception:
+                            pass
+                        self._remove_partial_output()
+                        return False
+                    if elapsed >= poll_timeout:
+                        process.kill()
+                        process.wait()
+                        logger.error("FFmpeg merge timed out after 15 minutes")
+                        return False
 
             t_err.join(timeout=5)
             t_out.join(timeout=5)
@@ -285,6 +339,7 @@ def merge_segments(
     target_duration: Optional[int] = None,
     is_fmp4: bool = False,
     init_segment_path: Optional[str] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """
     Convenience function to merge segments
@@ -313,6 +368,7 @@ def merge_segments(
         target_duration=target_duration,
         is_fmp4=is_fmp4,
         init_segment_path=init_segment_path,
+        cancel_check=cancel_check,
     )
     concat_file = Path(concat_dir or Path(output_file).parent) / "concat_list.txt"
     

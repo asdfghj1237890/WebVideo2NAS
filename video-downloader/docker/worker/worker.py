@@ -4,17 +4,20 @@ Worker process that downloads and processes web videos (m3u8, mpd, mp4)
 """
 
 import os
+import re
 import sys
+import threading
 import time
 import logging
 import redis
 import json
 import subprocess
 import shutil
+from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import urlparse
 import signal
 import ipaddress
@@ -526,19 +529,37 @@ class DownloadWorker:
             self._process_m3u8_download(job_id, job)
     
     def _process_mpd_download(self, job_id: str, job: dict):
-        """Process DASH/MPD stream download using ffmpeg"""
-        from pathlib import Path
-        import re
-        
+        """Process DASH/MPD stream download.
+
+        v2.4.0 refactor: parses MPD ourselves and routes segment fetches
+        through SegmentDownloader so the DASH path benefits from the same
+        infrastructure as HLS:
+          - host_throttle (Redis cross-process cap)
+          - _adaptive_delay (per-segment pacing)
+          - referer/mobile_ua strategies
+          - HOST_HEADERS_FILE per-host overrides
+          - curl_cffi chrome TLS impersonation
+          - cancellation propagation
+        ffmpeg is used only for the final video+audio mux (or video-only
+        passthrough when the MPD has no audio AdaptationSet).
+        """
+        from mpd_parser import parse_mpd, MPDParseError
+        from downloader import SegmentDownloader
+        from ffmpeg_wrapper import merge_segments
+        from ssl_adapter import create_impersonated_session
+        import tempfile
+
+        temp_dir = None
+
         try:
             _enforce_ssrf_guard(job["url"])
 
             self.update_job_status(job_id, "downloading", progress=0)
             logger.info(f"Starting MPD download: {job['url']}")
 
+            # Header normalization — same as the HLS path
             headers = job.get('headers', {}).copy()
             headers.pop('X-WV2NAS-Format', None)
-
             headers.pop('Range', None)
             headers.pop('range', None)
             if headers.get('Sec-Fetch-Dest') == 'video':
@@ -551,20 +572,243 @@ class DownloadWorker:
                 headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
             if 'User-Agent' not in headers:
                 headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+            if 'Accept' not in headers:
+                headers['Accept'] = '*/*'
+            if 'Accept-Language' not in headers:
+                headers['Accept-Language'] = 'en-US,en;q=0.9'
+            if 'Accept-Encoding' not in headers:
+                headers['Accept-Encoding'] = 'gzip, deflate, br'
 
-            # Build ffmpeg -headers string (each header terminated with \r\n)
-            header_str = ""
-            for k, v in headers.items():
-                if k.lower() in ('host', 'connection', 'content-length', 'accept-encoding'):
-                    continue
-                header_str += f"{k}: {v}\r\n"
+            # --- Step 1: fetch + parse MPD ---
+            logger.info("Step 1: Fetching and parsing MPD")
+            shared_session = create_impersonated_session()
+            mpd_response = shared_session.get(
+                job['url'], headers=headers, timeout=30, stream=False,
+            )
+            mpd_response.raise_for_status()
+            mpd_xml = mpd_response.content.decode('utf-8', errors='replace')
+
+            # Codex review #17 (round 8): if the MPD endpoint redirected,
+            # use the final URL as the base for relative segment resolution
+            # — otherwise relative paths point at the wrong place and
+            # downloads either fail or fetch the wrong objects. ffmpeg's
+            # native DASH path uses the final URL by default; matching
+            # that for parity.
+            manifest_url = getattr(mpd_response, 'url', None) or job['url']
+            if SSRF_GUARD_ENABLED and manifest_url != job['url']:
+                # Re-validate the final URL — a redirect could have moved
+                # us to an internal host.
+                _enforce_ssrf_guard(manifest_url)
+
+            try:
+                manifest = parse_mpd(mpd_xml, manifest_url)
+            except MPDParseError as e:
+                # Codex review #14: don't hard-fail on unsupported-but-valid
+                # MPD shapes (SegmentList, SegmentBase, multi-period, etc.)
+                # that ffmpeg's native DASH support handles fine. Falling
+                # back preserves the v2.3.x DASH capability.
+                #
+                # Genuine show-stoppers (DRM, live streams) re-raise — we
+                # can't process those even via ffmpeg.
+                err_str = str(e)
+                if 'encrypted content' in err_str or 'live streams are rejected' in err_str:
+                    raise Exception(f"MPD: {err_str}")
+
+                # Codex review #18 (round 9, [high]): the ffmpeg fallback
+                # re-fetches the MPD URL itself via ffmpeg's HTTP stack
+                # and then follows BaseURL/SegmentURL/Initialization
+                # references inside it on its own. None of that traffic
+                # goes through `_enforce_ssrf_guard`. A pre-scan of the
+                # *current* mpd_xml is also insufficient because:
+                #   1. TOCTOU — the server can serve different content
+                #      to curl_cffi vs to ffmpeg's second fetch
+                #   2. ffmpeg follows redirects independently and can
+                #      land on internal hosts the pre-scan never saw
+                #   3. URLs in MPD shapes our parser doesn't understand
+                #      may not appear in the XML walker either
+                # Under SSRF guard the only safe option is to refuse
+                # unsupported manifest shapes outright. Without the guard
+                # the operator has accepted the SSRF risk, so fall back.
+                if SSRF_GUARD_ENABLED:
+                    raise Exception(
+                        f"MPD: unsupported manifest shape ({err_str}); "
+                        f"ffmpeg fallback disabled under SSRF_GUARD because "
+                        f"it would bypass URL validation"
+                    )
+
+                logger.warning(
+                    f"MPD parser couldn't handle this manifest ({err_str}); "
+                    f"falling back to ffmpeg native DASH path. Note: ffmpeg "
+                    f"path bypasses host_throttle/adaptive_delay/strategy "
+                    f"infrastructure that the parsed-MPD path provides."
+                )
+                return self._process_mpd_with_ffmpeg(job_id, job, headers)
+
+            video = manifest['video']
+            audio = manifest.get('audio')
+
+            # Codex review #5 (round 2, [high]): SSRF defense for MPD-controlled
+            # URLs. The MPD itself was checked, but its BaseURL/SegmentTemplate
+            # can resolve init/media segment URLs to arbitrary hosts including
+            # localhost or AWS metadata (169.254.169.254). Re-validate every
+            # derived URL against the same guard before any fetch happens.
+            # Cheap when SSRF_GUARD is disabled (the helper short-circuits).
+            for derived_url in self._collect_mpd_urls(video, audio):
+                _enforce_ssrf_guard(derived_url)
+            logger.info(
+                f"MPD parsed: video {video['segment_count']} segments "
+                f"({video.get('resolution', 'unknown')}, {video['bandwidth']} bps), "
+                f"audio={'yes' if audio else 'no'}, total {manifest['duration']}s"
+            )
+
+            self.db.execute(text("""
+                UPDATE job_metadata
+                SET resolution = :resolution, duration = :duration, segment_count = :segment_count
+                WHERE job_id = :job_id
+            """), {
+                "resolution": video.get('resolution'),
+                "duration": manifest['duration'],
+                "segment_count": video['segment_count'] + (audio['segment_count'] if audio else 0),
+                "job_id": job_id,
+            })
+            self.db.commit()
+
+            self.update_job_status(job_id, "downloading", progress=5)
+
+            # --- Step 2: download init segments (video + optional audio) ---
+            temp_dir = tempfile.mkdtemp(prefix=f"mpd_{job_id}_")
+            logger.info(f"Step 2: Fetching init segments")
+
+            # Codex review #7: video and audio init MUST go to distinct
+            # filenames. Earlier both calls used the default "init.mp4"
+            # in the same temp_dir, so the audio download silently
+            # overwrote the video init bytes — the subsequent video merge
+            # fed audio init to ffmpeg and produced corrupt output.
+            video_init_path = None
+            if video['init_segment_url']:
+                video_init_path = self._download_init_segment(
+                    video['init_segment_url'], headers, shared_session, temp_dir,
+                    filename="video_init.mp4",
+                )
+                if video_init_path is None:
+                    raise Exception("Failed to download video init segment")
+
+            audio_init_path = None
+            if audio and audio['init_segment_url']:
+                audio_init_path = self._download_init_segment(
+                    audio['init_segment_url'], headers, shared_session, temp_dir,
+                    filename="audio_init.mp4",
+                )
+                if audio_init_path is None:
+                    # Codex review #3: don't silently downgrade to video-only.
+                    # MPD declared audio; if we can't get it, the user has
+                    # no way to tell the result is broken vs. intentionally
+                    # silent. Fail loudly instead.
+                    raise Exception(
+                        "Audio init segment download failed — MPD declared an "
+                        "audio AdaptationSet but we couldn't fetch its init "
+                        "segment. Refusing to ship a silent video that the "
+                        "user would mistake for a successful download."
+                    )
+
+            # --- Step 3: download video segments ---
+            logger.info(f"Step 3: Downloading {video['segment_count']} video segments")
+            video_dir = tempfile.mkdtemp(prefix="video_", dir=temp_dir)
+            video_downloader = SegmentDownloader(
+                segments=video['segments'],
+                output_dir=video_dir,
+                headers=headers,
+                max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 2)),
+                m3u8_url=job['url'],
+                session=shared_session,
+            )
+
+            # Progress: video gets 5-50%, audio (if present) 50-80%, mux 80-95%
+            video_total = video['segment_count']
+            audio_total = audio['segment_count'] if audio else 0
+            grand_total = video_total + audio_total
+
+            check_interval_sec = 2.0
+            video_progress_state = {"next_check_time": time.monotonic() + check_interval_sec,
+                                    "last_reported": -1}
+
+            def video_progress_callback(completed, total):
+                if self.is_job_cancelled(job_id):
+                    raise Exception("Job cancelled by user")
+                # Map video progress to 5-50%
+                progress = int(5 + (completed / total) * 45)
+                now = time.monotonic()
+                is_final = (completed == total)
+                if (progress != video_progress_state["last_reported"]
+                        and (now >= video_progress_state["next_check_time"] or is_final)):
+                    self.update_job_status(job_id, "downloading", progress=progress)
+                    video_progress_state["last_reported"] = progress
+                    video_progress_state["next_check_time"] = now + check_interval_sec
+
+            video_files = video_downloader.download_all(video_progress_callback)
+            # Codex review #2: for fMP4 (DASH), even one missing segment
+            # produces silent media truncation in the muxed output — there
+            # is no in-band gap marker and ffmpeg byte-concat just glues
+            # remaining fragments together. Require ALL video segments
+            # rather than the HLS-style success ratio.
+            if len(video_files) < video_total:
+                missing_count = video_total - len(video_files)
+                raise Exception(
+                    f"DASH video incomplete: {missing_count}/{video_total} segment(s) "
+                    f"missing. fMP4 byte-concat would silently splice over the gap, "
+                    f"producing a truncated output that looks successful. Failing the "
+                    f"job loudly instead."
+                )
+
+            # --- Step 4: download audio segments (optional) ---
+            audio_files = None
+            if audio:
+                logger.info(f"Step 4: Downloading {audio['segment_count']} audio segments")
+                audio_dir = tempfile.mkdtemp(prefix="audio_", dir=temp_dir)
+                audio_downloader = SegmentDownloader(
+                    segments=audio['segments'],
+                    output_dir=audio_dir,
+                    headers=headers,
+                    max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 2)),
+                    m3u8_url=job['url'],
+                    session=shared_session,
+                )
+
+                audio_progress_state = {"next_check_time": time.monotonic() + check_interval_sec,
+                                        "last_reported": -1}
+
+                def audio_progress_callback(completed, total):
+                    if self.is_job_cancelled(job_id):
+                        raise Exception("Job cancelled by user")
+                    progress = int(50 + (completed / total) * 30)
+                    now = time.monotonic()
+                    is_final = (completed == total)
+                    if (progress != audio_progress_state["last_reported"]
+                            and (now >= audio_progress_state["next_check_time"] or is_final)):
+                        self.update_job_status(job_id, "downloading", progress=progress)
+                        audio_progress_state["last_reported"] = progress
+                        audio_progress_state["next_check_time"] = now + check_interval_sec
+
+                audio_files = audio_downloader.download_all(audio_progress_callback)
+                # Codex review #2 + #3: same all-or-nothing rule as video,
+                # AND don't silently degrade to video-only when MPD declared
+                # audio. MPD with an audio AdaptationSet → audio is part of
+                # the contract; missing audio = job failure.
+                if len(audio_files) < audio_total:
+                    missing_count = audio_total - len(audio_files)
+                    raise Exception(
+                        f"DASH audio incomplete: {missing_count}/{audio_total} segment(s) "
+                        f"missing. MPD declared an audio AdaptationSet — refusing to "
+                        f"ship video-only output that would look successful."
+                    )
+
+            # --- Step 5: byte-concat each track + mux with ffmpeg ---
+            logger.info("Step 5: Merging video (and audio if present)")
+            self.update_job_status(job_id, "processing", progress=80)
 
             safe_title = _make_safe_filename_stem(job.get('title') or '', fallback=f"video_{job_id[:8]}")
-
             output_dir = resolve_output_dir(job.get('output_subdir'))
             output_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Output directory: {output_dir}")
-
             base_name = safe_title
             output_file = output_dir / f"{base_name}.mp4"
             counter = 1
@@ -573,89 +817,143 @@ class DownloadWorker:
                 counter += 1
             output_file = str(output_file)
 
-            # Probe duration for progress reporting
-            total_duration = None
-            try:
-                ffprobe_path = shutil.which("ffprobe")
-                if ffprobe_path:
-                    probe_cmd = [ffprobe_path, "-v", "error"]
-                    if header_str:
-                        probe_cmd += ["-headers", header_str]
-                    probe_cmd += [
-                        "-show_entries", "format=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1",
-                        job['url']
-                    ]
-                    probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
-                    if probe.returncode == 0 and probe.stdout.strip():
-                        total_duration = float(probe.stdout.strip())
-                        logger.info(f"MPD total duration: {total_duration:.1f}s")
-            except Exception as e:
-                logger.warning(f"Failed to probe MPD duration: {e}")
+            # Codex review #9: cancellation polling between long-running
+            # steps. The old MPD path polled cancellation while ffmpeg was
+            # running and killed the process; the v2.4.0 rewrite lost that
+            # by using blocking subprocess.run. We re-add it: cancellation
+            # check before each merge/mux step, plus Popen+poll for the
+            # final mux (which can take minutes for long content).
+            if self.is_job_cancelled(job_id):
+                logger.info(f"Job {job_id} cancelled before video merge")
+                return
 
-            ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
-            cmd = [ffmpeg_path]
-            if header_str:
-                cmd += ["-headers", header_str]
-            cmd += [
-                "-i", job['url'],
-                "-c", "copy",
-                "-y",
-                output_file
-            ]
-
-            logger.info(f"FFmpeg DASH command: {' '.join(cmd[:6])}... -> {output_file}")
-            self.update_job_status(job_id, "downloading", progress=5)
-
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+            video_only_path = str(Path(temp_dir) / "video_concat.mp4")
+            ok = merge_segments(
+                segment_files=video_files,
+                output_file=video_only_path,
+                threads=int(os.getenv('FFMPEG_THREADS', 4)),
+                concat_dir=temp_dir,
+                target_duration=manifest['duration'],
+                is_fmp4=True,
+                init_segment_path=video_init_path,
+                # Codex review #13: cancel_check makes the long ffmpeg merge
+                # responsive to user cancellation within ~1s instead of
+                # blocking for the full 900s timeout.
+                cancel_check=lambda: self.is_job_cancelled(job_id),
             )
+            if not ok:
+                # merge_segments returns False on cancellation too — surface
+                # cleanly without raising if the user actually cancelled.
+                if self.is_job_cancelled(job_id):
+                    logger.info(f"Job {job_id} cancelled during video merge")
+                    return
+                raise Exception("Video segments merge failed")
 
-            last_progress = 5
-            time_pattern = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
+            if self.is_job_cancelled(job_id):
+                logger.info(f"Job {job_id} cancelled after video merge, before audio merge")
+                return
 
-            check_interval_sec = 2.0
-            next_check_time = time.monotonic() + check_interval_sec
-            stderr_lines = []
-
-            while True:
-                line = process.stderr.readline()
-                if not line and process.poll() is not None:
-                    break
-                if line:
-                    stderr_lines.append(line)
-                    match = time_pattern.search(line)
-                    if match and total_duration and total_duration > 0:
-                        h, m, s, cs = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
-                        current_time = h * 3600 + m * 60 + s + cs / 100.0
-                        progress = int(5 + (current_time / total_duration) * 85)
-                        progress = min(progress, 90)
-                        if progress > last_progress:
-                            last_progress = progress
-                            self.update_job_status(job_id, "downloading", progress=progress)
-
-                now = time.monotonic()
-                if now >= next_check_time:
-                    next_check_time = now + check_interval_sec
+            if audio_files:
+                audio_only_path = str(Path(temp_dir) / "audio_concat.mp4")
+                ok = merge_segments(
+                    segment_files=audio_files,
+                    output_file=audio_only_path,
+                    threads=int(os.getenv('FFMPEG_THREADS', 4)),
+                    concat_dir=temp_dir,
+                    target_duration=manifest['duration'],
+                    is_fmp4=True,
+                    init_segment_path=audio_init_path,
+                    cancel_check=lambda: self.is_job_cancelled(job_id),
+                )
+                if not ok:
                     if self.is_job_cancelled(job_id):
-                        logger.info(f"Job {job_id} cancelled during MPD download, killing ffmpeg")
-                        process.kill()
-                        process.wait()
-                        if Path(output_file).exists():
-                            Path(output_file).unlink()
+                        logger.info(f"Job {job_id} cancelled during audio merge")
                         return
+                    # Codex review #3: same fail-closed rule. Audio merge
+                    # failure when MPD declared audio = job failure, not
+                    # silent video-only.
+                    raise Exception(
+                        "Audio segments merge failed — MPD declared an audio "
+                        "AdaptationSet, so refusing to ship video-only output. "
+                        "Check ffmpeg logs above for the merge error."
+                    )
+            else:
+                # No audio AdaptationSet in MPD at all → video-only is the
+                # genuine, intended output (some VOD content is silent).
+                audio_only_path = None
 
-            return_code = process.wait()
+            if self.is_job_cancelled(job_id):
+                logger.info(f"Job {job_id} cancelled before mux")
+                return
 
-            if return_code != 0:
-                stderr_text = "".join(stderr_lines[-20:])
-                raise Exception(f"FFmpeg failed (exit {return_code}): {stderr_text}")
+            # Final mux (or copy video-only)
+            if audio_only_path:
+                logger.info(f"Step 6: Muxing video + audio into {output_file}")
+                ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+                mux_cmd = [
+                    ffmpeg_path,
+                    '-i', video_only_path,
+                    '-i', audio_only_path,
+                    '-c:v', 'copy', '-c:a', 'copy',
+                    '-map', '0:v:0', '-map', '1:a:0',
+                    '-y', output_file,
+                ]
+                # Codex review #9: use Popen + poll cancellation instead of
+                # subprocess.run(timeout=600). A user-cancelled job would
+                # otherwise keep ffmpeg running for up to 10 minutes before
+                # noticing. With Popen we kill it immediately when we see
+                # the cancellation flag.
+                mux_proc = subprocess.Popen(
+                    mux_cmd,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                mux_poll_interval = 1.0
+                mux_deadline = time.monotonic() + 600.0  # same overall cap as before
+                stderr_chunks: List[bytes] = []
+
+                def _drain_stderr():
+                    try:
+                        while True:
+                            chunk = mux_proc.stderr.read(65536)
+                            if not chunk:
+                                break
+                            stderr_chunks.append(chunk)
+                    except Exception:
+                        pass
+
+                drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
+                drain_thread.start()
+                try:
+                    while True:
+                        ret = mux_proc.poll()
+                        if ret is not None:
+                            break
+                        if self.is_job_cancelled(job_id):
+                            logger.info(f"Job {job_id} cancelled during mux, killing ffmpeg")
+                            mux_proc.kill()
+                            mux_proc.wait()
+                            if Path(output_file).exists():
+                                Path(output_file).unlink()
+                            return
+                        if time.monotonic() > mux_deadline:
+                            logger.error(f"Job {job_id} mux exceeded 600s, killing ffmpeg")
+                            mux_proc.kill()
+                            mux_proc.wait()
+                            raise Exception("FFmpeg mux exceeded 600s timeout")
+                        time.sleep(mux_poll_interval)
+                finally:
+                    drain_thread.join(timeout=2.0)
+                if mux_proc.returncode != 0:
+                    stderr_text = b"".join(stderr_chunks).decode('utf-8', errors='replace')
+                    raise Exception(f"FFmpeg mux failed (exit {mux_proc.returncode}): {stderr_text[-500:]}")
+            else:
+                # video-only — just rename
+                shutil.move(video_only_path, output_file)
+
+            self.update_job_status(job_id, "processing", progress=95)
 
             if not Path(output_file).exists() or Path(output_file).stat().st_size == 0:
-                raise Exception("FFmpeg produced empty output")
+                raise Exception("Output file empty after mux")
 
             if self.is_job_cancelled(job_id):
                 if Path(output_file).exists():
@@ -678,13 +976,20 @@ class DownloadWorker:
 
             self.update_job_status(
                 job_id, "completed", progress=100,
-                file_path=output_file, file_size=file_size
+                file_path=output_file, file_size=file_size,
             )
             logger.info(f"Job {job_id} completed (MPD): {output_file} ({file_size / 1024 / 1024:.2f} MB)")
 
         except Exception as e:
             logger.error(f"Job {job_id} MPD download failed: {e}", exc_info=True)
             self._handle_job_failure(job_id, job, str(e))
+        finally:
+            if temp_dir and Path(temp_dir).exists():
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    logger.info(f"Cleaned up temp directory: {temp_dir}")
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to clean up {temp_dir}: {cleanup_err}")
 
     def _process_direct_download(self, job_id: str, job: dict):
         """Process direct file download (MP4, MOV, etc.)"""
@@ -1042,12 +1347,163 @@ class DownloadWorker:
             logger.error(f"Job {job_id} failed: {e}", exc_info=True)
             self._handle_job_failure(job_id, job, str(e))
     
+    def _process_mpd_with_ffmpeg(self, job_id: str, job: dict, headers: dict):
+        """Fallback DASH path: hand the MPD URL to ffmpeg directly.
+
+        Used by `_process_mpd_download` when our parse_mpd can't handle the
+        manifest (Codex review #14 — preserve v2.3.x DASH capability for
+        SegmentList, SegmentBase, multi-period, $Time$-templates, etc.).
+
+        Tradeoff: ffmpeg's HTTP client doesn't go through SegmentDownloader
+        so we lose host_throttle, adaptive_delay, referer/mobile_ua
+        strategies, HOST_HEADERS_FILE overrides, and curl_cffi chrome
+        impersonation. For a CDN that's serving a complex DASH manifest
+        AND aggressively anti-bot, this fallback may still get throttled —
+        but at least it can attempt the download. Better than hard failure.
+        """
+        import re
+
+        # Build ffmpeg -headers string from the (already-prepared) headers dict
+        header_str = ""
+        for k, v in headers.items():
+            if k.lower() in ('host', 'connection', 'content-length', 'accept-encoding'):
+                continue
+            header_str += f"{k}: {v}\r\n"
+
+        safe_title = _make_safe_filename_stem(job.get('title') or '', fallback=f"video_{job_id[:8]}")
+        output_dir = resolve_output_dir(job.get('output_subdir'))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        base_name = safe_title
+        output_file = output_dir / f"{base_name}.mp4"
+        counter = 1
+        while output_file.exists():
+            output_file = output_dir / f"{base_name} ({counter}).mp4"
+            counter += 1
+        output_file = str(output_file)
+
+        # Probe duration for progress display
+        total_duration = None
+        try:
+            ffprobe_path = shutil.which("ffprobe")
+            if ffprobe_path:
+                probe_cmd = [ffprobe_path, "-v", "error"]
+                if header_str:
+                    probe_cmd += ["-headers", header_str]
+                probe_cmd += [
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    job['url'],
+                ]
+                probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                if probe.returncode == 0 and probe.stdout.strip():
+                    total_duration = float(probe.stdout.strip())
+        except Exception as e:
+            logger.warning(f"Failed to probe MPD duration: {e}")
+
+        ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+        cmd = [ffmpeg_path]
+        if header_str:
+            cmd += ["-headers", header_str]
+        cmd += ["-i", job['url'], "-c", "copy", "-y", output_file]
+
+        logger.info(f"FFmpeg DASH fallback: {output_file}")
+        self.update_job_status(job_id, "downloading", progress=5)
+
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        last_progress = 5
+        time_pattern = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
+        check_interval_sec = 2.0
+        next_check_time = time.monotonic() + check_interval_sec
+        stderr_lines: List[str] = []
+
+        while True:
+            line = process.stderr.readline()
+            if not line and process.poll() is not None:
+                break
+            if line:
+                stderr_lines.append(line)
+                m = time_pattern.search(line)
+                if m and total_duration and total_duration > 0:
+                    h, mi, s, cs = (int(m.group(i)) for i in range(1, 5))
+                    current = h * 3600 + mi * 60 + s + cs / 100.0
+                    progress = min(int(5 + (current / total_duration) * 85), 90)
+                    if progress > last_progress:
+                        last_progress = progress
+                        self.update_job_status(job_id, "downloading", progress=progress)
+            now = time.monotonic()
+            if now >= next_check_time:
+                next_check_time = now + check_interval_sec
+                if self.is_job_cancelled(job_id):
+                    logger.info(f"Job {job_id} cancelled during MPD ffmpeg fallback, killing")
+                    process.kill()
+                    process.wait()
+                    if Path(output_file).exists():
+                        Path(output_file).unlink()
+                    return
+
+        rc = process.wait()
+        if rc != 0:
+            stderr_text = "".join(stderr_lines[-20:])
+            raise Exception(f"FFmpeg DASH fallback failed (exit {rc}): {stderr_text}")
+        if not Path(output_file).exists() or Path(output_file).stat().st_size == 0:
+            raise Exception("FFmpeg DASH fallback produced empty output")
+
+        if self.is_job_cancelled(job_id):
+            if Path(output_file).exists():
+                Path(output_file).unlink()
+            return
+
+        file_size = Path(output_file).stat().st_size
+        duration_seconds = self._probe_duration_seconds(output_file)
+        if duration_seconds is not None:
+            self.db.execute(
+                text("""
+                    INSERT INTO job_metadata (job_id, duration)
+                    VALUES (:job_id, :duration)
+                    ON CONFLICT (job_id)
+                    DO UPDATE SET duration = EXCLUDED.duration
+                """),
+                {"job_id": job_id, "duration": duration_seconds},
+            )
+            self.db.commit()
+
+        self.update_job_status(
+            job_id, "completed", progress=100,
+            file_path=output_file, file_size=file_size,
+        )
+        logger.info(f"Job {job_id} completed (MPD ffmpeg fallback): {output_file} ({file_size / 1024 / 1024:.2f} MB)")
+
+    @staticmethod
+    def _collect_mpd_urls(video: dict, audio: Optional[dict]):
+        """Yield every URL the MPD download path will fetch.
+
+        Used by the SSRF guard pass right after parse_mpd: we trust the
+        original job URL (already SSRF-checked at the entry of
+        _process_mpd_download), but the MPD content is attacker-controlled
+        and can resolve BaseURL/SegmentTemplate to arbitrary internal hosts
+        (Codex review #5). Re-validating each derived URL here keeps SSRF
+        guard semantics consistent with how it works for direct HLS jobs.
+        """
+        if video:
+            if video.get('init_segment_url'):
+                yield video['init_segment_url']
+            for seg in video.get('segments') or []:
+                if seg.get('url'):
+                    yield seg['url']
+        if audio:
+            if audio.get('init_segment_url'):
+                yield audio['init_segment_url']
+            for seg in audio.get('segments') or []:
+                if seg.get('url'):
+                    yield seg['url']
+
     def _download_init_segment(
         self,
         url: str,
         headers: dict,
         session,
         temp_dir: str,
+        filename: str = "init.mp4",
     ) -> Optional[str]:
         """Download the HLS-fMP4 init segment (referenced by #EXT-X-MAP).
 
@@ -1063,9 +1519,15 @@ class DownloadWorker:
         Retries up to 3 times with simple backoff. No Referer-strategy
         fallback (the same Referer that works for media segments works for
         init), no concurrency throttle (one request, can't burst).
+
+        `filename` lets MPD callers pass distinct names for video and audio
+        init segments. Default "init.mp4" is fine for HLS-fMP4 (one init
+        per job). Without this, two callers sharing temp_dir overwrote
+        each other's init bytes — the video merge then fed audio init
+        bytes to ffmpeg, producing corrupt output (Codex review #7).
         """
         from pathlib import Path
-        init_path = Path(temp_dir) / "init.mp4"
+        init_path = Path(temp_dir) / filename
         max_attempts = 3
         last_err: Optional[str] = None
         for attempt in range(max_attempts):

@@ -226,6 +226,59 @@ def test_merge_keeps_mpegts_path_intact_for_ts(tmp_path, monkeypatch):
     assert "aac_adtstoasc" in cmd
 
 
+def test_merge_cancel_check_aborts_during_segment_streaming(tmp_path, monkeypatch):
+    """Codex review #13 (round 6): cancel_check is polled BEFORE each
+    segment is streamed to ffmpeg. When it returns True mid-stream,
+    merge must kill ffmpeg and remove any partial output."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    # 5 segments — cancellation fires before segment 3 streams.
+    seg_paths = []
+    for i in range(5):
+        p = tmp_path / f"segment_{i:05d}.ts"
+        p.write_bytes(b"x" * 376)
+        seg_paths.append(str(p))
+
+    output = tmp_path / "out.mp4"
+    captured = _patch_popen(monkeypatch)
+
+    # Cancel after the 2nd cancel_check call (i.e. before segment index 2).
+    cancel_state = {"calls": 0}
+
+    def cancel_after_two_polls():
+        cancel_state["calls"] += 1
+        return cancel_state["calls"] > 2
+
+    ok = merge_segments(
+        seg_paths,
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+        cancel_check=cancel_after_two_polls,
+    )
+    assert ok is False, "cancelled merge must return False"
+
+    # ffmpeg was killed
+    assert captured["instances"][0].returncode == -9
+    # Partial output removed
+    assert not output.exists(), f"partial output should be removed, but {output} still exists"
+
+
+def test_merge_cancel_check_default_none_is_no_op(tmp_path, monkeypatch):
+    """Sanity: existing callers (HLS path) that don't pass cancel_check
+    still work normally — no polling, no behavior change."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+    _patch_popen(monkeypatch)
+
+    ok = merge_segments([str(seg)], str(output), concat_dir=str(tmp_path), try_re_encode=False)
+    assert ok is True
+    assert output.exists()
+
+
 def test_merge_with_re_encode_skipped_for_fmp4(tmp_path, monkeypatch):
     """The re-encode fallback uses the concat demuxer, which can't handle
     .m4s segments without inline init. is_fmp4 → return False without
