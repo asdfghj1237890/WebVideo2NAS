@@ -952,6 +952,84 @@ def test_download_all_cleans_pacing_state_even_on_callback_exception(tmp_path):
     )
 
 
+# --- v2.3.16: mobile_ua fallback strategy (CocoCut-inspired) -----------
+
+
+def test_strategies_include_mobile_ua_as_last_resort(tmp_path):
+    """The mobile_ua strategy must be present and ordered LAST so it only
+    fires after all referer-based strategies have been exhausted."""
+    d = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={'Referer': 'https://example.com/', 'Origin': 'https://example.com'},
+        m3u8_url='https://cdn.example.com/v/index.m3u8',
+        session=object(),
+    )
+    strategies = d._get_referer_strategies('https://cdn.example.com/v/seg-1.ts')
+
+    names = [s['name'] for s in strategies]
+    assert 'mobile_ua' in names, "mobile_ua strategy must be in the strategy list"
+    assert names[-1] == 'mobile_ua', (
+        f"mobile_ua should be the LAST strategy (only fire after referer "
+        f"strategies exhausted). Got order: {names}"
+    )
+
+
+def test_mobile_ua_strategy_overrides_user_agent_to_iphone():
+    """mobile_ua strategy must set User-Agent to an iPhone Safari UA."""
+    d = SegmentDownloader(
+        segments=[],
+        output_dir='/tmp',
+        headers={},
+        session=object(),
+    )
+    strategies = d._get_referer_strategies('https://cdn.example.com/v/seg.ts')
+    mobile = next(s for s in strategies if s['name'] == 'mobile_ua')
+
+    assert 'User-Agent' in mobile, "mobile_ua must set User-Agent"
+    ua = mobile['User-Agent']
+    assert 'iPhone' in ua, f"expected iPhone in mobile UA, got {ua!r}"
+    assert 'Mobile/' in ua, f"expected 'Mobile/' marker, got {ua!r}"
+    assert 'Safari' in ua, f"expected Safari in mobile UA, got {ua!r}"
+
+
+def test_mobile_ua_strategy_keeps_source_referer():
+    """mobile_ua should NOT combine multiple changes — it inherits the
+    original Referer/Origin so we don't conflate two variables per attempt."""
+    d = SegmentDownloader(
+        segments=[],
+        output_dir='/tmp',
+        headers={'Referer': 'https://my-site.test/page', 'Origin': 'https://my-site.test'},
+        session=object(),
+    )
+    strategies = d._get_referer_strategies('https://cdn.example.com/v/seg.ts')
+    mobile = next(s for s in strategies if s['name'] == 'mobile_ua')
+
+    assert mobile['Referer'] == 'https://my-site.test/page'
+    assert mobile['Origin'] == 'https://my-site.test'
+
+
+def test_strategies_without_referer_have_no_user_agent_override():
+    """Non-mobile_ua strategies must NOT set User-Agent — only the mobile
+    strategy should switch UA. Otherwise we'd accidentally change UA
+    fingerprint on every strategy probe."""
+    d = SegmentDownloader(
+        segments=[],
+        output_dir='/tmp',
+        headers={'Referer': 'https://example.com/', 'Origin': 'https://example.com'},
+        m3u8_url='https://cdn.example.com/v/index.m3u8',
+        session=object(),
+    )
+    strategies = d._get_referer_strategies('https://cdn.example.com/v/seg.ts')
+    for s in strategies:
+        if s['name'] == 'mobile_ua':
+            continue
+        assert 'User-Agent' not in s, (
+            f"strategy {s['name']!r} unexpectedly sets User-Agent — only "
+            f"mobile_ua should override UA"
+        )
+
+
 def test_invalid_validation_does_not_shrink_pacing_delay(tmp_path):
     """Codex review #7: a CDN that returns HTTP 200 with garbage bytes
     (>= 188, not an obvious image, not a known block page) must NOT

@@ -717,34 +717,58 @@ class SegmentDownloader:
             logger.warning(f"Decryption failed for segment {segment_index}: {e}")
             return data
     
-    def _get_referer_strategies(self, segment_url: str) -> List[Dict[str, str]]:
+    # Recent-ish iOS Safari User-Agent for the mobile_ua fallback strategy.
+    # Some CDNs (notably phncdn) serve different — sometimes less-protected
+    # — streams to mobile clients. If desktop Chrome UA is being throttled,
+    # presenting as iPhone Safari may unlock the same content via the mobile
+    # path. Bumped roughly with each major iOS release; not version-pinned
+    # (the CDN cares "is this mobile?", not "is this iOS 18.2 vs 18.4?").
+    MOBILE_USER_AGENT = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 "
+        "Mobile/15E148 Safari/604.1"
+    )
+
+    def _get_referer_strategies(self, segment_url: str) -> List[Dict[str, Optional[str]]]:
         """
-        Generate different Referer/Origin header combinations to try.
-        Some CDNs have specific requirements for these headers.
+        Generate different header combinations to try when downloading a segment.
+
+        Strategies in order:
+          1. source_page    — original Referer (the page the user was on)
+          2. segment_domain — Referer = segment's own host (same-origin)
+          3. m3u8_url       — Referer = the m3u8 URL itself
+          4. no_referer     — strip Referer/Origin entirely
+          5. mobile_ua      — keep source_page Referer but switch UA to iOS
+                              Safari (some CDNs serve mobile-friendly streams
+                              with lower throttling — borrowed from CocoCut)
+
+        Each strategy dict can override Referer, Origin, and/or User-Agent.
+        Missing keys mean "inherit from self.headers"; explicit None means
+        "remove from outgoing headers".
         """
-        strategies = []
-        
+        strategies: List[Dict[str, Optional[str]]] = []
+
         # Parse URLs for building strategies
         segment_parsed = urlparse(segment_url)
         segment_origin = f"{segment_parsed.scheme}://{segment_parsed.netloc}"
-        
+
         original_referer = self.headers.get('Referer', '')
         original_origin = self.headers.get('Origin', '')
-        
-        # Strategy 1: Original headers (source page as Referer) - already tried
+
+        # Strategy 1: Original headers (source page as Referer)
         strategies.append({
             'name': 'source_page',
             'Referer': original_referer,
-            'Origin': original_origin
+            'Origin': original_origin,
         })
-        
-        # Strategy 2: Use segment's own domain as Referer (same-origin request simulation)
+
+        # Strategy 2: Use segment's own domain as Referer (same-origin simulation)
         strategies.append({
             'name': 'segment_domain',
             'Referer': segment_origin + '/',
-            'Origin': segment_origin
+            'Origin': segment_origin,
         })
-        
+
         # Strategy 3: Use m3u8 URL as Referer
         if self.m3u8_url:
             m3u8_parsed = urlparse(self.m3u8_url)
@@ -752,16 +776,28 @@ class SegmentDownloader:
             strategies.append({
                 'name': 'm3u8_url',
                 'Referer': self.m3u8_url,
-                'Origin': m3u8_origin
+                'Origin': m3u8_origin,
             })
-        
+
         # Strategy 4: No Referer/Origin (some servers allow this)
         strategies.append({
             'name': 'no_referer',
             'Referer': None,
-            'Origin': None
+            'Origin': None,
         })
-        
+
+        # Strategy 5: mobile UA (v2.3.16). Last-resort — most CDNs accept the
+        # default desktop UA fine, but for the ones that throttle desktop
+        # specifically (phncdn, some premium CDNs), iPhone Safari fingerprint
+        # often gets through. Keeps source_page Referer/Origin so we don't
+        # combine multiple changes per attempt.
+        strategies.append({
+            'name': 'mobile_ua',
+            'Referer': original_referer,
+            'Origin': original_origin,
+            'User-Agent': self.MOBILE_USER_AGENT,
+        })
+
         return strategies
     
     def _try_download_with_headers(self, url: str, headers: Dict, index: int) -> Optional[bytes]:
@@ -948,6 +984,10 @@ class SegmentDownloader:
                     headers['Origin'] = strategy['Origin']
                 elif 'Origin' in headers and strategy.get('Origin') is None:
                     del headers['Origin']
+                # User-Agent override (v2.3.16 mobile_ua strategy support).
+                # Strategies that don't set this inherit self.headers['User-Agent'].
+                if strategy.get('User-Agent'):
+                    headers['User-Agent'] = strategy['User-Agent']
 
                 # _try_download_with_headers re-raises on transport errors
                 # (RST/timeout) so this branch only fires on application-level
@@ -986,14 +1026,19 @@ class SegmentDownloader:
                         headers['Referer'] = strategy['Referer']
                     elif 'Referer' in headers and strategy.get('Referer') is None:
                         del headers['Referer']
-                    
+
                     if strategy.get('Origin'):
                         headers['Origin'] = strategy['Origin']
                     elif 'Origin' in headers and strategy.get('Origin') is None:
                         del headers['Origin']
-                    
+
+                    # User-Agent override (v2.3.16 mobile_ua strategy support).
+                    # Strategies that don't set this inherit self.headers['User-Agent'].
+                    if strategy.get('User-Agent'):
+                        headers['User-Agent'] = strategy['User-Agent']
+
                     if index == 0 and retry_count == 0:
-                        logger.info(f"Trying Referer strategy: {strategy['name']}")
+                        logger.info(f"Trying strategy: {strategy['name']}")
                     
                     content = self._try_download_with_headers(url, headers, index)
                     
