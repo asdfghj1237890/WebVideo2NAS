@@ -17,6 +17,13 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from ssl_adapter import create_legacy_session, create_impersonated_session, tls_verify_enabled
 
+# Cross-process per-host concurrency throttle. Optional — no-op when
+# HOST_CONCURRENCY_CAP env is unset. See host_throttle.py for rationale.
+try:
+    import host_throttle as _host_throttle
+except ImportError:
+    _host_throttle = None  # type: ignore[assignment]
+
 # Network-layer errors that should NOT trigger Referer-strategy fallback.
 # A RST or transfer timeout means the host is throttling/dropping us — trying
 # 4 different Referer/Origin combos against the same throttled host just
@@ -449,63 +456,65 @@ class SegmentDownloader:
             pressure. Let the outer retry+backoff in download_segment
             handle recovery.
         """
+        # Acquire a per-host slot if cross-process throttle is enabled. Held
+        # for the entire request (including response.content read) — we don't
+        # release mid-transfer because a partial download still occupies a
+        # connection slot at the CDN. Released in the outer finally below.
+        throttle = _host_throttle.get() if _host_throttle is not None else None
+        slot_acquired = throttle.acquire(url) if throttle is not None else False
         try:
-            response = self.session.get(
-                url,
-                headers=headers,
-                timeout=self.timeout,
-                stream=False
-            )
-        except _TRANSPORT_ERRORS:
-            # Network-layer failure — re-raise so caller skips remaining
-            # strategies and falls into outer retry+backoff.
-            raise
-        except Exception as e:
-            # Unknown error during the request itself — treat as transport
-            # to be safe (don't burn extra strategies on a mystery failure).
-            logger.debug(f"Segment {index} request raised unexpected error, treating as transport: {e}")
-            raise
-
-        try:
-            # Log response cookies for debugging
-            if response.cookies and index == 0:
-                logger.info(f"Response set cookies: {dict(response.cookies)}")
-
-            if response.status_code == 474:
-                logger.debug(f"Segment {index} got 474 error with current headers")
-                return None
-
-            response.raise_for_status()
-            content = response.content
-
-            # Early content-type based blocking detection
-            content_type = ""
             try:
-                content_type = response.headers.get("Content-Type", "")
-            except Exception:
+                response = self.session.get(
+                    url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    stream=False
+                )
+
+                # Log response cookies for debugging
+                if response.cookies and index == 0:
+                    logger.info(f"Response set cookies: {dict(response.cookies)}")
+
+                if response.status_code == 474:
+                    logger.debug(f"Segment {index} got 474 error with current headers")
+                    return None
+
+                response.raise_for_status()
+                content = response.content
+
+                # Early content-type based blocking detection
                 content_type = ""
-            blocked, _reason = self._is_obviously_blocked_response(content, content_type=content_type)
-            if blocked:
+                try:
+                    content_type = response.headers.get("Content-Type", "")
+                except Exception:
+                    content_type = ""
+                blocked, _reason = self._is_obviously_blocked_response(content, content_type=content_type)
+                if blocked:
+                    return None
+
+                if len(content) < 188:
+                    return None
+
+                # Check if response is an anti-hotlink image
+                if content[:3] == JPEG_MAGIC or content[:4] == PNG_MAGIC or content[:4] == GIF_MAGIC:
+                    return None
+
+                return content
+
+            except _TRANSPORT_ERRORS:
+                # Network-layer failure (connect timeout, RST, partial-body
+                # timeout). Re-raise so caller skips remaining Referer
+                # strategies and falls into outer retry+backoff. Switching
+                # strategies against a throttled host just adds pressure.
+                raise
+            except Exception as e:
+                # HTTP-level failure (raise_for_status on 4xx/5xx, etc.) —
+                # an alternate Referer might succeed.
+                logger.debug(f"Segment {index} download attempt failed (HTTP/app level): {e}")
                 return None
-
-            if len(content) < 188:
-                return None
-
-            # Check if response is an anti-hotlink image
-            if content[:3] == JPEG_MAGIC or content[:4] == PNG_MAGIC or content[:4] == GIF_MAGIC:
-                return None
-
-            return content
-
-        except _TRANSPORT_ERRORS:
-            # Body read raised a transport error (partial body / mid-transfer
-            # RST). Same reasoning as above — don't switch strategies.
-            raise
-        except Exception as e:
-            # HTTP-level failure (raise_for_status on 4xx/5xx, etc.) —
-            # an alternate Referer might succeed.
-            logger.debug(f"Segment {index} download attempt failed (HTTP/app level): {e}")
-            return None
+        finally:
+            if slot_acquired and throttle is not None:
+                throttle.release(url)
     
     def download_segment(
         self, 

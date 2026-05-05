@@ -104,6 +104,10 @@ services:
       - MAX_DOWNLOAD_WORKERS=${MAX_DOWNLOAD_WORKERS:-10}
       - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
       - FFMPEG_THREADS=${FFMPEG_THREADS:-4}
+      # Cross-process per-host cap (v2.3.11+). Unset/0 = disabled.
+      # See .env.example for rationale. All workers share state via Redis.
+      - HOST_CONCURRENCY_CAP=${HOST_CONCURRENCY_CAP:-}
+      - HOST_CONCURRENCY_TTL=${HOST_CONCURRENCY_TTL:-300}
       - STORAGE_PATH=/downloads
     volumes:
       - /volume1/video-downloader/downloads:/downloads
@@ -137,6 +141,10 @@ services:
       - MAX_DOWNLOAD_WORKERS=${MAX_DOWNLOAD_WORKERS:-10}
       - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
       - FFMPEG_THREADS=${FFMPEG_THREADS:-4}
+      # Cross-process per-host cap (v2.3.11+). Unset/0 = disabled.
+      # See .env.example for rationale. All workers share state via Redis.
+      - HOST_CONCURRENCY_CAP=${HOST_CONCURRENCY_CAP:-}
+      - HOST_CONCURRENCY_TTL=${HOST_CONCURRENCY_TTL:-300}
       - STORAGE_PATH=/downloads
     volumes:
       - /volume1/video-downloader/downloads:/downloads
@@ -170,6 +178,10 @@ services:
       - MAX_DOWNLOAD_WORKERS=${MAX_DOWNLOAD_WORKERS:-10}
       - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
       - FFMPEG_THREADS=${FFMPEG_THREADS:-4}
+      # Cross-process per-host cap (v2.3.11+). Unset/0 = disabled.
+      # See .env.example for rationale. All workers share state via Redis.
+      - HOST_CONCURRENCY_CAP=${HOST_CONCURRENCY_CAP:-}
+      - HOST_CONCURRENCY_TTL=${HOST_CONCURRENCY_TTL:-300}
       - STORAGE_PATH=/downloads
     volumes:
       - /volume1/video-downloader/downloads:/downloads

@@ -1552,7 +1552,12 @@ def main():
                 sys.exit(1)
             logger.warning(f"Waiting for Redis... ({i+1}/{max_retries})")
             time.sleep(2)
-    
+
+    # Initialize cross-process per-host concurrency throttle (no-op when
+    # HOST_CONCURRENCY_CAP is unset). Must run after redis is reachable.
+    import host_throttle
+    host_throttle.init(redis_client)
+
     # Start worker
     worker = DownloadWorker()
     worker.run()
