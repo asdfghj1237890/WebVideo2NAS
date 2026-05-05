@@ -5,6 +5,7 @@ Multi-threaded downloader for m3u8 video segments
 
 import logging
 import os
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Callable
@@ -15,6 +16,30 @@ import urllib3
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from ssl_adapter import create_legacy_session, create_impersonated_session, tls_verify_enabled
+
+# Network-layer errors that should NOT trigger Referer-strategy fallback.
+# A RST or transfer timeout means the host is throttling/dropping us — trying
+# 4 different Referer/Origin combos against the same throttled host just
+# amplifies pressure. These get re-raised so the outer retry+backoff handles
+# them instead. HTTP-layer rejections (4xx/5xx, anti-hotlink images) still
+# fall back to other strategies as before.
+_TRANSPORT_ERRORS: tuple = ()
+try:
+    from curl_cffi.requests.exceptions import (
+        Timeout as _CurlTimeout,
+        ConnectionError as _CurlConnectionError,
+    )
+    _TRANSPORT_ERRORS = _TRANSPORT_ERRORS + (_CurlTimeout, _CurlConnectionError)
+except ImportError:
+    pass
+try:
+    from requests.exceptions import (
+        Timeout as _ReqTimeout,
+        ConnectionError as _ReqConnectionError,
+    )
+    _TRANSPORT_ERRORS = _TRANSPORT_ERRORS + (_ReqTimeout, _ReqConnectionError)
+except ImportError:
+    pass
 
 if not tls_verify_enabled():
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -406,7 +431,24 @@ class SegmentDownloader:
         return strategies
     
     def _try_download_with_headers(self, url: str, headers: Dict, index: int) -> Optional[bytes]:
-        """Try downloading a segment with specific headers, returns content or None"""
+        """
+        Try downloading a segment with specific headers.
+
+        Returns:
+            bytes on success.
+            None when an HTTP response was received but indicates an
+            application-level rejection (4xx/5xx, 474, anti-hotlink image,
+            HTML/JSON block page, body too small). Caller should try a
+            different Referer/Origin strategy.
+
+        Raises:
+            Transport errors (Timeout, ConnectionError, etc. — see
+            _TRANSPORT_ERRORS at module level). Caller must NOT switch
+            strategies in this case: the host is throttling or unreachable
+            and trying alternate Referers against the same host just adds
+            pressure. Let the outer retry+backoff in download_segment
+            handle recovery.
+        """
         try:
             response = self.session.get(
                 url,
@@ -414,15 +456,25 @@ class SegmentDownloader:
                 timeout=self.timeout,
                 stream=False
             )
-            
+        except _TRANSPORT_ERRORS:
+            # Network-layer failure — re-raise so caller skips remaining
+            # strategies and falls into outer retry+backoff.
+            raise
+        except Exception as e:
+            # Unknown error during the request itself — treat as transport
+            # to be safe (don't burn extra strategies on a mystery failure).
+            logger.debug(f"Segment {index} request raised unexpected error, treating as transport: {e}")
+            raise
+
+        try:
             # Log response cookies for debugging
             if response.cookies and index == 0:
                 logger.info(f"Response set cookies: {dict(response.cookies)}")
-            
+
             if response.status_code == 474:
                 logger.debug(f"Segment {index} got 474 error with current headers")
                 return None
-            
+
             response.raise_for_status()
             content = response.content
 
@@ -435,18 +487,24 @@ class SegmentDownloader:
             blocked, _reason = self._is_obviously_blocked_response(content, content_type=content_type)
             if blocked:
                 return None
-            
+
             if len(content) < 188:
                 return None
-            
+
             # Check if response is an anti-hotlink image
             if content[:3] == JPEG_MAGIC or content[:4] == PNG_MAGIC or content[:4] == GIF_MAGIC:
                 return None
-            
+
             return content
-            
+
+        except _TRANSPORT_ERRORS:
+            # Body read raised a transport error (partial body / mid-transfer
+            # RST). Same reasoning as above — don't switch strategies.
+            raise
         except Exception as e:
-            logger.debug(f"Download attempt failed: {e}")
+            # HTTP-level failure (raise_for_status on 4xx/5xx, etc.) —
+            # an alternate Referer might succeed.
+            logger.debug(f"Segment {index} download attempt failed (HTTP/app level): {e}")
             return None
     
     def download_segment(
@@ -497,18 +555,23 @@ class SegmentDownloader:
                 elif 'Origin' in headers and strategy.get('Origin') is None:
                     del headers['Origin']
 
+                # _try_download_with_headers re-raises on transport errors
+                # (RST/timeout) so this branch only fires on application-level
+                # rejections (4xx/5xx/474/anti-hotlink). On transport errors
+                # the cached strategy is still correct — the host is throttled,
+                # not the Referer wrong — and the exception propagates to the
+                # outer retry+backoff without invalidating the cache.
                 content = self._try_download_with_headers(url, headers, index)
                 if content:
                     used_strategy = strategy['name']
                 else:
-                    # The previously-working strategy stopped working. Drop it so we don't
-                    # waste an extra request on every subsequent segment. Usually this means
-                    # the CDN's signed auth token (?auth=...&exp=...) has expired, not that
-                    # the Referer header is wrong — re-probing won't help, but at least we
-                    # stop trusting a stale cache.
+                    # Application-level rejection (token expired / Referer
+                    # newly required). Drop the cache so the strategy loop
+                    # below can re-probe.
                     logger.warning(
-                        f"Cached Referer strategy '{strategy['name']}' stopped working "
-                        f"(segment {index}); invalidating. Likely a signed-URL/token expiry."
+                        f"Cached Referer strategy '{strategy['name']}' got an "
+                        f"application-level rejection (segment {index}); "
+                        f"invalidating. Likely a signed-URL/token expiry."
                     )
                     self.working_referer_strategy = None
             
@@ -652,9 +715,13 @@ class SegmentDownloader:
                 self.failed_segments.append({'segment': segment, 'error': err_str})
                 return None
 
-            # Retry logic
+            # Retry logic — exponential backoff with full jitter so N segments
+            # that failed simultaneously (typical CDN-throttle pattern) don't
+            # all wake up at the same moment and burst-retry against the still-
+            # throttled host. Sleep range: [base, 2*base) where base = 2^retry.
             if retry_count < self.max_retries:
-                time.sleep(2 ** retry_count)  # Exponential backoff
+                base = 2 ** retry_count
+                time.sleep(base + random.uniform(0, base))
                 return self.download_segment(segment, retry_count + 1)
             else:
                 logger.error(f"Segment {index} failed after {self.max_retries} attempts")
