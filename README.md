@@ -62,6 +62,7 @@ Chrome Extension → NAS Docker (API + Worker) → Video Storage
 
 - **[🚀 Installation Guide](#installation)** - Complete setup instructions
 - **[📋 Technical Documentation](docs/)** - Architecture & specifications
+- **[🛠️ Developer Docs](docs/development/)** - Internal developer guide (8 chapters: getting started, architecture, chrome ext, worker pipeline, API, testing, CI/release, bug case studies)
 - **[🔒 Security Policy](#security)** - Security guidelines
 - **[🤝 Contributing](#contributing)** - How to contribute
 
@@ -81,12 +82,13 @@ Chrome Extension → NAS Docker (API + Worker) → Video Storage
 
 ### NAS Docker Service
 - ✅ RESTful API for job management
-- ✅ **Dual-worker architecture** for parallel processing
+- ✅ **Multi-worker architecture** (3 workers by default in the Synology compose) for parallel processing
 - ✅ Multi-threaded segment downloader
 - ✅ FFmpeg-based video merging
 - ✅ Job queue with Redis
 - ✅ Progress tracking & notifications
 - ✅ Persistent storage with PostgreSQL
+- ✅ Periodic DB cleanup service (per-status retention + orphan partial-file removal)
 
 ## Technology Stack
 
@@ -107,12 +109,14 @@ Chrome Extension → NAS Docker (API + Worker) → Video Storage
 
 ```
 webvideo2nas/
-├── chrome-extension/  # Chrome extension source
-├── docs/              # Documentation
-├── video-downloader/  # NAS downloader (Docker stack)
-│   └── docker/        # Docker services (API + Worker)
-├── pics/              # Diagrams used by README
-└── README.md          # This file
+├── chrome-extension/      # Chrome extension source
+├── docs/                  # User-facing documentation
+│   └── development/       # Developer-facing internal docs (architecture,
+│                          # worker pipeline, testing, CI, bug case studies)
+├── video-downloader/      # NAS downloader (Docker stack)
+│   └── docker/            # Docker services (API + Worker)
+├── pics/                  # Diagrams used by README
+└── README.md              # This file
 ```
 
 ## Requirements
@@ -344,20 +348,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [2.3.9] - 2026-05-05
+
+#### Fixed
+- **Hidden-mode nav badge displayed `100` overflowing the supposedly-circular pill shape** when AV-task history hit the cap. Root cause was structural: `.nav-count` was a default `display: inline` `<span>` inheriting `line-height: 1.6` from `.nav-item`, so on `padding: 1px 7px` + `font-size: 12px` the rendered text box was 19.2 px tall while the padded container was only ~14 px, pushing characters outside the rounded border. The "circle" only looked circular for 1-2 digit content because flex centering masked the overflow at small widths; "100" exposed the broken layout. Two-part fix: (1) `.nav-count` rebuilt with `display: inline-flex` + `align-items/justify-content: center` + explicit `height: 18px` + `line-height: 1` + `flex-shrink: 0`, so the badge owns its layout instead of inheriting from the parent, and (2) `options.js` caps the displayed value at `99+` once `rows.length >= 100`, so the badge never has to render literal 3-digit counts.
+
+#### Changed
+- **`AV_HISTORY_MAX` bumped from 100 to 200** in `chrome-extension/background.js`. With the badge now handling 3-digit counts cleanly, doubling the cap gives users meaningful history headroom. FIFO trim behaviour (newest unshifted, list capped to MAX) unchanged. Extension manifest: `2.3.1` → `2.3.9` (catching up several releases of stale version string).
+
+### [2.3.8] - 2026-05-05
+
+#### Fixed
+- **`backfill_suspect.py` crashed with `TypeError: ... got multiple values for argument 'declared_duration'`** the moment it tried to evaluate the first job. The script's `_Shim` class hoisted `DownloadWorker._compute_suspect_reason` (a `@staticmethod`) as an instance attribute, then accessed it through an instance — Python's descriptor protocol re-bound the function as a regular method, so calling `shim._compute_suspect_reason(declared_duration=...)` slotted `shim` into the first positional argument, conflicting with the explicit `declared_duration=` kwarg. Fix: drop the `_Shim` wrapper entirely; both helpers (`_probe_duration_seconds` and `_compute_suspect_reason`) are called directly off `DownloadWorker`. Also converted `_probe_duration_seconds` to `@staticmethod` (it never used `self` anyway, and is now consistent with the `_probe_duration_float` helper added in v2.3.5).
+
+### [2.3.7] - 2026-05-05
+
+#### Fixed
+- **CI red after v2.3.6** because the new `merge()` test read `stdin.getvalue()` on a `BytesIO` that the production code had already closed (`merge()` closes stdin once it's done streaming segments through). Test now uses a tiny `_CapturingBytesIO` subclass that snapshots its contents into a `.captured` attribute on `close()`, so the test reads the captured snapshot regardless of stream state. Local `vitest`/`pytest` runs all green; CI back to green.
+
+### [2.3.6] - 2026-05-05
+
+#### Fixed
+- **HLS merge produced ~half-length mp4 even when every segment downloaded successfully**. Worker would log `Download complete: 1216/1216 segments successful`, ffmpeg merge returned `returncode == 0`, the output mp4 was ~770 MB — but actual playback duration was 3158 s instead of the m3u8's declared 7299 s (~43%). Root cause: the old merge command used ffmpeg's **concat demuxer** (`-f concat -safe 0 -i list.txt -c copy`) without explicit `duration` directives in the list. Each `.ts` segment's internal PTS started from 0 (HLS-spec-legal), so the concat demuxer had to compute cross-segment offsets from each input's reported timestamps + heuristics. On certain streams the heuristic miscomputed offsets, producing PTS overlap between consecutive segments → mp4 muxer (which requires monotonic PTS) silently dropped every "time-reversed" packet. No error, no warning, just half the output. Fixed by replacing concat demuxer with byte-concatenation through ffmpeg's stdin: `ffmpeg -f mpegts -i pipe:0 -c copy -bsf:a aac_adtstoasc out.mp4`, with the worker writing each segment's bytes (1 MB chunks via `shutil.copyfileobj`) into ffmpeg's stdin in order. MPEG-TS is byte-concatenable by design (188-byte packet stream), so ffmpeg sees a single continuous stream and never has to compute offsets. Implementation includes background drain threads on stdout/stderr to avoid pipe-buffer deadlock and a 15-minute timeout safety net. The existing `merge_with_re_encode` fallback (concat demuxer + transcode) is preserved as a final safety path — transcode regenerates PTS so the demuxer bug can't manifest there.
+
+#### Notes
+- Detailed root-cause walkthrough and decision rationale documented in [`docs/development/08-bug-case-studies.md`](docs/development/08-bug-case-studies.md) §1.
+- Pre-v2.3.6 jobs may have suffered the same silent truncation. The existing `backfill_suspect.py` tool (re)probes their actual duration vs declared and flags ratio < 0.85 as suspect, surfacing in the chrome sidepanel with a Re-fetch button.
+
+### [2.3.5] - 2026-05-05
+
+#### Added
+- **Worker diagnostic logs for the HLS download / decryption pipeline**, to make root-causing future "downloaded but wrong" cases tractable without round-tripping through extra reproductions. Two new instrumentation points: (1) `_get_key_bytes` now logs the AES-128 key endpoint's Content-Type, length, and full hex, plus a WARNING when all 16 bytes fall in the printable-ASCII range (sometimes legitimate — some hosts genuinely use ASCII-text keys — but worth surfacing as it's an unusual key shape worth eyeballing); (2) new `_diagnose_segment_durations` runs after segment download finishes, sample-probes 5 segments (start, 25%, 50%, 75%, end) with ffprobe and compares the actually-decoded duration to the m3u8's `#EXTINF` declaration. Both are pure observability — neither fails the job — and together they give enough signal to distinguish "decryption broken", "individual segments wrong", and "merge step lost data" in a handful of log lines.
+
+#### Changed
+- **Reverted the v2.3.4 worker-side heuristic relaxation** that would have suppressed the `actual_duration < 0.85 * declared_duration` SUSPECT flag for jobs that had downloaded 100% of segments. The flag is the last line of defence against silent truncation in the worker pipeline — relaxing it without a compensating signal turned out to mask a real partial-output case. v2.3.5's diagnostics replace it as the primary debugging aid; the SUSPECT heuristic remains in its v2.3.3 form. The chrome-extension cross-tab fix from v2.3.4 is unaffected — that part stays.
+
+### [2.3.4] - 2026-05-05
+
+#### Fixed
+- **Cross-tab URL leak when sending detected videos**. Sidepanel's `sendToNAS` now passes the source tab's `tabId` along with the URL, and the extension's `findBestCapturedEntry` substitution logic hard-filters captured headers by `entry.tabId === sourceTabId`. Previously the captured-header picker scored entries by URL-origin match alone, which on multi-tab sessions of the same site (the canonical multi-tab use case for this extension) didn't disambiguate between tabs — every captured manifest from any tab on the same origin scored equally and the most-recent timestamp tiebreaker silently rewrote the user's clicked URL to whichever same-origin tab's video was most recently played, sending the wrong video to NAS. Tab id is intrinsic to the network capture (Chrome's webRequest events carry it) and survives redirects, so it's the definitive same-tab signal. When the caller doesn't supply a tab id (e.g. orphan / service-worker capture path), the function falls back to strict initiator equality — still tighter than the old origin-prefix scoring. Helper hoisted to module scope for testability + 3 new vitest regression tests covering the multi-tab scenario, orphan fallback, and within-tab clean-URL → tokenized-variant substitution.
+
+### [2.3.3] - 2026-05-05
+
+#### Added
+- **Third worker container (`worker3`)** in `docker-compose.synology.yml`, identical to `worker` / `worker2`, sharing the same image and Redis queue. Three workers means roughly 3× concurrent download throughput — bounded by NAS network and disk I/O rather than the worker process itself.
+- **`db_cleanup` service**: a new lightweight container running an `sh` loop that every `CLEANUP_INTERVAL_SECONDS` (default 3600) prunes the `jobs` table and removes orphaned partial files on disk. Keeps the latest 100 jobs **per terminal status** (`completed`, `failed`, `cancelled`) — so a long-running deployment doesn't accumulate unbounded historical rows that slow down the sidepanel's `/api/jobs?limit=...` query. Also `rm`'s `file_path` for `failed`/`cancelled` rows that left partial mp4 fragments under `/downloads`.
+
+#### Changed
+- **Worker startup now reaps zombie jobs** at boot. New `_reap_zombie_jobs()` runs once when worker container starts, marks any job in `downloading`/`processing` status with `started_at > 2 hours ago` as `failed` with reason "Worker restarted while job was in progress (zombie reaped after 2h)". Idempotent across multiple workers booting simultaneously (PG row locks serialise; second writer sees no matching rows). The 2-hour floor protects legitimately long HLS jobs from being clobbered when a sibling worker restarts.
+- **Cancellation also cleans up the partial output** instead of leaving a half-merged file behind for `db_cleanup` to find later. Worker checks `is_job_cancelled()` at every transition (post-download, pre-merge, post-merge), unlinks the partial file before raising.
+
+### [2.3.2] - 2026-05-05
+
+#### Fixed
+- **HLS download progress callback wrote to the DB on every segment** (1216 segments → 1216 `UPDATE jobs SET progress=...` round-trips per job). The v2.3.1 throttle covered the worker→DB write but not the per-segment callback that triggered it; this fix brings them in sync. Progress writes now happen at most every 2 s, plus a final guaranteed write when the job completes 100 % so the user never sees a stuck progress bar. Reduces DB load on the typical multi-thousand-segment HLS download by ~600×.
+
+### [2.3.1] - 2026-05-05
+
+#### Changed
+- **Tighter progress refresh** for active downloads. Worker reports progress every ~2 s (was variable, sometimes 5–10 s gaps when ffmpeg merge was running silently). Sidepanel polls `/api/jobs?limit=20` every 2 s (was 5 s). Net result: download bars update smoothly instead of feeling stuck during long segment phases. Both ends throttled symmetrically so neither side hits API rate limits even with multiple concurrent in-flight jobs.
+
 ### [2.3.0] - 2026-05-04
 
 #### Added
-- **AV-task falls back to jav101 when missav doesn't produce a manifest.** New two-phase pipeline in `handleAvTaskFetch`: **phase 1** is the original v2.2.0 behaviour — opens the user's `hidden_mode.url_template` (default `https://missav.ws/dm18/{code}`) in a **background tab**, fully automatic, the site's JS produces a signed m3u8 and the existing detection pipeline ships it to NAS without bothering the user. **Phase 2** only kicks in if missav times out (no manifest in 60s): opens `https://jav101.com/search/{code}` in an **active foreground tab** so the user can click the download button and solve the reCAPTCHA — the resulting request to `dl*.jav101.com/<file>.mp4?md5=…&expires=…` is picked up by the same `maybeFireAvTaskAutoSend → sendToNAS` path and shipped as a single direct mp4 (no HLS, no segment auth, no cookies). The history row stays `pending` across the transition; its `url` field updates from missav → jav101 so the table reflects which site is currently being attempted.
+- **AV-task gets a secondary-source fallback when the primary URL template doesn't produce a manifest.** New two-phase pipeline in `handleAvTaskFetch`: **phase 1** is the original v2.2.0 behaviour — opens the user-configured `hidden_mode.url_template` in a **background tab**, fully automatic, the site's own JS produces a signed m3u8 and the existing detection pipeline ships it to NAS without bothering the user. **Phase 2** only kicks in if phase 1 times out (no manifest in 60 s): opens a hardcoded secondary search site in an **active foreground tab** so the user can click the download button and solve any required CAPTCHA — the resulting signed mp4 request is picked up by the same `maybeFireAvTaskAutoSend → sendToNAS` path and shipped as a single direct mp4 (no HLS, no segment auth, no cookies). The history row stays `pending` across the transition; its `url` field updates from primary → secondary so the table reflects which site is currently being attempted.
 
 #### Changed
-- **`maybeFireAvTaskAutoSend` gained a phase-aware URL filter**: during the jav101 phase, only URLs whose hostname is a subdomain of `jav101.com` (i.e. `dl3.jav101.com` etc., not the apex that serves the page chrome) qualify for auto-send. Without this filter the play page's preview-clip mp4s would race the real download and ship a 30-second teaser to the NAS. The missav phase keeps the original "first eligible URL wins" behaviour.
-- **Missav phase fast-fails on HTTP 4xx/5xx** instead of waiting the full 60s timeout. New `chrome.webRequest.onHeadersReceived` listener watches the missav helper tab's `main_frame` response — if the status code is ≥400 (e.g. `missav.ws/dm18/orecz-214` returns 404 because the path doesn't exist), the tab is closed immediately and the jav101 fallback opens within milliseconds rather than after a minute of dead air. Filtered to `main_frame` only so that ad subframes and API errors don't trigger spurious failovers. The jav101 phase isn't covered — its search page returns 200 with empty results when a code is unknown, so HTTP status can't classify success/failure there.
+- **`maybeFireAvTaskAutoSend` gained a phase-aware URL filter**: during the secondary phase, only URLs whose hostname is on the secondary CDN (e.g. `dl*.example.com` patterns rather than the apex that serves the page chrome) qualify for auto-send. Without this filter the play page's preview-clip mp4s would race the real download and ship a 30-second teaser to the NAS. The primary phase keeps the original "first eligible URL wins" behaviour.
+- **Primary phase fast-fails on HTTP 4xx/5xx** instead of waiting the full 60 s timeout. New `chrome.webRequest.onHeadersReceived` listener watches the helper tab's `main_frame` response — if the status code is ≥ 400 (e.g. the page returns 404 because the code's path doesn't exist on the primary site), the tab is closed immediately and the secondary fallback opens within milliseconds rather than after a minute of dead air. Filtered to `main_frame` only so that ad subframes and API errors don't trigger spurious failovers. The secondary phase isn't covered — its search page returns 200 with empty results when a code is unknown, so HTTP status can't classify success/failure there.
 
 #### Notes
-- **Order is "automatic-first, manual-fallback"** by design: most codes resolve on missav inside the first ~5–15s without the user noticing anything happened, and jav101 only intrudes (active tab popping to the front) for the codes that missav genuinely can't deliver. Worst-case end-to-end timeout is 120s (60s missav + 60s jav101) when missav stalls without erroring, but a missav 404 now flips to jav101 in under a second.
-- **Phase 2 is not "hidden"** — the jav101 tab opens in foreground because reCAPTCHA solving requires user interaction (Anthropic safety policy forbids auto-solving CAPTCHAs, and jav101 doesn't expose the signed download without it). If the user isn't around to solve the captcha, the 60s timer expires and the row is marked `failed`.
-- jav101's URL is hardcoded — no new option added. The existing `hidden_mode.url_template` setting still controls the missav phase, so swapping the primary site (or pointing it at a 404 to force jav101 every time) remains a one-line change in `hidden_mode.toml`.
-- The `dl*.jav101.com` mp4 carries an `expires=<unix-timestamp>` query param — a few minutes in the future when issued. The pipeline forwards the URL to NAS within ~4s of capture (existing `AV_TASK_AUTOCLOSE_DELAY_MS` window), well inside the validity. If the NAS queue is backed up enough that the URL expires before the worker dequeues, the existing v2.2.3 anti-hotlink Re-fetch path takes over (re-open jav101 tab, solve captcha again, resend).
+- **Order is "automatic-first, manual-fallback"** by design: most codes resolve on the primary site inside the first ~5–15 s without the user noticing anything happened, and the secondary site only intrudes (active tab popping to the front) for the codes that the primary genuinely can't deliver. Worst-case end-to-end timeout is 120 s (60 s primary + 60 s secondary) when the primary stalls without erroring, but a 404 now flips to secondary in under a second.
+- **Phase 2 is not "hidden"** — the secondary tab opens in foreground because CAPTCHA solving requires user interaction (Anthropic safety policy forbids auto-solving CAPTCHAs, and the secondary site doesn't expose the signed download without it). If the user isn't around to solve the captcha, the 60 s timer expires and the row is marked `failed`.
+- The secondary site's URL pattern is hardcoded — no new option added. The existing `hidden_mode.url_template` setting still controls the primary phase, so swapping the primary site (or pointing it at a 404 to force the secondary every time) remains a one-line config change in `hidden_mode.toml`.
+- The signed secondary mp4 carries an `expires=<unix-timestamp>` query param — a few minutes in the future when issued. The pipeline forwards the URL to NAS within ~4 s of capture (existing `AV_TASK_AUTOCLOSE_DELAY_MS` window), well inside the validity. If the NAS queue is backed up enough that the URL expires before the worker dequeues, the existing v2.2.3 anti-hotlink Re-fetch path takes over (re-open the secondary tab, solve captcha again, resend).
 
 ### [2.2.3] - 2026-05-04
 
@@ -373,11 +437,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### [2.2.2] - 2026-05-04
 
 #### Changed
-- **AV-task auto-send now uses the source page's `<title>` as the job title** instead of the bare `[code]` placeholder. When the helper tab's m3u8 fires, `maybeFireAvTaskAutoSend()` reads `tab.title` from `chrome.tabs.get()` at that moment — by then the page's static `<title>` has loaded (this is what the player JS depends on too) so we get the actual video name (e.g. `NTTR-015 - 寝取られ NTR... - MissAV`). Falls through `tab.title` → `getStoredPageTitle()` cache → `[code]` placeholder, in that priority order. The cached path is kept as a fallback because some sites' SPAs update title slightly later than the m3u8 fetch, so the live read isn't always populated yet at the precise moment of detection.
-- **Options `hidden_mode.toml` table gains a `title` column** (between `code` and `submitted`) showing the same value, so the history is glanceable without having to chase the URL link. Sized to take 30% of the table width — long missav titles wrap rather than truncating mid-character. Empty cells render `—` for rows that didn't reach `sent` (e.g. timed-out tasks where the page never settled).
+- **AV-task auto-send now uses the source page's `<title>` as the job title** instead of the bare `[code]` placeholder. When the helper tab's m3u8 fires, `maybeFireAvTaskAutoSend()` reads `tab.title` from `chrome.tabs.get()` at that moment — by then the page's static `<title>` has loaded (this is what the player JS depends on too) so we get the actual video name (e.g. `ABCD-1234 - <full title> - <site>`). Falls through `tab.title` → `getStoredPageTitle()` cache → `[code]` placeholder, in that priority order. The cached path is kept as a fallback because some sites' SPAs update title slightly later than the m3u8 fetch, so the live read isn't always populated yet at the precise moment of detection.
+- **Options `hidden_mode.toml` table gains a `title` column** (between `code` and `submitted`) showing the same value, so the history is glanceable without having to chase the URL link. Sized to take 30% of the table width — long page titles wrap rather than truncating mid-character. Empty cells render `—` for rows that didn't reach `sent` (e.g. timed-out tasks where the page never settled).
 
 #### Notes
-- Worker-side filename truncation (v2.1.19's 240-byte UTF-8 cap on the filesystem stem) handles the long, multi-byte missav titles cleanly — the file written to disk will keep as much of the title as fits, cut on a UTF-8 boundary, with `.mp4` and any collision-suffix appended.
+- Worker-side filename truncation (v2.1.19's 240-byte UTF-8 cap on the filesystem stem) handles long multi-byte CJK titles cleanly — the file written to disk will keep as much of the title as fits, cut on a UTF-8 boundary, with `.mp4` and any collision-suffix appended.
 
 ### [2.2.1] - 2026-05-04
 
@@ -394,7 +458,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### [2.2.0] - 2026-05-04
 
 #### Added
-- **Hidden mode + AV-task quick-input** (opt-in, off by default). New `[hidden_mode]` block in the options `prefs.toml` pane with two settings: `enabled` (toggle) and `url_template` (default `https://missav.ws/dm18/{code}`). When enabled, the side panel grows an AV-task input above the detected/recent panes — type a code (e.g. `nttr-015`), hit Enter or click *Fetch*, and the extension:
+- **Hidden mode + AV-task quick-input** (opt-in, off by default). New `[hidden_mode]` block in the options `prefs.toml` pane with two settings: `enabled` (toggle) and `url_template` (a URL with a `{code}` placeholder, configured by the user — defaults to a typical preview-site URL pattern). When enabled, the side panel grows an AV-task input above the detected/recent panes — type a code (e.g. `ABCD-1234`), hit Enter or click *Fetch*, and the extension:
   1. substitutes `{code}` into the template (after sanitizing the input to `[A-Za-z0-9._-]` to block path-injection attempts),
   2. opens that URL in a **background** browser tab so the site's JS runs naturally and produces a fresh signed m3u8 the way it would for any visitor (no server-side scraping — Chrome IS the browser, no anti-bot to fight),
   3. waits for the existing detection pipeline (`registerDetectedUrl`) to capture a manifest *on that tab*,
@@ -412,7 +476,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Added
 - **Probable-wrong file detection + Re-fetch flow** for jobs where the worker marked the file `completed` but the result is materially shorter than the m3u8 promised (the classic CDN-token-expiry bug from before v2.1.6, which left silent stub files on disk that the user couldn't easily distinguish from healthy ones). Two-part feature:
   1. **Worker post-merge probe** (m3u8 path): after a successful merge, ffprobe the output and compare to the m3u8 EXTINF declared duration. If actual < 85% of declared, write `job_metadata.suspect_reason` describing the shortfall (e.g. `"actual duration 38s is only 10% of declared 392s — likely partial download (token expiry / anti-hotlink). Re-fetch via the source page."`). Falls back to a 50 KB/s bitrate floor when ffprobe can't read a duration, catching anti-hotlink JPEGs / corrupted outputs that still file-exist.
-  2. **Chrome sidepanel surfacing**: completed-but-suspect jobs render a warm-tone warning block under the job title with the human-readable reason and a `Re-fetch from source page` button. Clicking opens the original `source_page` (e.g. `https://jav101.com/play/video/avid…`) in a new active tab so the site's JS reissues a fresh m3u8 token and the extension's network capture picks it up; the user clicks Send normally on that tab to redownload (no auto-Send to avoid racing the player's load). Toast confirms.
+  2. **Chrome sidepanel surfacing**: completed-but-suspect jobs render a warm-tone warning block under the job title with the human-readable reason and a `Re-fetch from source page` button. Clicking opens the original `source_page` (e.g. `https://example.com/play/video/...`) in a new active tab so the site's JS reissues a fresh m3u8 token and the extension's network capture picks it up; the user clicks Send normally on that tab to redownload (no auto-Send to avoid racing the player's load). Toast confirms.
 - **`backfill_suspect.py`**: standalone retroactive scanner for existing files. `docker compose exec worker python /app/worker/backfill_suspect.py` walks every `completed` job that has a `file_path` on disk, ffprobes it, runs the same suspect heuristic, and writes `actual_duration`/`suspect_reason` into `job_metadata`. Supports `--dry-run`, `--report-only`, `--limit N`, `--rescan-flagged`. Idempotent. **Run this once after deploying v2.1.22 to mark old stubs already on disk** — they'll then surface in the chrome sidepanel with the Re-fetch button.
 
 #### Schema
@@ -434,7 +498,7 @@ Both added via the existing idempotent `_ensure_schema()` migration in API + wor
 ### [2.1.21] - 2026-05-04
 
 #### Fixed
-- **Detection wasn't actually per-tab when two tabs shared an origin** (the canonical multi-tab bulk-send case for this extension — opening multiple JAV pages on the same site). The per-tab list (`currentTabUrls[tabId]`) was clean, but `getSortedUrlsForTabWithOrphans()` then merged in entries from the global `orphanUrlInfos` store using `pageOrigin === tabOrigin` matching. Tab 1's service-worker / no-tabId captures (whose `pageUrl` recorded Tab 1's page) leaked into Tab 2's view because both tabs shared the origin — switching from Tab 1 to Tab 2 still showed Tab 1's URLs in the sidepanel and that's what the user clicked Send on. Tightened orphan attach to require **exact `info.pageUrl === tabUrl`**: an orphan can only show in the tab whose current page URL exactly matches the page that captured it. This is strictly per-tab — orphans without a captured `pageUrl` simply don't appear (acceptable; they were rare to begin with). PWAs / SW-fetched manifests where `pageUrl` is recorded continue to attach to exactly one tab as expected. Verified with a multi-tab simulation: under the old logic, a Tab 1 SW orphan appeared in both Tab 1 and Tab 2; under the new logic, it appears only in Tab 1. The v2.1.20 same-origin substitution guard remains as a defence-in-depth layer
+- **Detection wasn't actually per-tab when two tabs shared an origin** (the canonical multi-tab bulk-send case for this extension — opening multiple video pages on the same site). The per-tab list (`currentTabUrls[tabId]`) was clean, but `getSortedUrlsForTabWithOrphans()` then merged in entries from the global `orphanUrlInfos` store using `pageOrigin === tabOrigin` matching. Tab 1's service-worker / no-tabId captures (whose `pageUrl` recorded Tab 1's page) leaked into Tab 2's view because both tabs shared the origin — switching from Tab 1 to Tab 2 still showed Tab 1's URLs in the sidepanel and that's what the user clicked Send on. Tightened orphan attach to require **exact `info.pageUrl === tabUrl`**: an orphan can only show in the tab whose current page URL exactly matches the page that captured it. This is strictly per-tab — orphans without a captured `pageUrl` simply don't appear (acceptable; they were rare to begin with). PWAs / SW-fetched manifests where `pageUrl` is recorded continue to attach to exactly one tab as expected. Verified with a multi-tab simulation: under the old logic, a Tab 1 SW orphan appeared in both Tab 1 and Tab 2; under the new logic, it appears only in Tab 1. The v2.1.20 same-origin substitution guard remains as a defence-in-depth layer
 
 ### [2.1.20] - 2026-05-04
 
