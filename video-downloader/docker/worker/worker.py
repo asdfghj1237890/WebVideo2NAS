@@ -1664,6 +1664,21 @@ def main():
     # HOST_CONCURRENCY_CAP is unset). Must run after redis is reachable.
     import host_throttle
     host_throttle.init(redis_client)
+    if host_throttle.get() is None:
+        # Per-process adaptive_delay (in downloader.py) is always on, but
+        # it learns and schedules independently in each worker container.
+        # Without a cross-process cap, N workers' segment starts can still
+        # align and exceed a CDN's per-IP throttle threshold. Loud INFO
+        # so operators see the recommendation in the worker log.
+        logger.info(
+            "host_throttle disabled (HOST_CONCURRENCY_CAP and "
+            "HOST_CONCURRENCY_OVERRIDES both unset). Per-segment adaptive "
+            "delay still applies WITHIN each worker process, but multiple "
+            "worker containers will not coordinate against per-IP CDN "
+            "throttling. For multi-worker deployments hitting throttling, "
+            "set HOST_CONCURRENCY_OVERRIDES=phncdn.com:6 (or similar) in "
+            ".env. See .env.example for details."
+        )
 
     # Start worker
     worker = DownloadWorker()

@@ -8,7 +8,7 @@ import os
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional, Callable, Set
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -56,6 +56,196 @@ logger = logging.getLogger(__name__)
 # MPEG-TS sync byte - all valid .ts files start with this
 TS_SYNC_BYTE = b'\x47'
 TS_PACKET_SIZE = 188
+
+
+# --- Per-host adaptive inter-segment delay --------------------------------
+#
+# Inspired by CocoCut / hls.js's `normalDelay` — pause briefly between
+# consecutive segment requests to a host so we don't burst past its
+# throttle threshold. Starts at 0 (no delay) so non-throttled CDNs aren't
+# slowed down. On a transport failure for a host we increase the delay;
+# on sustained success we shrink it back to 0. Per-process state — Redis
+# coordination would add round-trip cost on the hot path for marginal
+# benefit (each process learns its own throttle profile independently).
+
+
+class _PerHostAdaptiveDelay:
+    """Per-host inter-segment pacing that backs off on transport failures.
+
+    SCOPE: PER-PROCESS ONLY. State is held in a module-level singleton
+    inside this Python process. With multiple worker containers (the
+    deployed compose runs 3) sharing the same egress IP, each process
+    learns and schedules INDEPENDENTLY. So 3 workers × 6 in-flight = 18
+    simultaneous starts at the CDN, even though each worker thinks it's
+    pacing nicely. Adaptive delay alone is NOT sufficient cross-process
+    throttle.
+
+    For cross-process coordination against per-IP CDN throttling, layer
+    `host_throttle` (see host_throttle.py) on top by setting
+    `HOST_CONCURRENCY_CAP` or `HOST_CONCURRENCY_OVERRIDES` in env. That
+    enforces a shared in-flight cap via Redis so the aggregate across
+    workers respects the CDN's per-IP threshold. The two layers are
+    complementary:
+      - host_throttle (Redis)        : cross-process per-host concurrency cap
+      - _PerHostAdaptiveDelay (here) : per-process per-segment pacing
+
+    Why per-process state? Adaptive delay is on the segment hot path
+    (called for every segment of every job). A Redis round-trip per
+    segment to coordinate "what's my delay" + "what's my next slot"
+    would add ~1–5ms × 32 workers × 200 segments per job = 6–32 seconds
+    of latency overhead per job, for a refinement that the cross-process
+    cap already mostly addresses. The per-process scope is intentional
+    architecture, not an oversight.
+
+    Two pieces of state per host:
+      - `_delays[host]`           — current per-request delay (ms)
+      - `_next_request_at[host]`  — earliest monotonic time the next
+                                    request to this host may start
+
+    Why both? An earlier version of this class only tracked `_delays` and
+    every download thread independently slept for `delay` ms before issuing
+    its request. Codex review caught the bug: under a real failure event,
+    8 threads observe the same `delay`, sleep concurrently, then all wake
+    at the same instant and burst against the still-throttled host —
+    exactly the pattern the delay was supposed to prevent.
+
+    Fix: `acquire_pace_slot()` atomically reserves the caller's start time
+    by reading-and-bumping `_next_request_at[host]`. So 8 same-host threads
+    arriving at roughly t=0 with delay=200ms get back sleep values
+    [0, 200, 400, 600, 800, 1000, 1200, 1400] ms — properly serialized
+    starts. When `delay` is 0 (healthy host), every caller gets sleep=0
+    and there is no overhead on the fast path.
+
+    Thread-safe within the process. Single module-level instance shared
+    across all download threads in this worker process.
+    """
+
+    MIN_MS = 0.0
+    MAX_MS = 3000.0           # CocoCut caps normalDelay at 3 seconds
+    BOOTSTRAP_MS = 100.0      # first-failure jump from 0 → 100ms
+    INCREASE_FACTOR = 2.0
+    DECREASE_FACTOR = 0.7
+    SNAP_TO_ZERO_THRESHOLD_MS = 50.0  # below this, just drop to 0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._delays: Dict[str, float] = {}
+        self._next_request_at: Dict[str, float] = {}
+
+    def get_ms(self, host: str) -> float:
+        """Inspect current delay for a host. Use acquire_pace_slot() for
+        actual pacing — this method is for tests / metrics only."""
+        if not host:
+            return 0.0
+        with self._lock:
+            return self._delays.get(host, 0.0)
+
+    def acquire_pace_slot(self, host: str) -> float:
+        """Atomically reserve this caller's request slot for `host`.
+
+        Returns the number of seconds the caller must sleep before issuing
+        its request. When the per-host delay is 0, all callers get 0 — no
+        overhead. When the delay is > 0, sequential callers (including
+        concurrent ones, since the lock serializes the read-and-bump) are
+        spaced `delay_ms` apart so multiple workers don't all wake at the
+        same moment and re-burst against a throttled host.
+
+        Caller MUST sleep for the returned duration before issuing its
+        request. The slot is reserved at this call regardless of whether
+        the caller actually sleeps — there's no "release" because the slot
+        is a point in time, not a resource.
+
+        Stale-reservation cleanup: under load, `_next_request_at[host]`
+        can be pushed minutes into the future (32 workers × 3s cap = 93s).
+        If subsequent successes snap the delay back to 0, those stale
+        future reservations would otherwise still apply, stalling a new
+        worker for ~90s on an already-healthy host. When delay is 0 we
+        drop the entry and return 0 immediately — the host is fast again,
+        forget the old schedule.
+        """
+        if not host:
+            return 0.0
+        with self._lock:
+            delay_s = self._delays.get(host, 0.0) / 1000.0
+            if delay_s <= 0:
+                # Healthy host — no pacing needed. Clear any stale future
+                # reservation left over from a previous failure burst.
+                self._next_request_at.pop(host, None)
+                return 0.0
+            now = time.monotonic()
+            scheduled = max(now, self._next_request_at.get(host, 0.0))
+            self._next_request_at[host] = scheduled + delay_s
+            return max(0.0, scheduled - now)
+
+    def report_failure(self, host: str) -> float:
+        """Bump the delay for this host. Returns the new delay in ms."""
+        if not host:
+            return 0.0
+        with self._lock:
+            current = self._delays.get(host, 0.0)
+            new_delay = self.BOOTSTRAP_MS if current <= 0 else min(current * self.INCREASE_FACTOR, self.MAX_MS)
+            self._delays[host] = new_delay
+            return new_delay
+
+    def report_success(self, host: str) -> float:
+        """Shrink the delay for this host. Returns the new delay in ms.
+
+        When the delay snaps to 0, also drop any stale future reservation
+        in `_next_request_at[host]` so the next request to this host
+        doesn't sleep behind an obsolete schedule.
+        """
+        if not host:
+            return 0.0
+        with self._lock:
+            current = self._delays.get(host, 0.0)
+            if current <= 0:
+                return 0.0
+            new_delay = current * self.DECREASE_FACTOR
+            if new_delay < self.SNAP_TO_ZERO_THRESHOLD_MS:
+                new_delay = 0.0
+                # Host is healthy again — clear any reservation from the
+                # earlier delay window so subsequent requests aren't
+                # stalled by stale future schedules.
+                self._next_request_at.pop(host, None)
+            self._delays[host] = new_delay
+            return new_delay
+
+    def cancel_host_reservations(self, host: str) -> None:
+        """Drop the pending reservation for a host on cancellation.
+
+        Called by the download path when a worker is interrupted in its
+        pacing sleep (`_stop_event.wait()` returned True). Without this,
+        the cancelled worker's reserved future slot would remain in the
+        singleton, stalling later jobs to the same host — even though the
+        cancelled worker never actually sent its request.
+
+        The previous cleanup path (in `report_success`) only fires on
+        successful downloads. After a fail-fast abort or user cancellation
+        there are typically NO successes, so without this method the stale
+        schedule sticks indefinitely (or until enough successes finally
+        snap the delay back to 0).
+
+        Note: this is intentionally a coarse "drop the entry" rather than
+        "rewind by my reservation". Multiple cancelled workers calling
+        concurrently might over-clear a fresh reservation made by a healthy
+        worker that arrived in between, but the worst case is that the
+        first new worker bypasses pacing once (which is the same as if it
+        were the very first arriver). Self-healing on the next call.
+        """
+        if not host:
+            return
+        with self._lock:
+            self._next_request_at.pop(host, None)
+
+    def reset_for_tests(self) -> None:
+        """Test helper — clear all per-host state."""
+        with self._lock:
+            self._delays.clear()
+            self._next_request_at.clear()
+
+
+# Module singleton. Tests can call `reset_for_tests()` between cases.
+_adaptive_delay = _PerHostAdaptiveDelay()
 
 
 # --- Failure classification ------------------------------------------------
@@ -215,7 +405,16 @@ class SegmentDownloader:
         self.downloaded_count = 0
         self.total_segments = len(segments)
         self.failed_segments = []
-        
+
+        # Codex review #6: track which hosts this downloader has actually
+        # touched, so we can clear their _adaptive_delay reservations on
+        # exit (download_all's finally). Without this, a failed/aborted job
+        # would leave its queued `_next_request_at[host]` in the module
+        # singleton, and the NEXT job in this worker process would inherit
+        # that stale schedule — sleeping minutes for nothing.
+        self._touched_hosts: Set[str] = set()
+        self._touched_hosts_lock = threading.Lock()
+
         # Stop event for cooperative cancellation
         self._stop_event = threading.Event()
         
@@ -584,6 +783,43 @@ class SegmentDownloader:
             pressure. Let the outer retry+backoff in download_segment
             handle recovery.
         """
+        # Resolve hostname once for both throttle and adaptive-delay bookkeeping.
+        host = urlparse(url).hostname or ""
+
+        # Track this host so download_all's finally can drop our pacing
+        # reservations on exit (Codex review #6 — prevent stale schedule
+        # carrying over to the next job in this worker process).
+        if host:
+            with self._touched_hosts_lock:
+                self._touched_hosts.add(host)
+
+        # CocoCut-style inter-segment pacing. acquire_pace_slot() atomically
+        # reserves THIS caller's start time so concurrent same-host workers
+        # are spaced `delay_ms` apart instead of all sleeping the same value
+        # and bursting together at the end (the bug Codex caught in the
+        # original implementation). Returns 0 on healthy hosts → no overhead
+        # on the fast path.
+        #
+        # Use _stop_event.wait() instead of time.sleep() so cancellation
+        # propagates immediately. With max_workers=32 and delay capped at
+        # MAX_MS=3s, the queued worker can be assigned ~93s of sleep —
+        # blocking on a raw sleep would mean 90+ seconds of "is the job
+        # still cancellable?" plus extra CDN traffic when the worker
+        # finally wakes up after abort. Event.wait returns True when the
+        # event is set, False on timeout — True means cancellation, bail.
+        sleep_for = _adaptive_delay.acquire_pace_slot(host)
+        if sleep_for > 0:
+            if self._stop_event.wait(sleep_for):
+                # Cancelled mid-sleep. We already advanced the reservation
+                # but won't actually send a request, so drop the host's
+                # _next_request_at entry. Otherwise the singleton would
+                # stall the next job's first request on this host by 30+
+                # seconds (especially after a fail-fast abort where there
+                # are no successes to clear via report_success).
+                _adaptive_delay.cancel_host_reservations(host)
+                logger.debug(f"Segment {index} pacing-sleep cancelled by stop event")
+                return None
+
         # Acquire a per-host slot if cross-process throttle is enabled. Held
         # for the entire request (including response.content read) — we don't
         # release mid-transfer because a partial download still occupies a
@@ -627,6 +863,15 @@ class SegmentDownloader:
                 if content[:3] == JPEG_MAGIC or content[:4] == PNG_MAGIC or content[:4] == GIF_MAGIC:
                     return None
 
+                # NOTE on adaptive_delay.report_success: NOT called here.
+                # Reaching this point only means the CDN returned an HTTP
+                # 200 with a non-empty, non-obviously-blocked body — the
+                # body could still fail TS-sync / fMP4-box validation in
+                # download_segment (Codex review #7: a CDN serving 400KB
+                # of anti-leech garbage with status 200 would otherwise
+                # decay the host delay back to 0 even though every
+                # segment is still failing). report_success is now called
+                # in download_segment AFTER validation + file write.
                 return content
 
             except _TRANSPORT_ERRORS:
@@ -634,10 +879,22 @@ class SegmentDownloader:
                 # timeout). Re-raise so caller skips remaining Referer
                 # strategies and falls into outer retry+backoff. Switching
                 # strategies against a throttled host just adds pressure.
+                # Bump the per-host delay so the next attempt waits — this
+                # is the CocoCut-style adaptive backoff.
+                new_delay = _adaptive_delay.report_failure(host)
+                if new_delay > 0 and (index < 3 or index % 25 == 0):
+                    # Log occasionally so the operator can see throttle response
+                    # without flooding for every segment.
+                    logger.info(
+                        f"Adaptive delay for {host} bumped to {new_delay:.0f}ms "
+                        f"after transport error (segment {index})"
+                    )
                 raise
             except Exception as e:
                 # HTTP-level failure (raise_for_status on 4xx/5xx, etc.) —
-                # an alternate Referer might succeed.
+                # an alternate Referer might succeed. Doesn't move the
+                # adaptive-delay counter either way (those errors are
+                # ambiguous w.r.t. "host is throttling vs token expired").
                 logger.debug(f"Segment {index} download attempt failed (HTTP/app level): {e}")
                 return None
         finally:
@@ -748,35 +1005,20 @@ class SegmentDownloader:
                             self.working_referer_strategy = strategy
                         break
             
-            # If all strategies failed, use original headers and let the error handling below deal with it
+            # If all strategies failed, raise so the outer retry+backoff fires.
+            #
+            # We used to attempt one more `self.session.get(url, headers=self.headers, ...)`
+            # here, but that path bypassed _try_download_with_headers — which means it
+            # bypassed the host throttle cap, the adaptive pacing, AND the success/failure
+            # reporting (Codex review #5). The "fallback" was also semantically redundant:
+            # strategies[0] is 'source_page' which uses self.headers['Referer']/['Origin']
+            # already, so the fallback re-issued a request identical to strategy 1. Removing
+            # it loses no unique attempt and ensures every same-host request participates
+            # in pacing.
             if content is None:
-                response = self.session.get(
-                    url,
-                    headers=self.headers,
-                    timeout=self.timeout,
-                    stream=False
+                raise ValueError(
+                    f"All Referer strategies returned no content for segment {index}"
                 )
-                
-                if response.status_code == 474:
-                    logger.error(f"Segment {index} got 474 error")
-                    logger.error(f"Response headers: {dict(response.headers)}")
-                    error_content = response.text[:500] if hasattr(response, 'text') else "No content"
-                    logger.error(f"Error content: {error_content}")
-                
-                response.raise_for_status()
-                content = response.content
-
-                content_type = ""
-                try:
-                    content_type = response.headers.get("Content-Type", "")
-                except Exception:
-                    content_type = ""
-                blocked, reason = self._is_obviously_blocked_response(content, content_type=content_type)
-                if blocked:
-                    raise ValueError(reason)
-                
-                if len(content) < 188:
-                    raise ValueError(f"Segment too small: {len(content)} bytes")
 
             # Always check for obvious block/HTML responses BEFORE decryption.
             # If we decrypt first, block pages become random bytes and may slip through.
@@ -824,12 +1066,23 @@ class SegmentDownloader:
             # Write validated content to file
             with open(output_path, 'wb') as f:
                 f.write(content)
-            
+
+            # Adaptive pacing success report — fired ONLY here, after the
+            # bytes have passed both _is_valid_ts_content (TS sync /
+            # fMP4 box) AND been written to disk. Reporting earlier in
+            # _try_download_with_headers was premature: a CDN serving
+            # 400KB of HTTP-200 garbage would have decayed the per-host
+            # delay back to 0 even though every segment still failed
+            # validation (Codex review #7).
+            success_host = urlparse(url).hostname or ""
+            if success_host:
+                _adaptive_delay.report_success(success_host)
+
             if index == 0 and used_strategy:
                 logger.info(f"Segment {index} downloaded successfully with strategy: {used_strategy}")
             else:
                 logger.debug(f"Segment {index} downloaded and validated successfully ({len(content)} bytes)")
-            
+
             return str(output_path)
         
         except Exception as e:
@@ -879,62 +1132,89 @@ class SegmentDownloader:
             List of downloaded file paths
         """
         logger.info(f"Starting download of {self.total_segments} segments with {self.max_workers} workers")
-        
+
         downloaded_files = [None] * self.total_segments
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all download tasks
-            future_to_segment = {
-                executor.submit(self.download_segment, segment): segment
-                for segment in self.segments
-            }
-            
-            # Process completed downloads
-            try:
-                for future in as_completed(future_to_segment):
-                    # Check if stop was requested before processing more results
-                    if self._stop_event.is_set():
-                        logger.info("Stop event detected in download_all, aborting...")
-                        for f in future_to_segment:
-                            f.cancel()
-                        break
-                    
-                    segment = future_to_segment[future]
-                    index = segment['index']
-                    
-                    try:
-                        file_path = future.result()
-                        if file_path:
-                            downloaded_files[index] = file_path
-                            self.downloaded_count += 1
-                    
-                    except Exception as e:
-                        logger.error(f"Unexpected error downloading segment {index}: {e}")
-                        self.failed_segments.append({'segment': segment, 'error': str(e)})
-                    
-                    # Call progress callback (outside try-except so callback exceptions propagate)
-                    if progress_callback:
-                        progress_callback(self.downloaded_count, self.total_segments)
-            
-            except Exception as e:
-                # Callback raised an exception (e.g., job cancelled or too many errors)
-                # Signal all threads to stop and cancel pending futures
-                logger.warning("Download aborted, signaling stop and cancelling remaining tasks...")
-                self._stop_event.set()
-                for future in future_to_segment:
-                    future.cancel()
-                # Re-raise the exception
-                raise
-        
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all download tasks
+                future_to_segment = {
+                    executor.submit(self.download_segment, segment): segment
+                    for segment in self.segments
+                }
+
+                # Process completed downloads
+                try:
+                    for future in as_completed(future_to_segment):
+                        # Check if stop was requested before processing more results
+                        if self._stop_event.is_set():
+                            logger.info("Stop event detected in download_all, aborting...")
+                            for f in future_to_segment:
+                                f.cancel()
+                            break
+
+                        segment = future_to_segment[future]
+                        index = segment['index']
+
+                        try:
+                            file_path = future.result()
+                            if file_path:
+                                downloaded_files[index] = file_path
+                                self.downloaded_count += 1
+
+                        except Exception as e:
+                            logger.error(f"Unexpected error downloading segment {index}: {e}")
+                            self.failed_segments.append({'segment': segment, 'error': str(e)})
+
+                        # Call progress callback (outside try-except so callback exceptions propagate)
+                        if progress_callback:
+                            progress_callback(self.downloaded_count, self.total_segments)
+
+                except Exception as e:
+                    # Callback raised an exception (e.g., job cancelled or too many errors)
+                    # Signal all threads to stop and cancel pending futures
+                    logger.warning("Download aborted, signaling stop and cancelling remaining tasks...")
+                    self._stop_event.set()
+                    for future in future_to_segment:
+                        future.cancel()
+                    # Re-raise the exception
+                    raise
+        finally:
+            # Codex review #6: drop _adaptive_delay reservations for any
+            # host this downloader touched, regardless of how it exited
+            # (success / abort / cancellation / unhandled exception).
+            # Without this, a fail-fast abort or all-failures completion
+            # leaves the module singleton holding our queue position; the
+            # next job in the same worker process inherits it and starts
+            # by sleeping minutes for nothing. We keep _delays (host's
+            # learned wisdom) but clear _next_request_at (queue position).
+            self._cleanup_pacing_state()
+
         # Filter out None values (failed downloads)
         successful_files = [f for f in downloaded_files if f is not None]
-        
+
         logger.info(f"Download complete: {len(successful_files)}/{self.total_segments} segments successful")
-        
+
         if self.failed_segments:
             logger.warning(f"Failed segments: {len(self.failed_segments)}")
-        
+
         return successful_files
+
+    def _cleanup_pacing_state(self) -> None:
+        """Drop adaptive-delay reservations for hosts this downloader touched.
+
+        Called from download_all's finally so the next job in this worker
+        process starts with a clean per-host schedule. The host's *delay*
+        (learned wisdom from observed failures) is preserved in the
+        singleton; only the *queue position* (`_next_request_at[host]`),
+        which is meaningful only while we're actually queueing requests,
+        is dropped.
+        """
+        with self._touched_hosts_lock:
+            hosts = list(self._touched_hosts)
+            self._touched_hosts.clear()
+        for h in hosts:
+            _adaptive_delay.cancel_host_reservations(h)
     
     def get_progress(self) -> Dict:
         """Get download progress information"""
