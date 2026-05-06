@@ -1693,6 +1693,83 @@ def test_retry_pending_restores_max_retries_after_run(tmp_path):
     assert d.max_retries == 7  # restored
 
 
+def test_retry_pending_propagates_callback_cancellation(tmp_path):
+    """The codebase uses callback-raises-exception as the cancellation
+    signal (see worker.py classifier-driven aborts). The single-mode retry
+    loop must NOT swallow callback exceptions as per-segment failures —
+    that would silently continue downloading the rest of the pending tail
+    after the user has already cancelled. (Codex adversarial review.)"""
+    segs = [{'url': f'https://example.com/seg-{i}.ts', 'index': i} for i in range(5)]
+    session = _CapturingSession(_FakeResponse(
+        status_code=200,
+        content=_make_valid_ts_sample(packet_count=3),
+        headers={'Content-Type': 'video/mp2t'},
+    ))
+    d = SegmentDownloader(
+        segments=segs,
+        output_dir=str(tmp_path),
+        session=session,
+    )
+    d._partial_files = [None] * 5  # all pending
+
+    cancel_at_done = 1  # raise on the first successful segment
+    callback_dones = []
+
+    def cancellation_callback(done, total):
+        callback_dones.append(done)
+        if done >= cancel_at_done:
+            raise RuntimeError("Job cancelled by user")
+
+    # Cancellation must propagate to the caller, not be swallowed.
+    with pytest.raises(RuntimeError, match="cancelled"):
+        d.retry_pending_in_single_mode(cancellation_callback)
+
+    # _stop_event must be set so any cooperative downstream code abandons cleanly.
+    assert d._stop_event.is_set()
+
+    # Critical assertion: segments AFTER the cancelled one must not have
+    # been attempted. The bug Codex flagged is that the broad except in
+    # the retry loop catches the callback's RuntimeError, logs it as a
+    # segment failure, and continues with the next segment.
+    called_urls = {c['url'] for c in session.calls}
+    later_seg_urls = {f'https://example.com/seg-{i}.ts' for i in (1, 2, 3, 4)}
+    leaked = later_seg_urls & called_urls
+    assert not leaked, (
+        f"Cancellation didn't stop the loop — later segments were "
+        f"attempted after callback raised: {sorted(leaked)}"
+    )
+
+
+def test_retry_pending_still_records_real_segment_failures(tmp_path):
+    """Sanity: separating callback exceptions from download exceptions
+    must not break the existing "real download error → record in
+    failed_segments" path. A failing session (transport-style error) on a
+    pending segment should still be caught and recorded; loop continues
+    to the next segment (only callback errors should stop the loop)."""
+
+    transport_exc_cls = _TRANSPORT_ERRORS[0]
+    try:
+        exc = transport_exc_cls("simulated transport failure")
+    except TypeError:
+        exc = transport_exc_cls()
+
+    segs = [{'url': f'https://example.com/seg-{i}.ts', 'index': i} for i in range(2)]
+    d = SegmentDownloader(
+        segments=segs,
+        output_dir=str(tmp_path),
+        session=_RaisingSession(exc),
+        max_retries=1,  # don't burn time looping retries during this test
+    )
+    d._partial_files = [None, None]
+
+    # Should NOT raise — segment failures get recorded, loop continues.
+    d.retry_pending_in_single_mode(progress_callback=None)
+
+    # Both segments attempted (loop didn't bail on first error)
+    assert len(d.failed_segments) >= 1
+    assert not d._stop_event.is_set()  # not a cancellation
+
+
 def test_single_mode_flag_bypasses_report_failure(monkeypatch, tmp_path):
     """When _single_mode is set, transport errors during a request must NOT
     bump the parallel-path adaptive delay (it's not relevant in sequential

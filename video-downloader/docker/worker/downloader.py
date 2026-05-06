@@ -1461,23 +1461,40 @@ class SegmentDownloader:
         self.max_retries = 1  # one shot per segment in degraded mode
 
         try:
-            for segment in pending:
-                if self._stop_event.is_set():
-                    logger.info("Stop requested during single-mode retry, aborting")
-                    break
-                index = segment['index']
-                try:
-                    file_path = self.download_segment(segment)
+            try:
+                for segment in pending:
+                    if self._stop_event.is_set():
+                        logger.info("Stop requested during single-mode retry, aborting")
+                        break
+                    index = segment['index']
+                    # Per-segment try catches DOWNLOAD errors only — must NOT
+                    # wrap progress_callback. The codebase uses callback-raises
+                    # as the cancellation signal (worker.py classifier-driven
+                    # aborts work this way); swallowing it would silently
+                    # continue downloading after the user cancelled.
+                    try:
+                        file_path = self.download_segment(segment)
+                    except Exception as e:
+                        logger.error(f"Single-mode retry failed for segment {index}: {e}")
+                        self.failed_segments.append({'segment': segment, 'error': str(e)})
+                        file_path = None
                     if file_path:
                         self._partial_files[index] = file_path
                         self.downloaded_count = sum(
                             1 for f in self._partial_files if f is not None
                         )
-                        if progress_callback:
-                            progress_callback(self.downloaded_count, self.total_segments)
-                except Exception as e:
-                    logger.error(f"Single-mode retry failed for segment {index}: {e}")
-                    self.failed_segments.append({'segment': segment, 'error': str(e)})
+                    # Outside per-segment catch: callback exceptions propagate
+                    # up to the outer except, which sets _stop_event and
+                    # re-raises so worker.py knows to abort.
+                    if progress_callback:
+                        progress_callback(self.downloaded_count, self.total_segments)
+            except Exception:
+                # Callback-driven cancellation (or any other unhandled error
+                # from a non-segment source). Mirror download_all's pattern:
+                # set _stop_event so cooperative downstream code stops, then
+                # re-raise so the caller sees the original signal.
+                self._stop_event.set()
+                raise
         finally:
             self._single_mode = False
             self.max_retries = original_max_retries
