@@ -504,7 +504,7 @@ def test_explain_failures_other_dominant_falls_back_to_breakdown():
     assert 'other=10' in msg
 
 
-# --- Per-host adaptive delay (CocoCut-style normalDelay) -----------------
+# --- Per-host adaptive delay (hls.js-style normalDelay) -----------------
 #
 # v2.3.15: per-host inter-segment delay that bumps on transport failures
 # and decays on success. Pin the bookkeeping rules so a future "cleanup"
@@ -1163,7 +1163,7 @@ def test_get_key_bytes_overrides_apply_per_host_not_per_segment_host(
     assert session.calls[0]["headers"].get("X-Key-Auth") == "for-keys-only"
 
 
-# --- v2.3.16: mobile_ua fallback strategy (CocoCut-inspired) -----------
+# --- v2.3.16: mobile_ua fallback strategy -----------
 
 
 def test_strategies_include_mobile_ua_as_last_resort(tmp_path):

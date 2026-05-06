@@ -61,7 +61,7 @@ TS_PACKET_SIZE = 188
 
 # --- Per-host adaptive inter-segment delay --------------------------------
 #
-# Inspired by CocoCut / hls.js's `normalDelay` — pause briefly between
+# Inspired by hls.js's `normalDelay` — pause briefly between
 # consecutive segment requests to a host so we don't burst past its
 # throttle threshold. Starts at 0 (no delay) so non-throttled CDNs aren't
 # slowed down. On a transport failure for a host we increase the delay;
@@ -122,7 +122,7 @@ class _PerHostAdaptiveDelay:
     """
 
     MIN_MS = 0.0
-    MAX_MS = 3000.0           # CocoCut caps normalDelay at 3 seconds
+    MAX_MS = 3000.0           # cap at 3s — matches hls.js normalDelay ceiling
     BOOTSTRAP_MS = 100.0      # first-failure jump from 0 → 100ms
     INCREASE_FACTOR = 2.0
     DECREASE_FACTOR = 0.7
@@ -860,7 +860,7 @@ class SegmentDownloader:
           4. no_referer     — strip Referer/Origin entirely
           5. mobile_ua      — keep source_page Referer but switch UA to iOS
                               Safari (some CDNs serve mobile-friendly streams
-                              with lower throttling — borrowed from CocoCut)
+                              with lower throttling)
 
         Each strategy dict can override Referer, Origin, and/or User-Agent.
         Missing keys mean "inherit from self.headers"; explicit None means
@@ -958,7 +958,7 @@ class SegmentDownloader:
         if host_overrides:
             headers = {**headers, **host_overrides}
 
-        # CocoCut-style inter-segment pacing. acquire_pace_slot() atomically
+        # Adaptive inter-segment pacing. acquire_pace_slot() atomically
         # reserves THIS caller's start time so concurrent same-host workers
         # are spaced `delay_ms` apart instead of all sleeping the same value
         # and bursting together at the end (the bug Codex caught in the
@@ -1045,7 +1045,7 @@ class SegmentDownloader:
                 # strategies and falls into outer retry+backoff. Switching
                 # strategies against a throttled host just adds pressure.
                 # Bump the per-host delay so the next attempt waits — this
-                # is the CocoCut-style adaptive backoff.
+                # is the per-host adaptive backoff.
                 new_delay = _adaptive_delay.report_failure(host)
                 if new_delay > 0 and (index < 3 or index % 25 == 0):
                     # Log occasionally so the operator can see throttle response

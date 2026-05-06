@@ -123,16 +123,15 @@
     return origSend.apply(this, arguments);
   };
 
-  // --- Patch JSON.parse (v2.3.18 deepsearch port from CocoCut) ---
+  // --- Patch JSON.parse (v2.3.18 deepsearch hook) ---
   // The fetch/XHR scans above only look at the first 500 bytes of a
   // response and only fire when the body STARTS with #EXTM3U or <MPD.
   // Many sites wrap the manifest URL inside a JSON API response, e.g.
   //   {"video": {"hls": "https://cdn.example.com/.../master.m3u8"}}
   // — those URLs never appear at byte 0 of the response, so they're
-  // missed. CocoCut's deepsearch hooks JSON.parse and walks every
-  // parsed object looking for m3u8/mpd URLs in any string field. We
-  // port the same idea here. Worker / AES-key hooks from CocoCut are
-  // intentionally NOT ported (Worker injection is fragile across
+  // missed. We hook JSON.parse and walk every parsed object looking
+  // for m3u8/mpd URLs in any string field. Worker / AES-key hooks are
+  // intentionally NOT installed (Worker injection is fragile across
   // origins; AES keys are usually fetched via #EXT-X-KEY URI which
   // we already capture).
   var MEDIA_URL_RE = /https?:\/\/[^\s"'<>\\]+\.(m3u8|mpd)(\?[^\s"'<>\\]*)?/gi;
