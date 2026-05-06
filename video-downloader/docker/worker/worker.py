@@ -1562,7 +1562,7 @@ class DownloadWorker:
     def _process_m3u8_download(self, job_id: str, job: dict):
         """Process m3u8 stream download"""
         from m3u8_parser import parse_m3u8
-        from downloader import SegmentDownloader, classify_failures, explain_failures
+        from downloader import SegmentDownloader, TransportThrottleAbort, classify_failures, explain_failures
         from ffmpeg_wrapper import merge_segments
         from ssl_adapter import create_impersonated_session
         import tempfile
@@ -1821,15 +1821,43 @@ class DownloadWorker:
 
                     if _dominant(counts['transport']):
                         logger.error(f"Transport errors dominant: {counts['transport']}/{failed_count} failures (curl timeouts/RSTs)")
-                        raise Exception(
+                        # v2.4.2: raise a typed sentinel so the outer driver
+                        # can recognize this and try single-connection mode
+                        # (mimics how an in-browser downloader sees the CDN
+                        # — one persistent H2 connection, sequential reads)
+                        # before surfacing a hard failure to the user.
+                        raise TransportThrottleAbort(
                             f"Download aborted: {counts['transport']}/{failed_count} segments failed with "
                             "curl transport errors (timeouts / connection resets). Likely "
                             "per-IP CDN throttle — lower HOST_CONCURRENCY_CAP, set a "
                             "stricter HOST_CONCURRENCY_OVERRIDES entry for this host, or "
-                            "wait 15+ minutes for the IP cooldown."
+                            "wait 15+ minutes for the IP cooldown.",
+                            transport_count=counts['transport'],
+                            total_failures=failed_count,
                         )
             
-            segment_files = downloader.download_all(progress_callback)
+            try:
+                segment_files = downloader.download_all(progress_callback)
+            except TransportThrottleAbort as throttle_err:
+                # v2.4.2: classifier-driven auto-downgrade. The parallel
+                # attempt's connection pattern (N concurrent TCP connections
+                # from one IP) is what aggressive per-IP CDNs throttle; an
+                # in-browser downloader works because the browser uses ONE
+                # persistent H2 connection and multiplexes streams on it.
+                # Retry the segments that didn't make it through one shared
+                # session sequentially — already-downloaded segments are
+                # preserved, so we only pay for the pending tail.
+                logger.warning(
+                    f"Auto-downgrade triggered after transport-dominant abort "
+                    f"({throttle_err.transport_count}/{throttle_err.total_failures} "
+                    "transport errors). Retrying remaining segments in single-"
+                    "connection sequential mode..."
+                )
+                segment_files = downloader.retry_pending_in_single_mode(progress_callback)
+                if not segment_files:
+                    # Phase 2 produced nothing — surface the original throttle
+                    # error so the user sees a meaningful recommendation.
+                    raise throttle_err
 
             if not segment_files:
                 raise Exception("No segments downloaded successfully")

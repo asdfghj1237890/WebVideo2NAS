@@ -12,6 +12,7 @@ from downloader import (
     JPEG_MAGIC,
     PNG_MAGIC,
     GIF_MAGIC,
+    TransportThrottleAbort,
     _TRANSPORT_ERRORS,
     _PerHostAdaptiveDelay,
     _adaptive_delay,
@@ -1508,3 +1509,219 @@ def test_acquire_pace_slot_picks_up_delay_change_mid_sequence():
     # s3 should still be > s2 (we're scheduled after the previous reservation)
     # but the increment from s2 to s3's scheduled time is now only 50ms
     assert s3 >= s2 - 0.01, f"slot must not go backwards in time, s2={s2}, s3={s3}"
+
+
+# --- v2.4.2: classifier-driven auto-downgrade (single-connection retry) ----
+#
+# When the parallel attempt aborts with transport-dominant failures, the
+# worker re-runs the *unfinished* segments through one shared session
+# sequentially (mimicking what an in-browser downloader does — one H2
+# connection, segments fetched in order). These tests pin the contract of
+# `retry_pending_in_single_mode`:
+#   - already-downloaded segments are preserved (no re-download)
+#   - only `_partial_files[i] is None` segments are attempted
+#   - sequential pass → no thread pool, no parallel adaptive-delay sleeps
+#   - max_retries clamped to 1 in degraded mode (don't re-burn)
+
+
+def test_transport_throttle_abort_carries_failure_counts():
+    """The sentinel exception preserves the count fields so the auto-
+    downgrade path can log a coherent reason."""
+    err = TransportThrottleAbort("aborted", transport_count=12, total_failures=15)
+    assert err.transport_count == 12
+    assert err.total_failures == 15
+    assert "aborted" in str(err)
+
+
+def test_retry_pending_only_attempts_unfinished_segments(tmp_path):
+    """If 3 of 5 segments succeeded in the parallel run (left non-None in
+    `_partial_files`), retry_pending_in_single_mode must only call the
+    session for the 2 pending ones — preserving the 3 already-done files."""
+    segs = [{'url': f'https://example.com/seg-{i}.ts', 'index': i} for i in range(5)]
+    payload = _make_valid_ts_sample(packet_count=3)
+    response = _FakeResponse(status_code=200, content=payload, headers={'Content-Type': 'video/mp2t'})
+    session = _CapturingSession(response)
+    d = SegmentDownloader(
+        segments=segs,
+        output_dir=str(tmp_path),
+        session=session,
+    )
+    # Pre-seed _partial_files: indexes 0, 2, 4 already done from "phase 1"
+    d._partial_files = [
+        str(tmp_path / 'pre_done_0.ts'),
+        None,
+        str(tmp_path / 'pre_done_2.ts'),
+        None,
+        str(tmp_path / 'pre_done_4.ts'),
+    ]
+    # Touch the pre-done files so they appear on disk (retry shouldn't see
+    # them as "missing" and re-download).
+    for f in d._partial_files:
+        if f:
+            open(f, 'wb').close()
+
+    result = d.retry_pending_in_single_mode()
+
+    # Session should have been called for the 2 pending segments only.
+    # Each pending segment runs through _try_download_with_headers which
+    # calls session.get(url, ...). With 5 strategies probed for the FIRST
+    # pending segment, we may see up to 5 calls for it (probe phase) +
+    # 1 call for the second pending = up to 6. But once strategy is
+    # established, second segment is just 1 call. Lower bound: 2 (one
+    # working request per pending segment), upper bound: 6 (if probing
+    # all strategies on first pending).
+    pending_urls = {'https://example.com/seg-1.ts', 'https://example.com/seg-3.ts'}
+    called_urls = {c['url'] for c in session.calls}
+    # The 2 pending URLs must have been touched.
+    assert pending_urls.issubset(called_urls)
+    # The 3 already-done URLs must NOT have been touched.
+    done_urls = {f'https://example.com/seg-{i}.ts' for i in (0, 2, 4)}
+    assert not done_urls.intersection(called_urls)
+    # Result preserves all 5 (3 pre-done + 2 freshly-downloaded).
+    assert len(result) == 5
+
+
+def test_retry_pending_no_op_when_nothing_pending(tmp_path):
+    """If the parallel run finished everything, retry should be a no-op
+    (no session calls, no failures)."""
+    segs = [{'url': f'https://example.com/seg-{i}.ts', 'index': i} for i in range(3)]
+    session = _CapturingSession(_FakeResponse(status_code=200, content=_make_valid_ts_sample()))
+    d = SegmentDownloader(
+        segments=segs,
+        output_dir=str(tmp_path),
+        session=session,
+    )
+    d._partial_files = [str(tmp_path / f'done_{i}.ts') for i in range(3)]
+
+    result = d.retry_pending_in_single_mode()
+
+    assert len(session.calls) == 0
+    assert len(result) == 3
+
+
+def test_retry_pending_skips_adaptive_delay_in_single_mode(monkeypatch, tmp_path):
+    """Single-mode retry must not call _adaptive_delay.acquire_pace_slot —
+    sequential downloads pace themselves at the request/response cycle and
+    parallel-path delays just add useless waits (especially since the
+    delay was likely bumped to the 3s ceiling during phase 1's transport
+    storm)."""
+    import downloader as dl
+
+    pace_calls = []
+
+    def spy_acquire(host):
+        pace_calls.append(host)
+        return 0.0
+
+    monkeypatch.setattr(dl._adaptive_delay, 'acquire_pace_slot', spy_acquire)
+
+    segs = [{'url': 'https://example.com/seg-0.ts', 'index': 0}]
+    session = _CapturingSession(_FakeResponse(status_code=200, content=_make_valid_ts_sample()))
+    d = SegmentDownloader(
+        segments=segs,
+        output_dir=str(tmp_path),
+        session=session,
+    )
+    # Mark seg 0 as pending
+    d._partial_files = [None]
+
+    d.retry_pending_in_single_mode()
+
+    # acquire_pace_slot must NOT have been called during single-mode retry.
+    assert pace_calls == []
+
+
+def test_retry_pending_clears_partial_run_failures(tmp_path):
+    """Phase 1 may have populated `failed_segments`; retry should reset it
+    so phase-2-only failures show up cleanly in post-mortem."""
+    segs = [{'url': 'https://example.com/seg-0.ts', 'index': 0}]
+    session = _CapturingSession(_FakeResponse(status_code=200, content=_make_valid_ts_sample()))
+    d = SegmentDownloader(
+        segments=segs,
+        output_dir=str(tmp_path),
+        session=session,
+    )
+    d._partial_files = [None]
+    # Pre-seed failure list as if phase 1 had recorded transport timeouts
+    d.failed_segments = [
+        {'segment': segs[0], 'error': 'Operation timed out after 30000 milliseconds'},
+    ] * 6
+
+    d.retry_pending_in_single_mode()
+
+    # If retry succeeded, failed_segments stays empty.
+    assert d.failed_segments == []
+
+
+def test_retry_pending_clears_stop_event(tmp_path):
+    """Phase 1's abort path sets _stop_event; retry must clear it before
+    re-attempting (otherwise download_segment short-circuits immediately)."""
+    segs = [{'url': 'https://example.com/seg-0.ts', 'index': 0}]
+    session = _CapturingSession(_FakeResponse(status_code=200, content=_make_valid_ts_sample()))
+    d = SegmentDownloader(
+        segments=segs,
+        output_dir=str(tmp_path),
+        session=session,
+    )
+    d._partial_files = [None]
+    d._stop_event.set()  # simulate the parallel-run abort
+
+    d.retry_pending_in_single_mode()
+
+    # After retry, _stop_event should NOT still be set (we cleared it for
+    # the retry pass and the cleanup path doesn't re-set it).
+    assert not d._stop_event.is_set()
+
+
+def test_retry_pending_restores_max_retries_after_run(tmp_path):
+    """retry_pending temporarily clamps max_retries to 1 to avoid burning
+    9× the time on a degraded path. The original value must be restored
+    after the retry completes (or fails) so callers don't observe state
+    drift on the downloader."""
+    segs = [{'url': 'https://example.com/seg-0.ts', 'index': 0}]
+    session = _CapturingSession(_FakeResponse(status_code=200, content=_make_valid_ts_sample()))
+    d = SegmentDownloader(
+        segments=segs,
+        output_dir=str(tmp_path),
+        max_retries=7,
+        session=session,
+    )
+    d._partial_files = [None]
+
+    d.retry_pending_in_single_mode()
+
+    assert d.max_retries == 7  # restored
+
+
+def test_single_mode_flag_bypasses_report_failure(monkeypatch, tmp_path):
+    """When _single_mode is set, transport errors during a request must NOT
+    bump the parallel-path adaptive delay (it's not relevant in sequential
+    mode and would needlessly stall the next test job in the worker)."""
+    import downloader as dl
+
+    bumps = []
+
+    def spy_report_failure(host):
+        bumps.append(host)
+        return 100.0
+
+    monkeypatch.setattr(dl._adaptive_delay, 'report_failure', spy_report_failure)
+
+    transport_exc_cls = _TRANSPORT_ERRORS[0]
+    try:
+        exc = transport_exc_cls("simulated transport failure")
+    except TypeError:
+        exc = transport_exc_cls()
+
+    d = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        session=_RaisingSession(exc),
+    )
+    d._single_mode = True
+
+    with pytest.raises(_TRANSPORT_ERRORS):
+        d._try_download_with_headers("https://example.com/seg.ts", {}, index=0)
+
+    # report_failure must NOT have been called in single mode.
+    assert bumps == []

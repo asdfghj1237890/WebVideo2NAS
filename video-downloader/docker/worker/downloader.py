@@ -54,6 +54,22 @@ if not tls_verify_enabled():
 
 logger = logging.getLogger(__name__)
 
+
+class TransportThrottleAbort(Exception):
+    """Raised by the worker's progress callback when transport-layer failures
+    dominate (curl timeouts / connection resets). The classifier in
+    `worker.py` raises this instead of a plain Exception so the outer driver
+    can recognize the throttle pattern and auto-downgrade to single-connection
+    sequential mode (`SegmentDownloader.retry_pending_in_single_mode`) before
+    surfacing failure to the user. Carrying the failure counts on the
+    exception lets the auto-downgrade path log a coherent reason."""
+
+    def __init__(self, message: str, transport_count: int = 0, total_failures: int = 0):
+        super().__init__(message)
+        self.transport_count = transport_count
+        self.total_failures = total_failures
+
+
 # MPEG-TS sync byte - all valid .ts files start with this
 TS_SYNC_BYTE = b'\x47'
 TS_PACKET_SIZE = 188
@@ -523,6 +539,14 @@ class SegmentDownloader:
 
         # Stop event for cooperative cancellation
         self._stop_event = threading.Event()
+
+        # v2.4.2: classifier-driven auto-downgrade state.
+        # _partial_files mirrors download_all's local downloaded_files but
+        # is preserved on `self` so retry_pending_in_single_mode can pick
+        # up where the parallel run left off. _single_mode bypasses
+        # _adaptive_delay (sequential by definition is already paced).
+        self._partial_files: List[Optional[str]] = [None] * len(segments)
+        self._single_mode = False
         
         # Track which Referer strategy worked (for logging)
         self.working_referer_strategy = None
@@ -972,7 +996,13 @@ class SegmentDownloader:
         # still cancellable?" plus extra CDN traffic when the worker
         # finally wakes up after abort. Event.wait returns True when the
         # event is set, False on timeout — True means cancellation, bail.
-        sleep_for = _adaptive_delay.acquire_pace_slot(host)
+        # v2.4.2: skip adaptive pacing in single-connection retry mode.
+        # Sequential downloads (1 thread, 1 reused session) already pace
+        # themselves at the request/response cycle, so adding the parallel-
+        # path delay (which can be at the 3s ceiling after the first run's
+        # transport storms) just multiplies wait time without spreading
+        # connections that aren't there to spread.
+        sleep_for = 0.0 if self._single_mode else _adaptive_delay.acquire_pace_slot(host)
         if sleep_for > 0:
             if self._stop_event.wait(sleep_for):
                 # Cancelled mid-sleep. We already advanced the reservation
@@ -1045,15 +1075,18 @@ class SegmentDownloader:
                 # strategies and falls into outer retry+backoff. Switching
                 # strategies against a throttled host just adds pressure.
                 # Bump the per-host delay so the next attempt waits — this
-                # is the per-host adaptive backoff.
-                new_delay = _adaptive_delay.report_failure(host)
-                if new_delay > 0 and (index < 3 or index % 25 == 0):
-                    # Log occasionally so the operator can see throttle response
-                    # without flooding for every segment.
-                    logger.info(
-                        f"Adaptive delay for {host} bumped to {new_delay:.0f}ms "
-                        f"after transport error (segment {index})"
-                    )
+                # is the per-host adaptive backoff. (v2.4.2: skipped in
+                # single-connection retry mode — the parallel-path delay
+                # is irrelevant when there's nothing to space out.)
+                if not self._single_mode:
+                    new_delay = _adaptive_delay.report_failure(host)
+                    if new_delay > 0 and (index < 3 or index % 25 == 0):
+                        # Log occasionally so the operator can see throttle response
+                        # without flooding for every segment.
+                        logger.info(
+                            f"Adaptive delay for {host} bumped to {new_delay:.0f}ms "
+                            f"after transport error (segment {index})"
+                        )
                 raise
             except Exception as e:
                 # HTTP-level failure (raise_for_status on 4xx/5xx, etc.) —
@@ -1307,8 +1340,9 @@ class SegmentDownloader:
         """
         logger.info(f"Starting download of {self.total_segments} segments with {self.max_workers} workers")
 
-        downloaded_files = [None] * self.total_segments
-
+        # v2.4.2: track partial state on `self` so retry_pending_in_single_mode
+        # can pick up where this attempt left off (segments that finished
+        # remain finished — only None slots get re-attempted).
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 # Submit all download tasks
@@ -1333,7 +1367,7 @@ class SegmentDownloader:
                         try:
                             file_path = future.result()
                             if file_path:
-                                downloaded_files[index] = file_path
+                                self._partial_files[index] = file_path
                                 self.downloaded_count += 1
 
                         except Exception as e:
@@ -1365,13 +1399,95 @@ class SegmentDownloader:
             self._cleanup_pacing_state()
 
         # Filter out None values (failed downloads)
-        successful_files = [f for f in downloaded_files if f is not None]
+        successful_files = [f for f in self._partial_files if f is not None]
 
         logger.info(f"Download complete: {len(successful_files)}/{self.total_segments} segments successful")
 
         if self.failed_segments:
             logger.warning(f"Failed segments: {len(self.failed_segments)}")
 
+        return successful_files
+
+    def retry_pending_in_single_mode(
+        self,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> List[str]:
+        """Re-attempt segments that didn't complete on the parallel run, but
+        sequentially through a single shared session. Used by the worker as
+        an auto-downgrade after a transport-dominant abort: the parallel
+        attempt's connection-count pattern is what tripped the CDN, and
+        resuming with one curl_cffi session reusing one HTTP/2 connection
+        mimics what an in-browser downloader would do.
+
+        Only segments whose `_partial_files[index]` is None get retried.
+        Already-downloaded segments are preserved as-is. This means a job
+        that got 30/65 through phase 1 only pays for 35 segments in
+        phase 2, not the full 65.
+
+        max_retries is overridden to 1 here — phase-2 retries are expensive
+        (single thread, ~3s/segment), and if a segment fails sequentially
+        with 1 connection it's almost certainly going to keep failing.
+        Better to surface the failure quickly than triple-retry each one.
+        """
+        # Pending = segments that the parallel run never produced a file for.
+        pending = [
+            s for s in self.segments
+            if self._partial_files[s['index']] is None
+        ]
+        already_done = self.total_segments - len(pending)
+
+        if not pending:
+            logger.info("No pending segments — single-mode retry is a no-op")
+            return [f for f in self._partial_files if f is not None]
+
+        logger.info(
+            f"Single-connection retry: {len(pending)} pending, "
+            f"{already_done} already done (preserved from parallel run)"
+        )
+
+        # Reset state for retry. _stop_event was set by the parallel-run
+        # abort; clear it. failed_segments was populated during phase 1;
+        # clear so any phase-2 failures show up cleanly. Keep
+        # _adaptive_delay state for OTHER hosts but clear our reservations
+        # via the existing cleanup path so we don't sleep on stale schedule.
+        self._stop_event.clear()
+        self.failed_segments = []
+        self._cleanup_pacing_state()
+
+        # Single-mode flag bypasses _adaptive_delay sleeps (parallel-only
+        # concern) and report_failure bumps inside _try_download_with_headers.
+        self._single_mode = True
+        original_max_retries = self.max_retries
+        self.max_retries = 1  # one shot per segment in degraded mode
+
+        try:
+            for segment in pending:
+                if self._stop_event.is_set():
+                    logger.info("Stop requested during single-mode retry, aborting")
+                    break
+                index = segment['index']
+                try:
+                    file_path = self.download_segment(segment)
+                    if file_path:
+                        self._partial_files[index] = file_path
+                        self.downloaded_count = sum(
+                            1 for f in self._partial_files if f is not None
+                        )
+                        if progress_callback:
+                            progress_callback(self.downloaded_count, self.total_segments)
+                except Exception as e:
+                    logger.error(f"Single-mode retry failed for segment {index}: {e}")
+                    self.failed_segments.append({'segment': segment, 'error': str(e)})
+        finally:
+            self._single_mode = False
+            self.max_retries = original_max_retries
+            self._cleanup_pacing_state()
+
+        successful_files = [f for f in self._partial_files if f is not None]
+        logger.info(
+            f"Single-mode retry complete: {len(successful_files)}/{self.total_segments} "
+            f"total segments successful (was {already_done} before retry)"
+        )
         return successful_files
 
     def _cleanup_pacing_state(self) -> None:
