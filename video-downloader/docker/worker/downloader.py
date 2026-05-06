@@ -707,9 +707,23 @@ class SegmentDownloader:
         if cached is not None:
             return cached
 
+        # v2.4.1 (Codex adversarial review): per-host header overrides from
+        # HOST_HEADERS_FILE must apply to AES key fetches too, not just to
+        # segment downloads. Some CDNs require the operator-configured
+        # Authorization / User-Agent on BOTH endpoints — without this merge
+        # segments succeed but key fetches return 403, and the encrypted job
+        # fails despite the documented per-host override being set. Lookup
+        # uses the KEY URL's host (which can differ from the segment host).
+        key_host = urlparse(key_url).hostname or ""
+        request_headers = dict(self.headers)
+        if key_host:
+            host_overrides = get_host_headers_for(key_host)
+            if host_overrides:
+                request_headers.update(host_overrides)
+
         response = self.session.get(
             key_url,
-            headers=self.headers,
+            headers=request_headers,
             timeout=self.timeout,
             stream=False,
         )

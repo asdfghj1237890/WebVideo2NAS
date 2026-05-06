@@ -1062,6 +1062,107 @@ def test_get_host_headers_for_lowercases_hostnames(monkeypatch, tmp_path):
     assert get_host_headers_for("ev-h.PHNCDN.com") == {"X": "Y"}
 
 
+# --- v2.4.1: HOST_HEADERS_FILE must apply to AES key fetches too -------
+#
+# Codex adversarial review (commits 2.3.15-2.3.18) found that
+# `_get_key_bytes` was sending `self.headers` directly to the AES key
+# endpoint, bypassing the per-host overrides applied by
+# `_try_download_with_headers`. For CDNs that require the same custom
+# Authorization / User-Agent on BOTH segment and key URLs, encrypted
+# streams would fail even when the operator had configured the documented
+# per-host override.
+
+
+class _CapturingSession:
+    """Session that records the kwargs of each .get() call and returns a
+    fixed response."""
+
+    def __init__(self, response):
+        self._response = response
+        self.calls = []
+
+    def get(self, url, headers=None, **kwargs):
+        self.calls.append({"url": url, "headers": dict(headers or {})})
+        return self._response
+
+
+def test_get_key_bytes_applies_host_headers_overrides(monkeypatch, tmp_path):
+    """HOST_HEADERS_FILE per-host overrides must merge into AES key fetches.
+    Without this, encrypted streams break on any CDN that requires the
+    operator-configured headers on the key endpoint as well as segments."""
+    cfg = tmp_path / "host_headers.json"
+    cfg.write_text(
+        '{"keycdn.example": {"X-Auth-Token": "secret-token", "User-Agent": "custom-ua"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    response = _FakeResponse(status_code=200, content=b"\x00" * 16)
+    session = _CapturingSession(response)
+
+    d = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={"User-Agent": "default-ua", "Referer": "https://example.com/"},
+        session=session,
+    )
+
+    key = d._get_key_bytes("https://keycdn.example/path/to/key.bin")
+    assert key == b"\x00" * 16
+    assert len(session.calls) == 1
+    sent = session.calls[0]["headers"]
+    # Per-host override beats default.
+    assert sent.get("X-Auth-Token") == "secret-token"
+    assert sent.get("User-Agent") == "custom-ua"
+    # Default headers not overridden still pass through.
+    assert sent.get("Referer") == "https://example.com/"
+
+
+def test_get_key_bytes_no_overrides_uses_default_headers(monkeypatch, tmp_path):
+    """Sanity: with no HOST_HEADERS_FILE override matching the key host,
+    default headers are sent unchanged."""
+    monkeypatch.delenv("HOST_HEADERS_FILE", raising=False)
+
+    response = _FakeResponse(status_code=200, content=b"\x00" * 16)
+    session = _CapturingSession(response)
+
+    d = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={"User-Agent": "default-ua"},
+        session=session,
+    )
+    d._get_key_bytes("https://otherkey.example/key.bin")
+    assert session.calls[0]["headers"].get("User-Agent") == "default-ua"
+    assert "X-Auth-Token" not in session.calls[0]["headers"]
+
+
+def test_get_key_bytes_overrides_apply_per_host_not_per_segment_host(
+    monkeypatch, tmp_path
+):
+    """Override lookup must use the KEY URL's host, not the segment host —
+    operators commonly point keys at a different subdomain than segments."""
+    cfg = tmp_path / "host_headers.json"
+    # Override targets the key host only.
+    cfg.write_text(
+        '{"keys.example.test": {"X-Key-Auth": "for-keys-only"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOST_HEADERS_FILE", str(cfg))
+
+    response = _FakeResponse(status_code=200, content=b"\x11" * 16)
+    session = _CapturingSession(response)
+
+    d = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={"User-Agent": "default-ua"},
+        session=session,
+    )
+    d._get_key_bytes("https://keys.example.test/k.bin")
+    assert session.calls[0]["headers"].get("X-Key-Auth") == "for-keys-only"
+
+
 # --- v2.3.16: mobile_ua fallback strategy (CocoCut-inspired) -----------
 
 
