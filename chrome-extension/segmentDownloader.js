@@ -280,11 +280,12 @@ class KeyCache {
       // 128 keys are 16 bytes; the cap leaves slack for unexpected
       // encoding overhead but blocks a hostile key URI from streaming
       // gigabytes of garbage to fill memory.
-      if (buf.byteLength !== 16) {
-        throw new Error(`Key length ${buf.byteLength} != 16 bytes for ${keyUri}`);
+      const keyMaterial = new Uint8Array(buf);
+      if (keyMaterial.byteLength !== 16) {
+        throw new Error(`Key length ${keyMaterial.byteLength} != 16 bytes for ${keyUri}`);
       }
       const cryptoKey = await crypto.subtle.importKey(
-        'raw', buf, { name: 'AES-CBC' }, false, ['decrypt'],
+        'raw', keyMaterial, { name: 'AES-CBC' }, false, ['decrypt'],
       );
       return cryptoKey;
     })();

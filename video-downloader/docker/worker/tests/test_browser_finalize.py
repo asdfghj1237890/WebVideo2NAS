@@ -25,6 +25,8 @@ from browser_finalize import (
 
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
+HAS_FFPROBE = shutil.which("ffprobe") is not None
+HAS_FFMPEG_AND_FFPROBE = HAS_FFMPEG and HAS_FFPROBE
 
 
 def _make_staging(tmp_path: Path, plan: dict, segments: dict) -> Path:
@@ -464,6 +466,10 @@ def test_byte_concat_polls_cancel_check_between_segments(tmp_path):
         _byte_concat([seg1, seg2], out, cancel_check=lambda: True)
 
 
+@pytest.mark.skipif(
+    not HAS_FFMPEG_AND_FFPROBE,
+    reason="ffmpeg/ffprobe not on PATH",
+)
 def test_finalize_hls_ts_happy_path(tmp_path):
     """Generate three real .ts segments via ffmpeg, byte-concat them via
     finalize(), confirm a valid mp4 comes out the other side."""
