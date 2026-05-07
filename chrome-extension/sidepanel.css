@@ -280,6 +280,105 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 }
 .view-all:hover { color: var(--text); }
 
+/* Cross-site CDN trust list — sits between the section label and
+   the detected-URLs grid. Collapsible <details> so it doesn't take
+   vertical space when the user isn't using it; per-tile "+" buttons
+   provide the common-case 1-click path. */
+.trusted-cdn-section {
+  padding: 0 16px 6px;
+  font-family: var(--mono); font-size: 11px;
+}
+.trusted-cdn-section[open] { padding-bottom: 8px; }
+.trusted-cdn-summary {
+  display: flex; align-items: center; gap: 5px;
+  padding: 3px 0;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  color: var(--text-faint);
+  letter-spacing: 0.05em;
+  transition: color 140ms;
+}
+.trusted-cdn-summary::-webkit-details-marker { display: none; }
+.trusted-cdn-summary:hover { color: var(--text-mid); }
+.trusted-cdn-chevron {
+  font-size: 8px;
+  width: 10px;
+  display: inline-block;
+  transition: transform 140ms;
+  color: var(--text-faint);
+}
+.trusted-cdn-section[open] .trusted-cdn-chevron { transform: rotate(90deg); }
+.trusted-cdn-count {
+  color: var(--accent-dim);
+  font-size: 10px;
+  letter-spacing: 0;
+}
+.trusted-cdn-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 0 0;
+}
+.trusted-cdn-input {
+  flex: 1; min-width: 0;
+  padding: 3px 6px;
+  background: transparent;
+  border: 1px dashed var(--glass-border);
+  border-radius: 4px;
+  color: var(--text-mid);
+  font: inherit; font-family: var(--mono); font-size: 11px;
+  transition: border-color 140ms, color 140ms, background 140ms;
+}
+.trusted-cdn-input::placeholder { color: var(--text-faint); }
+.trusted-cdn-input:hover {
+  border-color: var(--glass-border-hi);
+  color: var(--text);
+}
+.trusted-cdn-input:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+  background: var(--bg0);
+  color: var(--text);
+}
+
+/* Per-tile "trust this CDN" button — top-right of the thumb,
+   complements .send-btn at bottom-left. Subtle by default;
+   becomes a green check + disabled when the host is already covered. */
+.trust-cdn-btn {
+  position: absolute; top: 7px; right: 7px;
+  z-index: 3;
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255,255,255,0.12);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  color: rgba(255,255,255,0.85);
+  font: inherit; line-height: 1; padding: 0;
+  transition: background 160ms, color 160ms, border-color 160ms,
+              transform 160ms, opacity 160ms;
+  opacity: 0;
+}
+.tile:hover .trust-cdn-btn { opacity: 1; }
+.trust-cdn-btn:hover {
+  background: var(--accent); color: var(--bg0);
+  border-color: var(--accent);
+  transform: scale(1.08);
+}
+.trust-cdn-btn:active { transform: scale(0.94); }
+.trust-cdn-btn.is-trusted {
+  opacity: 0.95;
+  background: rgba(60, 180, 90, 0.55);
+  color: #fff;
+  border-color: rgba(120, 220, 140, 0.4);
+  cursor: default;
+}
+.trust-cdn-btn.is-trusted:hover {
+  background: rgba(60, 180, 90, 0.55);
+  color: #fff;
+  transform: none;
+}
+
 /* ==== Grid ==== */
 .grid {
   display: grid;

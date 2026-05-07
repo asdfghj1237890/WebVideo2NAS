@@ -1022,6 +1022,196 @@ describe('manifest URL safety: same-site requirement (Codex adversarial-review)'
 });
 
 
+// Option E: user-allowlisted cross-site CDN suffixes. The strict
+// same-site policy refuses cross-site CDN streams whose segments are
+// IP-bound to the browser session and can't be fetched NAS-side. The
+// allowlist lets the user opt-in per host suffix; absent or empty,
+// behavior reverts to strict same-site.
+
+describe('_wv2nasMatchesTrustedCdnSuffix', () => {
+  const fn = (h, s) => ctx._wv2nasMatchesTrustedCdnSuffix(h, s);
+
+  it('exact host match', () => {
+    expect(fn('phncdn.com', ['phncdn.com'])).toBe(true);
+  });
+
+  it('subdomain match (suffix preceded by dot)', () => {
+    expect(fn('kv-h.phncdn.com', ['phncdn.com'])).toBe(true);
+    expect(fn('a.b.c.phncdn.com', ['phncdn.com'])).toBe(true);
+  });
+
+  it('typosquat / substring-only NOT a match (security boundary)', () => {
+    // Critical: must NOT match `evilphncdn.com` for suffix `phncdn.com`.
+    expect(fn('evilphncdn.com', ['phncdn.com'])).toBe(false);
+    expect(fn('aphncdn.com', ['phncdn.com'])).toBe(false);
+    // Suffix in the middle: also no.
+    expect(fn('foo.phncdn.com.evil.example', ['phncdn.com'])).toBe(false);
+  });
+
+  it('case-insensitive on both host and suffix', () => {
+    expect(fn('KV-H.PhnCDN.com', ['phncdn.com'])).toBe(true);
+    expect(fn('kv-h.phncdn.com', ['PHNCDN.COM'])).toBe(true);
+  });
+
+  it('tolerates leading dots and whitespace in user input', () => {
+    expect(fn('kv-h.phncdn.com', ['  .phncdn.com  '])).toBe(true);
+    expect(fn('kv-h.phncdn.com', ['..phncdn.com'])).toBe(true);
+  });
+
+  it('matches if any suffix in list matches', () => {
+    expect(fn('media.akamaized.net', ['phncdn.com', 'akamaized.net'])).toBe(true);
+  });
+
+  it('empty / non-array / missing returns false', () => {
+    expect(fn('phncdn.com', [])).toBe(false);
+    expect(fn('phncdn.com', null)).toBe(false);
+    expect(fn('phncdn.com', undefined)).toBe(false);
+    expect(fn('phncdn.com', 'phncdn.com')).toBe(false);
+  });
+
+  it('skips non-string / empty entries in list', () => {
+    expect(fn('phncdn.com', [null, '', undefined, 42, 'phncdn.com'])).toBe(true);
+    expect(fn('phncdn.com', [null, '', undefined, 42])).toBe(false);
+  });
+
+  it('empty / non-string host returns false', () => {
+    expect(fn('', ['phncdn.com'])).toBe(false);
+    expect(fn(null, ['phncdn.com'])).toBe(false);
+    expect(fn(42, ['phncdn.com'])).toBe(false);
+  });
+});
+
+
+describe('_wv2nasIsManifestUrlSafeForBrowser: trustedCdnSuffixes', () => {
+  it('allowlisted CDN suffix bypasses cross-site refusal', () => {
+    const result = ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://kv-h.phncdn.com/master.m3u8',
+      'https://cn.example.com/watch',
+      ['phncdn.com'],
+    );
+    expect(result).toEqual({ safe: true });
+  });
+
+  it('non-allowlisted cross-site still refused', () => {
+    const result = ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://other-cdn.example/master.m3u8',
+      'https://cn.example.com/watch',
+      ['phncdn.com'],
+    );
+    expect(result.safe).toBe(false);
+    expect(result.reason).toContain('not same-site');
+    // The error message should hint at the option-E knob.
+    expect(result.reason).toContain('Trusted cross-site CDN suffixes');
+  });
+
+  it('allowlist does NOT override hard rejections (private IP / localhost)', () => {
+    // User explicitly trusting `localhost` or `10.0.0.0/8` would be
+    // a self-foot-gun; the allowlist must remain subordinate to the
+    // private/loopback/reserved-IP refusals, which fire BEFORE the
+    // same-site check.
+    expect(ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://localhost/x.m3u8', 'https://attacker.com/p', ['localhost'],
+    ).safe).toBe(false);
+    expect(ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://10.0.0.1/x.m3u8', 'https://attacker.com/p', ['10.0.0.1'],
+    ).safe).toBe(false);
+    expect(ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://[::1]/x.m3u8', 'https://attacker.com/p', ['::1'],
+    ).safe).toBe(false);
+    expect(ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'http://kv-h.phncdn.com/x.m3u8', 'https://example.com/p', ['phncdn.com'],
+    ).safe).toBe(false);  // HTTPS-only gate still applies
+  });
+
+  it('empty / missing list = strict same-site (existing behavior)', () => {
+    expect(ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://kv-h.phncdn.com/x.m3u8', 'https://cn.example.com/watch',
+    ).safe).toBe(false);
+    expect(ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://kv-h.phncdn.com/x.m3u8', 'https://cn.example.com/watch', [],
+    ).safe).toBe(false);
+    expect(ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://kv-h.phncdn.com/x.m3u8', 'https://cn.example.com/watch', null,
+    ).safe).toBe(false);
+  });
+
+  it('typosquat NOT bypassed by allowlist (security boundary)', () => {
+    // suffix `phncdn.com` must NOT allow `evilphncdn.com` through.
+    const result = ctx._wv2nasIsManifestUrlSafeForBrowser(
+      'https://evilphncdn.com/x.m3u8',
+      'https://cn.example.com/watch',
+      ['phncdn.com'],
+    );
+    expect(result.safe).toBe(false);
+  });
+
+  it('end-to-end: _wv2nasFetchManifestInBrowser respects dnrContext.trustedCdnSuffixes', async () => {
+    function ok(text) {
+      return { ok: true, status: 200, text: async () => text, headers: { get: () => null } };
+    }
+    ctx.fetch = vi.fn(async () => ok('#EXTM3U\n#EXTINF:10\nseg.ts\n'));
+
+    // Without allowlist → refused (strict same-site).
+    const refused = await ctx._wv2nasFetchManifestInBrowser(
+      'https://kv-h.phncdn.com/playlist.m3u8',
+      { idBase: 10000, ruleIds: [], pageUrl: 'https://cn.example.com/watch' },
+    );
+    expect(refused).toMatchObject({ safetyRejected: true });
+    expect(ctx.fetch).not.toHaveBeenCalled();
+
+    // With allowlist → fetch goes through.
+    ctx.fetch = vi.fn(async () => ok('#EXTM3U\n#EXTINF:10\nseg.ts\n'));
+    const allowed = await ctx._wv2nasFetchManifestInBrowser(
+      'https://kv-h.phncdn.com/playlist.m3u8',
+      {
+        idBase: 10000, ruleIds: [],
+        pageUrl: 'https://cn.example.com/watch',
+        trustedCdnSuffixes: ['phncdn.com'],
+      },
+    );
+    expect(allowed).not.toBeNull();
+    expect(allowed.safetyRejected).toBeUndefined();
+    expect(allowed.manifest_text).toContain('#EXTM3U');
+    expect(ctx.fetch).toHaveBeenCalledOnce();
+  });
+
+  it('variant URL trust check is NOT softened by allowlist (structural)', async () => {
+    // Master on allowlisted CDN, variant URL points at a DIFFERENT
+    // allowlisted host. The variant trust anchor is master URL, not
+    // pageUrl — allowlist must NOT propagate, otherwise master could
+    // surface variants on attacker.com (which would be allowlisted).
+    function ok(text) {
+      return { ok: true, status: 200, text: async () => text, headers: { get: () => null } };
+    }
+    const master = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=2000000
+https://other-allowlisted.example/v/hi.m3u8
+`;
+    let i = 0;
+    const responses = [ok(master)];
+    ctx.fetch = vi.fn(async () => responses[i++]);
+
+    const result = await ctx._wv2nasFetchManifestInBrowser(
+      'https://kv-h.phncdn.com/master.m3u8',
+      {
+        idBase: 10000, ruleIds: [],
+        pageUrl: 'https://cn.example.com/watch',
+        trustedCdnSuffixes: ['phncdn.com', 'other-allowlisted.example'],
+      },
+    );
+    // Variant safety check uses master URL as anchor → variant is on
+    // a different site from `kv-h.phncdn.com` → refused regardless of
+    // allowlist.
+    expect(result).toMatchObject({
+      safetyRejected: true,
+      url: 'https://other-allowlisted.example/v/hi.m3u8',
+    });
+    // Only the master fetch happened.
+    expect(ctx.fetch).toHaveBeenCalledOnce();
+  });
+});
+
+
 // Codex review (P1): the safety gate validates the ORIGINAL URL,
 // but `fetch()`'s default redirect:'follow' would silently chase a
 // 30x to a foreign / private host with credentials:'include' and

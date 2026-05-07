@@ -70,6 +70,7 @@ async function loadSettingsFromStorage() {
   settings = await chrome.storage.sync.get([
     'nasEndpoint', 'apiKey', 'uiLanguage', 'uiTheme', 'jobSort',
     'hiddenMode', 'hiddenModeUrlTemplate',
+    'trustedCdnSuffixes',
   ]);
   if (settings.jobSort && JOB_SORT_CYCLE.includes(settings.jobSort)) {
     jobSort = settings.jobSort;
@@ -79,6 +80,118 @@ async function loadSettingsFromStorage() {
   }
   applyHiddenModeVisibility();
   return settings;
+}
+
+
+// Parse the comma- or newline-separated trustedCdnSuffixes input
+// into a clean string[]. The strict matcher in background.js trims,
+// lowercases, and strips leading dots at match time, so this is
+// mainly for storage hygiene + dedup, plus pulling the hostname out
+// when the user pastes a full URL.
+function parseTrustedCdnSuffixesInput(raw) {
+  if (typeof raw !== 'string') return [];
+  const seen = new Set();
+  for (const part of raw.split(/[,\n]+/)) {
+    let s = part.trim();
+    if (!s) continue;
+    if (s.includes('://')) {
+      try { s = new URL(s).hostname; } catch (_) { /* keep raw on parse fail */ }
+    }
+    s = s.replace(/^\.+/, '').toLowerCase();
+    if (s) seen.add(s);
+  }
+  return Array.from(seen);
+}
+
+function populateTrustedCdnInput() {
+  const input = document.getElementById('trustedCdnSuffixes');
+  if (!input) return;
+  const list = settings && settings.trustedCdnSuffixes;
+  input.value = Array.isArray(list) ? list.join(', ') : '';
+}
+
+function updateTrustedCdnCount() {
+  const el = document.getElementById('trustedCdnCount');
+  if (!el) return;
+  const list = settings && settings.trustedCdnSuffixes;
+  const n = Array.isArray(list) ? list.length : 0;
+  el.textContent = n > 0 ? `(${n})` : '';
+}
+
+async function saveTrustedCdnInput() {
+  const input = document.getElementById('trustedCdnSuffixes');
+  if (!input) return;
+  const trustedCdnSuffixes = parseTrustedCdnSuffixesInput(input.value || '');
+  settings.trustedCdnSuffixes = trustedCdnSuffixes;
+  await chrome.storage.sync.set({ trustedCdnSuffixes });
+  updateTrustedCdnCount();
+  // Re-render detected tiles so per-tile trust badges update.
+  if (typeof renderDetectedUrls === 'function') {
+    renderDetectedUrls({ keepPulse: false });
+  }
+}
+
+// Derive a reasonable host-suffix from a URL for the per-tile "+"
+// trust button. Last 2 dot-separated parts cover the vast majority
+// of CDN domains (phncdn.com, akamaized.net, cloudfront.net, ...).
+// Edge cases (co.uk, com.tw) get over-broad results; the user can
+// edit the trusted CDNs textbox to narrow if needed.
+//
+// Returns null when "+" trust would be meaningless: malformed URL,
+// IP literal (gate rejects regardless of trust list), single-label
+// host (e.g. localhost — also rejected by gate).
+function deriveTrustedCdnSuffix(urlOrHost) {
+  if (typeof urlOrHost !== 'string' || !urlOrHost) return null;
+  let host;
+  if (urlOrHost.includes('://')) {
+    try { host = new URL(urlOrHost).hostname; } catch (_) { return null; }
+  } else {
+    host = urlOrHost;
+  }
+  if (!host) return null;
+  host = host.toLowerCase();
+  // IP literal (v4 or bracketed v6) — gate rejects at IP-classification
+  // step, no trust list change can unblock these.
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return null;
+  if (host.startsWith('[')) return null;
+  const parts = host.split('.').filter(Boolean);
+  if (parts.length < 2) return null;
+  return parts.slice(-2).join('.');
+}
+
+// Pure JS twin of background.js's `_wv2nasMatchesTrustedCdnSuffix`.
+// Sidepanel can't call into the SW directly, so we duplicate the
+// strict-suffix matcher here for "is this host already covered?"
+// rendering decisions. Both helpers MUST stay in lockstep — same
+// rules (exact-or-dotted-suffix, lowercase, leading-dot tolerant).
+function hostMatchesAnyTrustedSuffix(host, suffixes) {
+  if (!Array.isArray(suffixes) || suffixes.length === 0) return false;
+  if (typeof host !== 'string' || !host) return false;
+  const h = host.toLowerCase();
+  for (const raw of suffixes) {
+    if (typeof raw !== 'string') continue;
+    const s = raw.trim().toLowerCase().replace(/^\.+/, '');
+    if (!s) continue;
+    if (h === s || h.endsWith('.' + s)) return true;
+  }
+  return false;
+}
+
+async function trustCdnFromUrl(url) {
+  const suffix = deriveTrustedCdnSuffix(url);
+  if (!suffix) return false;
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return false; }
+  const current = Array.isArray(settings.trustedCdnSuffixes)
+    ? settings.trustedCdnSuffixes.slice()
+    : [];
+  if (hostMatchesAnyTrustedSuffix(host, current)) return false; // already covered
+  current.push(suffix);
+  settings.trustedCdnSuffixes = current;
+  await chrome.storage.sync.set({ trustedCdnSuffixes: current });
+  populateTrustedCdnInput();
+  updateTrustedCdnCount();
+  return true;
 }
 
 function applyJobSortLabel() {
@@ -159,6 +272,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadSettingsFromStorage();
   applyTheme(settings.uiTheme || 'dark');
   applyUiLanguage();
+  populateTrustedCdnInput();
+  updateTrustedCdnCount();
 
   checkConnection();
   loadDetectedUrls();
@@ -182,6 +297,17 @@ function setupEventListeners() {
     loadDetectedUrls();
     loadRecentJobs();
   });
+
+  // Trusted CDN suffixes — save on blur (avoid spamming chrome.storage.sync
+  // writes per keystroke; sync has per-item byte quota and write rate limits).
+  const trustedCdnInput = document.getElementById('trustedCdnSuffixes');
+  if (trustedCdnInput) {
+    trustedCdnInput.addEventListener('blur', () => {
+      saveTrustedCdnInput().catch((e) =>
+        console.warn('[wv2nas] failed to persist trustedCdnSuffixes:', e)
+      );
+    });
+  }
 
   const themeBtn = document.getElementById('themeToggleBtn');
   if (themeBtn) {
@@ -298,6 +424,21 @@ function setupEventListeners() {
         if (changes.hiddenMode) settings.hiddenMode = changes.hiddenMode.newValue;
         if (changes.hiddenModeUrlTemplate) settings.hiddenModeUrlTemplate = changes.hiddenModeUrlTemplate.newValue;
         applyHiddenModeVisibility();
+      }
+
+      if (changes.trustedCdnSuffixes) {
+        settings.trustedCdnSuffixes = changes.trustedCdnSuffixes.newValue;
+        updateTrustedCdnCount();
+        // Don't clobber a field the user is currently editing.
+        const input = document.getElementById('trustedCdnSuffixes');
+        if (input && document.activeElement !== input) {
+          populateTrustedCdnInput();
+        }
+        // Refresh tile trust badges (a "+" elsewhere may have just
+        // covered some of the visible tiles).
+        if (typeof renderDetectedUrls === 'function') {
+          renderDetectedUrls({ keepPulse: false });
+        }
       }
     }
   });
@@ -622,6 +763,17 @@ function renderDetectedUrls(opts) {
     const isNowPlaying = !!urlInfo.isNowPlaying || !!urlInfo.isLive;
 
     const thumbnail = urlInfo.thumbnail || null;
+    // Trust-CDN button state. Hide entirely when the URL host is an
+    // IP literal / single-label / unparseable (gate rejects regardless,
+    // so a "trust" action would do nothing useful).
+    const trustSuffix = deriveTrustedCdnSuffix(url);
+    let trustHostLower = null;
+    if (trustSuffix) {
+      try { trustHostLower = new URL(url).hostname.toLowerCase(); } catch (_) {}
+    }
+    const trustAlreadyCovered = trustHostLower && hostMatchesAnyTrustedSuffix(
+      trustHostLower, settings && settings.trustedCdnSuffixes,
+    );
     return `
       <div class="tile${newClass}${selClass}${sentClass}${interactClass}"
            data-url="${escapeHtml(url)}"
@@ -666,6 +818,21 @@ function renderDetectedUrls(opts) {
               </span>
             </button>
           `}
+          ${trustSuffix ? `
+            <button class="trust-cdn-btn${trustAlreadyCovered ? ' is-trusted' : ''}"
+                    type="button"
+                    ${trustAlreadyCovered ? 'disabled aria-pressed="true"' : 'data-action="trust-cdn"'}
+                    data-url="${escapeHtml(url)}"
+                    data-suffix="${escapeHtml(trustSuffix)}"
+                    aria-label="${escapeHtml(trustAlreadyCovered
+                      ? `${trustSuffix} is already in trusted CDNs`
+                      : `Add ${trustSuffix} to trusted CDNs`)}"
+                    title="${escapeHtml(trustAlreadyCovered
+                      ? `trusted: ${trustSuffix}`
+                      : `+ trust ${trustSuffix} (browser-side cross-site)`)}">
+              ${trustAlreadyCovered ? '✓' : '+'}
+            </button>
+          ` : ''}
         </div>
         ${hasIp ? `
           <details class="ip-warn">
@@ -706,6 +873,20 @@ function renderDetectedUrls(opts) {
       const pageUrl = btn.dataset.page;
       const tile = btn.closest('.tile');
       flyToNAS(tile, url, pageUrl);
+    });
+  });
+
+  listElement.querySelectorAll('[data-action="trust-cdn"]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const url = btn.dataset.url;
+      if (!url) return;
+      const added = await trustCdnFromUrl(url);
+      if (added) {
+        // Re-render so the clicked tile (and any siblings on the same
+        // suffix) flip to the "already trusted" state.
+        renderDetectedUrls({ keepPulse: false });
+      }
     });
   });
 

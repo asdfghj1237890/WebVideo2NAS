@@ -1266,6 +1266,7 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     // Get settings
     const settings = await chrome.storage.sync.get([
       'nasEndpoint', 'apiKey', 'nasOutputSubdir', 'useBrowserSide',
+      'trustedCdnSuffixes',
     ]);
 
     if (!settings.nasEndpoint || !settings.apiKey) {
@@ -1434,6 +1435,7 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
       const masterSafety = _wv2nasIsManifestUrlSafeForBrowser(
         requestBody.url,
         pageUrl || requestBody.source_page || null,
+        settings.trustedCdnSuffixes,
       );
       if (!masterSafety.safe) {
         if (_wv2nasCanUseNasDirectForBrowserUnsafeUrl(
@@ -1463,6 +1465,7 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
           title,
           pageUrl,
           formatHint,
+          trustedCdnSuffixes: settings.trustedCdnSuffixes,
         });
         return;
       } catch (err) {
@@ -2412,6 +2415,27 @@ function _wv2nasClassifyIpv6Literal(inner) {
 }
 
 
+// User-configured cross-site CDN trust list. Strict suffix match on
+// the dotted hostname — a configured `phncdn.com` matches `phncdn.com`
+// and `kv-h.phncdn.com` but NOT `evilphncdn.com` (substring matches
+// would expose typosquats). Empty / missing list → no host matches,
+// behavior unchanged from the strict same-site policy.
+function _wv2nasMatchesTrustedCdnSuffix(host, suffixes) {
+  if (!Array.isArray(suffixes) || suffixes.length === 0) return false;
+  if (typeof host !== 'string' || !host) return false;
+  const h = host.toLowerCase();
+  for (const raw of suffixes) {
+    if (typeof raw !== 'string') continue;
+    // Trim whitespace and any leading dots so users writing
+    // ".phncdn.com" still get the intuitive match.
+    const s = raw.trim().toLowerCase().replace(/^\.+/, '');
+    if (!s) continue;
+    if (h === s || h.endsWith('.' + s)) return true;
+  }
+  return false;
+}
+
+
 // Codex adversarial-review (high): pre-validate any URL we're about
 // to fetch in the extension context with credentials. The server's
 // _enforce_plan_url_safety only runs AFTER `manifest_text` has been
@@ -2424,7 +2448,7 @@ function _wv2nasClassifyIpv6Literal(inner) {
 //     / shared-CGN / TEST-NET / reserved ranges
 //   - DNS-resolvable hostnames are accepted (we can't do DNS lookups
 //     client-side; the HTTPS gate is the safety net)
-function _wv2nasIsManifestUrlSafeForBrowser(url, pageUrl) {
+function _wv2nasIsManifestUrlSafeForBrowser(url, pageUrl, trustedCdnSuffixes) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -2461,23 +2485,30 @@ function _wv2nasIsManifestUrlSafeForBrowser(url, pageUrl) {
   // the page that surfaced this URL. Legitimate cookie-bound
   // streams (Vimeo private videos, paid streaming sites) are
   // typically same-site by design — that's where the cookies live.
-  // Cross-site streams (YouTube/Twitch-style with URL-embedded
-  // tokens) don't need browser-side credentials and can fall
-  // through to NAS-side planning, where `_safe_fetch` does
-  // resolve-and-public-IP-check before fetching.
+  //
+  // Cross-site CDN streams (page on brand domain, manifest/segments
+  // on a separate CDN eTLD+1) with IP-bound HMAC tokens that NAS-side
+  // can't reach are the exception — they need browser-side AND require
+  // the user to explicitly pre-declare the CDN host suffix as trusted
+  // via `trustedCdnSuffixes`. The user shoulders the split-horizon-DNS
+  // / internal-CA risk for those specific suffixes. Empty list →
+  // strict same-site policy (default).
   //
   // When pageUrl is not provided (back-compat for unit tests of
   // this helper), we fall back to the prior behavior — accept any
   // public-resolving DNS name. Production runBrowserSideJob always
   // passes pageUrl through dnrContext.
   if (pageUrl) {
-    if (!_wv2nasIsTrustedDnrUrl(url, pageUrl)) {
+    if (!_wv2nasIsTrustedDnrUrl(url, pageUrl)
+        && !_wv2nasMatchesTrustedCdnSuffix(host, trustedCdnSuffixes)) {
       return {
         safe: false,
         reason: (
           `host ${host} is not same-site with page (${pageUrl}); `
           + `refusing browser fetch — split-horizon DNS / internal-CA `
-          + `hosts cannot be distinguished client-side from public hosts`
+          + `hosts cannot be distinguished client-side from public hosts. `
+          + `If this is a known cross-site CDN, add its host suffix to `
+          + `'Trusted cross-site CDN suffixes' in extension options.`
         ),
       };
     }
@@ -2523,9 +2554,13 @@ async function _wv2nasFetchManifestInBrowser(url, dnrContext = null) {
   // forged manifest URL pointing at intranet/metadata hosts gets
   // fetched with the user's cookies before any server check runs.
   // Pass dnrContext.pageUrl so the gate can also reject DNS hostnames
-  // that aren't same-site with the page (split-horizon mitigation).
+  // that aren't same-site with the page (split-horizon mitigation),
+  // plus dnrContext.trustedCdnSuffixes for user-allowlisted cross-site
+  // CDN bypass (option E — opt-in per host suffix).
   const safety = _wv2nasIsManifestUrlSafeForBrowser(
-    url, dnrContext && dnrContext.pageUrl,
+    url,
+    dnrContext && dnrContext.pageUrl,
+    dnrContext && dnrContext.trustedCdnSuffixes,
   );
   if (!safety.safe) {
     console.warn(
@@ -3079,7 +3114,7 @@ async function _wv2nasAbortBrowserJob(nasEndpoint, apiKey, jobId, reason) {
   }
 }
 
-async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, pageUrl, formatHint }) {
+async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, pageUrl, formatHint, trustedCdnSuffixes }) {
   // Codex adversarial-review: SW cold-start kicks off
   // `_wv2nasInitRecovery()` which re-reserves DNR slots for surviving
   // offscreen jobs (and re-populates `_wv2nasUsedDnrSlots`). That
@@ -3138,9 +3173,19 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     // for untrusted hosts so neither header-spoof nor CORS-relax
     // emits.
     const masterTrustAnchor = pageUrl || (requestBody && requestBody.source_page) || null;
-    const masterTrustedForDnr = masterTrustAnchor
-      ? _wv2nasIsTrustedDnrUrl(requestBody.url, masterTrustAnchor)
-      : false;
+    let masterUrlHost = null;
+    try {
+      masterUrlHost = new URL(requestBody.url).hostname.toLowerCase();
+    } catch (_) { /* malformed URL caught earlier by safety gate */ }
+    // User-allowlisted CDN suffix counts as same-site for the DNR
+    // CORS-relax decision too — otherwise the response body comes back
+    // opaque and `_wv2nasFetchManifestInBrowser` can't read it as
+    // `manifest_text`. The user explicitly asserted trust for this
+    // suffix in extension options.
+    const masterTrustedForDnr = masterTrustAnchor && (
+      _wv2nasIsTrustedDnrUrl(requestBody.url, masterTrustAnchor)
+      || _wv2nasMatchesTrustedCdnSuffix(masterUrlHost, trustedCdnSuffixes)
+    );
 
     // === Phase 1 DNR: cover the manifest URL ===
     // Codex review #8: install header-spoof rules for the manifest URL
@@ -3187,6 +3232,10 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
         // it, otherwise we fall through to NAS-side planning where
         // _safe_fetch's resolve+public-IP guard runs.
         pageUrl: pageUrl || requestBody.source_page || null,
+        // User-allowlisted cross-site CDN suffixes (option E). When
+        // the master URL host matches one, the same-site gate is
+        // bypassed for THIS URL only.
+        trustedCdnSuffixes,
       },
     );
     if (browserFetched && browserFetched.safetyRejected) {

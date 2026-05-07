@@ -102,6 +102,26 @@
             <span id="detectedVideosTitle">Detected on this page</span>
             <span id="detectedCountSuffix" class="count-suffix"></span>
           </div>
+          <!-- Cross-site CDN trust list. Bypasses the browser-side
+               same-site gate for the host suffixes the user explicitly
+               lists here. SECURITY: trusted CDNs receive cookies +
+               CORS-relax — only add ones you trust.
+               Collapsed by default to keep the detected pane uncluttered;
+               per-tile "+" buttons (top-right of each thumb) provide a
+               1-click way to add a host without expanding this. -->
+          <details class="trusted-cdn-section" id="trustedCdnDetails">
+            <summary class="trusted-cdn-summary">
+              <span class="trusted-cdn-chevron" aria-hidden="true">▶</span>
+              <span class="trusted-cdn-summary-label" id="trustedCdnLabel">trusted CDNs</span>
+              <span class="trusted-cdn-count" id="trustedCdnCount"></span>
+            </summary>
+            <div class="trusted-cdn-row">
+              <input id="trustedCdnSuffixes" class="trusted-cdn-input" type="text"
+                     placeholder="phncdn.com, akamaized.net"
+                     spellcheck="false" autocomplete="off"
+                     title="Comma-separated host suffixes (e.g. 'phncdn.com'). Bypasses the cross-site gate for browser-side mode. SECURITY: only add CDNs you trust — they receive cookies + CORS-relax.">
+            </div>
+          </details>
           <div id="detectedUrlsList" class="grid">
             <div class="empty-state">
               <p id="detectedEmptyTitle">No videos detected yet</p>
