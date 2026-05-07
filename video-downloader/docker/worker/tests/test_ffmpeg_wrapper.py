@@ -298,3 +298,87 @@ def test_merge_with_re_encode_skipped_for_fmp4(tmp_path, monkeypatch):
     captured = _patch_popen(monkeypatch)
     assert merger.merge_with_re_encode() is False
     assert captured["instances"] == [], "ffmpeg must not be invoked for fMP4 re-encode path"
+
+
+def test_merge_segments_skips_reencode_when_copy_path_was_cancelled(tmp_path, monkeypatch):
+    """If copy mode returns False because cancellation fired, the fallback
+    must not start a long re-encode."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+
+    def cancelled_copy_merge(self):
+        self.cancelled = True
+        return False
+
+    monkeypatch.setattr(FFmpegMerger, "merge", cancelled_copy_merge)
+
+    def fail_if_reencode_runs(self):
+        raise AssertionError("re-encode must be skipped after cancellation")
+
+    monkeypatch.setattr(FFmpegMerger, "merge_with_re_encode", fail_if_reencode_runs)
+
+    ok = merge_segments(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=True,
+        cancel_check=lambda: False,
+    )
+
+    assert ok is False
+
+
+def test_merge_with_reencode_kills_ffmpeg_when_cancelled(tmp_path, monkeypatch):
+    """Re-encode itself also has to poll cancellation; otherwise a cancel
+    during fallback can block until the 30-minute subprocess timeout."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+
+    cancel_state = {"calls": 0}
+
+    def cancel_on_second_poll():
+        cancel_state["calls"] += 1
+        return cancel_state["calls"] >= 2
+
+    class HangingReencodePopen:
+        def __init__(self, command, stdout=None, stderr=None, **kwargs):
+            self.command = list(command)
+            self.returncode = None
+            self.killed = False
+            output.write_bytes(b"partial")
+
+        def communicate(self, timeout=None):
+            if self.killed:
+                self.returncode = -9
+                return (b"", b"cancelled")
+            raise ffmpeg_wrapper.subprocess.TimeoutExpired(self.command, timeout)
+
+        def kill(self):
+            self.killed = True
+
+    captured = {"instances": []}
+
+    def factory(command, **kwargs):
+        process = HangingReencodePopen(command, **kwargs)
+        captured["instances"].append(process)
+        return process
+
+    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "Popen", factory)
+
+    merger = FFmpegMerger(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        cancel_check=cancel_on_second_poll,
+    )
+
+    assert merger.merge_with_re_encode() is False
+    assert len(captured["instances"]) == 1
+    assert captured["instances"][0].killed is True
+    assert not output.exists(), "partial re-encode output should be removed after cancellation"

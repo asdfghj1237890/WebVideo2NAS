@@ -625,6 +625,17 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   transition: color 320ms;
 }
+.mode-badge {
+  display: inline-block;
+  font-family: var(--mono); font-size: 9px; font-weight: 600;
+  letter-spacing: 0.4px; text-transform: uppercase;
+  padding: 1px 5px; margin-right: 5px; border-radius: 3px;
+  vertical-align: middle;
+}
+.mode-badge.mode-browser {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
 .job-meta {
   font-size: 11px; color: var(--text-dim);
   font-family: var(--mono); margin-top: 3px;

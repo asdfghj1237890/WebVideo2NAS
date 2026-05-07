@@ -100,3 +100,5 @@ failed/
 CLAUDE.md
 .claude/
 
+# Project-local Codex rules (personal, per-developer)
+AGENTS.md

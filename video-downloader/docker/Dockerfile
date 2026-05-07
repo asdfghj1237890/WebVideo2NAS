@@ -28,9 +28,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 # Application source. Each role lives in its own subdir so the existing test
-# layout (api/tests, worker/tests) keeps working unchanged.
+# layout (api/tests, worker/tests) keeps working unchanged. v2.5+ adds
+# `shared/` for code reused across both roles (parsers, ssl session
+# factory) — the entrypoint puts /app on PYTHONPATH so `import shared`
+# resolves regardless of CWD.
 COPY api/ ./api/
 COPY worker/ ./worker/
+COPY shared/ ./shared/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

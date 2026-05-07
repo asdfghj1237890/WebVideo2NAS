@@ -553,6 +553,7 @@ function discardChanges() {
 async function savePreferences() {
   const autoDetect       = getToggle('autoDetect');
   const showNotifications = getToggle('showNotifications');
+  const useBrowserSide   = getToggle('useBrowserSide');
   const uiLanguage       = ($('uiLanguage').value || '').trim();
   // Hidden-mode (the AV-task quick-input flow). The toggle gates visibility
   // of the side-panel input box; the URL template is the per-site pattern
@@ -561,7 +562,7 @@ async function savePreferences() {
   const hiddenMode               = getToggle('hiddenMode');
   const hiddenModeUrlTemplate    = ($('hiddenModeUrlTemplate').value || '').trim();
   await chrome.storage.sync.set({
-    autoDetect, showNotifications, uiLanguage,
+    autoDetect, showNotifications, useBrowserSide, uiLanguage,
     hiddenMode, hiddenModeUrlTemplate,
   });
 }
@@ -760,7 +761,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Load settings
   const settings = await chrome.storage.sync.get([
     'nasEndpoint', 'apiKey', 'nasOutputSubdir',
-    'autoDetect', 'showNotifications',
+    'autoDetect', 'showNotifications', 'useBrowserSide',
     'uiLanguage', 'uiTheme',
     'nasProfiles', 'activeProfileId',
     'hiddenMode', 'hiddenModeUrlTemplate',
@@ -782,6 +783,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('apiKey').value      = settings.apiKey      || '';
   setToggle('autoDetect',       settings.autoDetect       !== false);
   setToggle('showNotifications', settings.showNotifications !== false);
+  // v2.5 useBrowserSide: default ON. Stored value wins when present.
+  setToggle('useBrowserSide',   settings.useBrowserSide   !== false);
   // hiddenMode default OFF (opt-in feature; only useful for the specific
   // AV-task workflow). url_template default is the missav pattern the user
   // referenced; saved value wins when present.
@@ -835,6 +838,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   $('showNotifications').addEventListener('click', async () => {
     setToggle('showNotifications', !getToggle('showNotifications'));
+    await savePreferences();
+  });
+  $('useBrowserSide').addEventListener('click', async () => {
+    setToggle('useBrowserSide', !getToggle('useBrowserSide'));
     await savePreferences();
   });
   $('hiddenMode').addEventListener('click', async () => {

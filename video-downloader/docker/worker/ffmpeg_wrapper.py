@@ -7,6 +7,7 @@ import logging
 import subprocess
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Callable, List, Optional
 import shutil
@@ -50,6 +51,7 @@ class FFmpegMerger:
         # responds to user cancellation within ~1s instead of blocking
         # for the full 900s merge timeout.
         self.cancel_check = cancel_check
+        self.cancelled = False
         self.ffmpeg_path: Optional[str] = None
 
         # Verify FFmpeg is available
@@ -179,6 +181,7 @@ class FFmpegMerger:
                     if self.cancel_check is not None and self.cancel_check():
                         logger.info("FFmpeg merge cancelled while streaming segments")
                         cancelled = True
+                        self.cancelled = True
                         break
                     with open(seg, 'rb') as f:
                         shutil.copyfileobj(f, process.stdin, length=1024 * 1024)
@@ -214,6 +217,7 @@ class FFmpegMerger:
                     elapsed += poll_interval
                     if self.cancel_check is not None and self.cancel_check():
                         logger.info("FFmpeg merge cancelled while waiting for ffmpeg exit")
+                        self.cancelled = True
                         try:
                             process.kill()
                             process.wait(timeout=5)
@@ -267,6 +271,11 @@ class FFmpegMerger:
         if not self.segment_files:
             return False
 
+        if self.cancel_check is not None and self.cancel_check():
+            logger.info("Re-encode skipped because merge was cancelled")
+            self.cancelled = True
+            return False
+
         # The concat demuxer treats each input as an independent decodable
         # stream. fMP4 .m4s segments aren't decodable alone (they need the
         # init segment's moov/ftyp), so the concat demuxer would error per
@@ -309,20 +318,62 @@ class FFmpegMerger:
             ]
             
             logger.debug(f"FFmpeg re-encode command: {' '.join(command)}")
-            
-            process = subprocess.run(
+
+            process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                timeout=1800  # 30 minutes for re-encoding
             )
-            
+
+            started_at = time.monotonic()
+            poll_interval = 1.0
+            poll_timeout = 1800.0
+            stdout_chunks: List[bytes] = []
+            stderr_chunks: List[bytes] = []
+
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=poll_interval)
+                    if stdout:
+                        stdout_chunks.append(stdout)
+                    if stderr:
+                        stderr_chunks.append(stderr)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.cancel_check is not None and self.cancel_check():
+                        logger.info("FFmpeg re-encode cancelled while waiting for ffmpeg exit")
+                        self.cancelled = True
+                        try:
+                            process.kill()
+                            stdout, stderr = process.communicate(timeout=5)
+                            if stdout:
+                                stdout_chunks.append(stdout)
+                            if stderr:
+                                stderr_chunks.append(stderr)
+                        except Exception:
+                            pass
+                        self._remove_partial_output()
+                        return False
+                    if time.monotonic() - started_at >= poll_timeout:
+                        try:
+                            process.kill()
+                            stdout, stderr = process.communicate(timeout=5)
+                            if stdout:
+                                stdout_chunks.append(stdout)
+                            if stderr:
+                                stderr_chunks.append(stderr)
+                        except Exception:
+                            pass
+                        logger.error("FFmpeg re-encode timed out after 30 minutes")
+                        return False
+
+            stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+
             if process.returncode == 0:
                 logger.info("Re-encode successful")
                 return True
             else:
-                logger.error(f"Re-encode failed: {process.stderr}")
+                logger.error(f"Re-encode failed: {stderr_text}")
                 return False
         
         except Exception as e:
@@ -378,6 +429,9 @@ def merge_segments(
         
         # If failed and re-encode is enabled, try re-encoding
         if not success and try_re_encode:
+            if merger.cancelled or (cancel_check is not None and cancel_check()):
+                logger.info("Copy mode stopped after cancellation; skipping re-encode")
+                return False
             logger.info("Copy mode failed, attempting re-encode")
             success = merger.merge_with_re_encode()
         
@@ -391,4 +445,3 @@ def merge_segments(
                 logger.debug(f"Cleaned up concat file: {concat_file}")
             except Exception as e:
                 logger.warning(f"Failed to cleanup concat file: {e}")
-

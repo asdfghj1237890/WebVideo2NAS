@@ -44,6 +44,73 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # Redis setup
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
+# Codex adversarial-review: a long-running browser-mode finalize (50 GB
+# staged, slow NAS mux) can legitimately exceed the zombie reaper's 2h
+# threshold. Without a liveness signal, a peer worker booting during the
+# mux would flip the live row to 'failed' and rmtree its staging dir
+# under the active process. The heartbeat below — set on CAS claim,
+# refreshed every WORKER_HEARTBEAT_INTERVAL seconds, deleted on exit —
+# lets the zombie reaper distinguish "wedged worker that died mid-mux"
+# from "worker still grinding through a slow mux".
+WORKER_HEARTBEAT_KEY_PREFIX = "worker_alive:"
+WORKER_HEARTBEAT_TTL_SECONDS = int(os.getenv("WORKER_HEARTBEAT_TTL", "600"))
+WORKER_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("WORKER_HEARTBEAT_INTERVAL", "120"))
+
+
+class _WorkerHeartbeat:
+    """Context manager that publishes a Redis liveness key for `job_id`.
+
+    Sets the key immediately on enter, then a daemon thread refreshes
+    it on a fixed interval until exit. On exit, the key is deleted so
+    the next reaper pass doesn't grant grace to a worker that has
+    actually finished. Failures to talk to Redis are logged and
+    swallowed — a flaky Redis must not break the worker, only weaken
+    the zombie-reaper protection.
+    """
+
+    def __init__(self, redis, job_id: str,
+                 ttl: int = WORKER_HEARTBEAT_TTL_SECONDS,
+                 interval: int = WORKER_HEARTBEAT_INTERVAL_SECONDS):
+        self._redis = redis
+        self._job_id = job_id
+        self._key = f"{WORKER_HEARTBEAT_KEY_PREFIX}{job_id}"
+        self._ttl = ttl
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _set(self) -> None:
+        try:
+            self._redis.set(self._key, "1", ex=self._ttl)
+        except Exception as e:
+            logger.warning(
+                f"Heartbeat publish failed for {self._job_id}: {e}"
+            )
+
+    def __enter__(self) -> "_WorkerHeartbeat":
+        self._set()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name=f"hb-{self._job_id[:8]}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._set()
+
+    def __exit__(self, *_) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        try:
+            self._redis.delete(self._key)
+        except Exception:
+            pass
+
+
 # Graceful shutdown handler
 shutdown_flag = False
 
@@ -128,6 +195,68 @@ def resolve_output_dir(subdir):
     except ValueError:
         raise Exception("Resolved output path escapes base directory")
     return candidate
+
+
+def _reserve_output_path(
+    output_dir: Path, stem: str, ext: str = ".mp4", max_collisions: int = 999
+) -> Path:
+    """Atomically reserve an output filename via O_CREAT | O_EXCL.
+
+    Codex review #8: the previous `exists()`-then-write loop was a
+    classic TOCTOU race. With multi-worker deployments running browser-
+    finalize concurrently, two workers processing different jobs whose
+    `_make_safe_filename_stem` collapses to the same stem could BOTH
+    observe `Title.mp4` as absent, both reserve `Title.mp4`, both mux,
+    and the later finisher's `Path.replace` would silently overwrite
+    the earlier finisher's completed file — both jobs end up flagged
+    'completed' but only one MP4 survives.
+
+    O_CREAT | O_EXCL is atomic at the filesystem layer: exactly one of
+    a set of racing workers wins for any given pathname. Losers see
+    FileExistsError, bump the counter, and try `Title (1).mp4`,
+    `Title (2).mp4`, ... until they reserve a unique name.
+
+    Returns the reserved Path. The file is empty (placeholder) on
+    return; the caller's mux step replaces it via os.replace from the
+    .partial path. If the worker crashes between reservation and the
+    final replace, an empty file is left at the reserved name —
+    subsequent jobs naturally bump past it; the orphan is harmless.
+
+    Raises:
+        RuntimeError if no slot is free within max_collisions attempts
+        (defends against an attacker / buggy code that filled the
+        whole `Title (N).mp4` namespace).
+    """
+    for counter in range(max_collisions + 1):
+        if counter == 0:
+            candidate = output_dir / f"{stem}{ext}"
+        else:
+            candidate = output_dir / f"{stem} ({counter}){ext}"
+        try:
+            fd = os.open(
+                str(candidate),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o644,
+            )
+            os.close(fd)
+            return candidate
+        except FileExistsError:
+            continue
+        except IsADirectoryError:
+            # Path is a directory (POSIX): treat as taken, bump counter.
+            continue
+        except PermissionError:
+            # Windows raises PermissionError when the path is a directory;
+            # also legitimately raised when output_dir is unwritable. In
+            # the directory case we want to bump the counter; in the
+            # unwritable-dir case we'll exhaust the loop and surface a
+            # RuntimeError below. Either way the user sees an actionable
+            # error rather than a silent overwrite.
+            continue
+    raise RuntimeError(
+        f"Could not reserve output filename {stem!r}{ext} after "
+        f"{max_collisions} collision attempts in {output_dir}"
+    )
 
 
 def _make_safe_filename_stem(title, fallback: str, max_bytes: int = 240) -> str:
@@ -382,10 +511,16 @@ class DownloadWorker:
             except Exception:
                 pass
     
-    def update_job_status(self, job_id: str, status: str, progress: int = None, 
-                         error_message: str = None, file_path: str = None, 
+    def update_job_status(self, job_id: str, status: str, progress: int = None,
+                         error_message: str = None, file_path: str = None,
                          file_size: int = None):
-        """Update job status in database (won't overwrite 'cancelled' status)"""
+        """Update job status in database (won't overwrite 'cancelled' status).
+
+        Returns:
+          True  - row was updated
+          False - CAS predicate missed (usually because the job is cancelled)
+          None  - DB update failed before we could know the row state
+        """
         try:
             updates = {"status": status}
             
@@ -418,11 +553,14 @@ class DownloadWorker:
             
             if result.rowcount > 0:
                 logger.info(f"Job {job_id} status updated to {status}")
+                return True
             # If rowcount is 0, job might be cancelled - don't log to reduce noise
+            return False
         
         except Exception as e:
             logger.error(f"Failed to update job status: {e}")
             self.db.rollback()
+            return None
     
     def get_job_details(self, job_id: str):
         """Get job details from database"""
@@ -1504,6 +1642,7 @@ class DownloadWorker:
         session,
         temp_dir: str,
         filename: str = "init.mp4",
+        byte_range: Optional[dict] = None,
     ) -> Optional[str]:
         """Download the HLS-fMP4 init segment (referenced by #EXT-X-MAP).
 
@@ -1532,14 +1671,41 @@ class DownloadWorker:
         last_err: Optional[str] = None
         for attempt in range(max_attempts):
             try:
+                request_headers = dict(headers or {})
+                for name in list(request_headers.keys()):
+                    if isinstance(name, str) and name.lower() == "range":
+                        request_headers.pop(name, None)
+                if byte_range:
+                    try:
+                        offset = int(byte_range["offset"])
+                        length = int(byte_range["length"])
+                    except (KeyError, TypeError, ValueError) as e:
+                        raise ValueError(f"Invalid init byte_range metadata: {byte_range!r}") from e
+                    if offset < 0 or length <= 0:
+                        raise ValueError(f"Invalid init byte_range metadata: {byte_range!r}")
+                    request_headers["Range"] = f"bytes={offset}-{offset + length - 1}"
                 response = session.get(
                     url,
-                    headers=headers,
+                    headers=request_headers,
                     timeout=30,
-                    stream=False,
+                    stream=bool(byte_range),
                 )
+                if byte_range and response.status_code != 206:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    raise ValueError(
+                        f"Init segment byte-range request not honored "
+                        f"(HTTP {response.status_code})"
+                    )
                 response.raise_for_status()
                 content = response.content
+                if byte_range and len(content) != int(byte_range["length"]):
+                    raise ValueError(
+                        f"Init segment byte-range length mismatch: "
+                        f"got {len(content)}, expected {byte_range['length']}"
+                    )
                 if not content or len(content) < 16:
                     raise ValueError(f"Init segment too small: {len(content)} bytes")
                 # Sanity: an init segment must start with 'ftyp' box at offset 4
@@ -1738,7 +1904,8 @@ class DownloadWorker:
             if init_segment_url:
                 logger.info(f"Step 2a: Fetching fMP4 init segment from {init_segment_url.split('?', 1)[0]}")
                 init_segment_path = self._download_init_segment(
-                    init_segment_url, segment_headers, shared_session, temp_dir
+                    init_segment_url, segment_headers, shared_session, temp_dir,
+                    byte_range=playlist_info.get('init_segment_byte_range'),
                 )
                 if init_segment_path is None:
                     raise Exception("Failed to download fMP4 init segment — cannot merge fragmented MP4 stream")
@@ -2044,28 +2211,280 @@ class DownloadWorker:
                     error_message=error_str
                 )
     
+    def process_browser_finalize(self, job_id: str):
+        """v2.5 browser-side finalize: API has staged decrypted segments
+        under STAGING_DIR/{job_id}/. Concat + ffmpeg-mux them into the
+        final MP4 under /downloads/<output_subdir>/.
+
+        Codex review #2: starts with a CAS claim so a duplicate enqueue
+        (e.g. two finalize POSTs racing, or a redis-push-then-DB-commit
+        failure followed by a retry) doesn't cause the job to be
+        processed twice. Whichever worker wins the UPDATE proceeds; the
+        other sees rowcount=0 and skips.
+        """
+        from browser_finalize import finalize, BrowserFinalizeError
+
+        logger.info(f"Browser finalize starting: {job_id}")
+
+        # Atomic claim. Codex review #6 tightened the allowed-from set:
+        # claiming directly from 'browser_uploading' (or browser_pending)
+        # would let the worker race against in-flight uploads — uploads
+        # that started BEFORE the API's finalize claim could still
+        # os.replace segment files after we've started reading them.
+        # Now we only claim from:
+        #   * 'pending' — finalize fully succeeded server-side
+        #   * 'browser_finalizing' — finalize past the upload-locking CAS
+        #     but rpush-then-DB-commit failed; redis still has the entry
+        #     so worker is responsible for resyncing the status here
+        try:
+            claim = self.db.execute(text("""
+                UPDATE jobs SET status = 'processing', started_at = :now
+                WHERE id = :job_id
+                  AND status IN ('pending', 'browser_finalizing')
+            """), {"job_id": job_id, "now": datetime.utcnow()})
+            self.db.commit()
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"CAS claim failed for {job_id}: {e}")
+            return
+        if claim.rowcount == 0:
+            logger.info(
+                f"Browser finalize {job_id}: claim failed (already processed, "
+                f"cancelled, in-flight uploads still open, or claimed by "
+                f"another worker); skipping"
+            )
+            return
+
+        # Codex adversarial-review: long browser-mode mux can legitimately
+        # exceed the zombie reaper cutoff. The heartbeat advertises
+        # liveness in Redis so a peer worker booting during the mux can
+        # tell "still working" from "wedged"; the reaper excludes any
+        # job_id whose heartbeat key is present.
+        with _WorkerHeartbeat(redis_client, job_id):
+            self._do_browser_finalize(job_id)
+
+    def _do_browser_finalize(self, job_id: str) -> None:
+        from browser_finalize import (
+            finalize, BrowserFinalizeError, BrowserFinalizeCancelled,
+        )
+
+        job = self.get_job_details(job_id)
+        if not job:
+            logger.error(f"Browser job {job_id} not found")
+            return
+
+        meta_row = self.db.execute(text("""
+            SELECT mode, total_segments, staging_dir, output_subdir
+            FROM job_metadata WHERE job_id = :job_id
+        """), {"job_id": job_id}).first()
+        if not meta_row or meta_row.mode != "browser":
+            logger.error(f"Job {job_id} not in browser mode (mode={meta_row.mode if meta_row else None}); skipping")
+            self.update_job_status(job_id, "failed",
+                                   error_message="Internal: browser_finalize popped but job not in browser mode")
+            return
+
+        staging_dir = _resolve_browser_staging_dir(meta_row.staging_dir, job_id)
+        if staging_dir is None:
+            self.update_job_status(
+                job_id, "failed",
+                error_message=(
+                    f"Invalid staging_dir for browser job: "
+                    f"{meta_row.staging_dir!r}"
+                ),
+            )
+            return
+        if not staging_dir.is_dir():
+            self.update_job_status(job_id, "failed",
+                                   error_message=f"Staging dir missing: {staging_dir}")
+            return
+
+        try:
+            output_dir = resolve_output_dir(meta_row.output_subdir)
+        except Exception as e:
+            self.update_job_status(job_id, "failed",
+                                   error_message=f"Invalid output_subdir: {e}")
+            return
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Atomically reserve a unique output filename (Codex review #8).
+        # `_reserve_output_path` uses O_CREAT|O_EXCL so concurrent workers
+        # processing jobs whose sanitized stem collides (same Title) end
+        # up with distinct files — without this, the later mux's
+        # Path.replace would silently overwrite the earlier worker's
+        # completed MP4.
+        stem = _make_safe_filename_stem(job.get("title"), fallback=f"video_{job_id[:8]}")
+        try:
+            candidate = _reserve_output_path(output_dir, stem)
+        except RuntimeError as e:
+            self.update_job_status(job_id, "failed", error_message=str(e))
+            return
+
+        # Status was already set to 'processing' by the CAS claim above;
+        # just bump the progress indicator for sidepanel polling.
+        self.update_job_status(job_id, "processing", progress=50)
+
+        try:
+            result = finalize(
+                staging_dir, candidate,
+                cancel_check=lambda: self.is_job_cancelled(job_id),
+            )
+        except BrowserFinalizeCancelled:
+            # Codex review (P2): user cancelled mid-finalize. The DB row
+            # is already 'cancelled' (the cancel endpoint did the CAS);
+            # don't clobber it with 'failed'. Just clean the placeholder
+            # + staged tree so disk doesn't leak. The user-visible MP4
+            # was never published (finalize() unlinked the partial path
+            # on its way out, and the atomic Path.replace runs only
+            # AFTER the final cancel gate).
+            logger.info(f"Browser finalize cancelled by user for {job_id}")
+            try:
+                candidate.unlink(missing_ok=True)
+            except Exception:
+                pass
+            _safe_cleanup_browser_staging(staging_dir, job_id)
+            return
+        except BrowserFinalizeError as e:
+            logger.error(f"Browser finalize failed for {job_id}: {e}")
+            # Clean up the reserved placeholder so the name is freed for
+            # subsequent jobs. The placeholder is empty (zero bytes) at
+            # this point — finalize() only replaces it via os.replace
+            # AFTER a successful mux + non-empty check, so an exception
+            # path means the file is still our placeholder, not user data.
+            try:
+                candidate.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.update_job_status(job_id, "failed", error_message=str(e))
+            # Codex adversarial-review: also release the staged segment
+            # tree. The job is now terminally 'failed', which excludes
+            # it from the stale-browser reaper's predicate; without
+            # this cleanup, a corrupt/unsupported stream or ffmpeg
+            # failure leaves up to MAX_JOB_STAGING_BYTES of decrypted
+            # segments under STAGING_DIR forever. Repeated bad jobs
+            # would exhaust NAS disk while the UI shows them as
+            # finished failures.
+            _safe_cleanup_browser_staging(staging_dir, job_id)
+            return
+        except Exception as e:
+            logger.error(f"Unexpected finalize error for {job_id}: {e}")
+            try:
+                candidate.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.update_job_status(job_id, "failed",
+                                   error_message=f"Unexpected error: {e}")
+            _safe_cleanup_browser_staging(staging_dir, job_id)
+            return
+
+        def _discard_published_output(reason: str) -> None:
+            logger.info(
+                f"Browser finalize completed but job {job_id} {reason}; "
+                "discarding output"
+            )
+            try:
+                Path(result["output_path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+            _safe_cleanup_browser_staging(staging_dir, job_id)
+
+        # finalize() has already gated the publish. This first post-publish
+        # check catches cancellation that landed before duration probing.
+        if self.is_job_cancelled(job_id):
+            _discard_published_output("was cancelled")
+            return
+
+        # Probe actual duration for the existing suspect-detection pass.
+        actual_duration = self._probe_duration_seconds(result["output_path"])
+        completed = self.update_job_status(
+            job_id, "completed",
+            progress=100,
+            file_path=result["output_path"],
+            file_size=result["file_size"],
+        )
+        if completed is False:
+            # DELETE can still win while duration probing is in progress.
+            # update_job_status preserves cancelled rows; if its CAS loses,
+            # re-read status before deleting the already-published MP4.
+            if self.is_job_cancelled(job_id):
+                _discard_published_output("lost the completed-status race")
+            else:
+                logger.warning(
+                    f"Browser finalize completed for {job_id}, but completed "
+                    "status update affected 0 rows while the job is not "
+                    "cancelled; preserving output and staging for inspection"
+                )
+            return
+        if completed is None:
+            logger.error(
+                f"Browser finalize completed for {job_id}, but completed "
+                "status update failed; preserving output and staging for retry"
+            )
+            return
+
+        try:
+            self.db.execute(text("""
+                UPDATE job_metadata SET actual_duration = :ad
+                WHERE job_id = :job_id
+            """), {"ad": actual_duration, "job_id": job_id})
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+
+        # Best-effort staging wipe; never fails the job over this. Use the
+        # containment-guarded helper even on success because staging_dir comes
+        # from DB metadata, not a freshly-computed trusted path.
+        _safe_cleanup_browser_staging(staging_dir, job_id)
+        logger.info(f"Browser finalize completed: {job_id} -> {result['output_path']}")
+
     def run(self):
-        """Main worker loop"""
+        """Main worker loop.
+
+        v2.5 watches two queues: `download_queue` (legacy nas-direct) and
+        `browser_finalize_queue` (browser-side jobs whose segments are
+        already staged). blpop returns from whichever queue produces
+        first; queue name in the result tells us which dispatch to use.
+
+        Codex adversarial-review: BLPOP returns from the FIRST non-empty
+        key in its argument list, so a sustained backlog on whichever
+        queue is listed first would starve the other indefinitely.
+        Browser-finalize jobs hold staging disk (up to 50 GB per job)
+        while waiting, so we MUST give them bounded latency. Solution:
+        rotate the queue order after every iteration. Workers
+        alternately give priority to each queue, giving ~50/50
+        fairness with no starvation guarantee for either side.
+        """
         logger.info("Worker started and waiting for jobs...")
-        
+
+        # Browser-finalize first on the very first iteration so a
+        # backlog accumulated before the worker booted gets drained
+        # without waiting for a download to land.
+        queue_priority = ["browser_finalize_queue", "download_queue"]
+
         while not shutdown_flag:
             try:
-                # Blocking pop from Redis queue (timeout: 5 seconds)
-                result = redis_client.blpop("download_queue", timeout=5)
-                
+                result = redis_client.blpop(queue_priority, timeout=5)
                 if result:
-                    _, job_id = result
-                    logger.info(f"Received job: {job_id}")
-                    self.process_job(job_id)
-                
+                    queue_name, job_id = result
+                    logger.info(f"Received job from {queue_name}: {job_id}")
+                    if queue_name == "browser_finalize_queue":
+                        self.process_browser_finalize(job_id)
+                    else:
+                        self.process_job(job_id)
+
+                # Rotate priority unconditionally — even on timeout,
+                # so the next iteration starts with the other queue
+                # at the head and a steady-state burst on one queue
+                # can't pin priority to itself.
+                queue_priority = [queue_priority[1], queue_priority[0]]
+
             except redis.exceptions.ConnectionError as e:
                 logger.error(f"Redis connection error: {e}")
                 time.sleep(5)  # Wait before retrying
-            
+
             except Exception as e:
                 logger.error(f"Unexpected error in worker loop: {e}")
                 time.sleep(1)
-        
+
         logger.info("Worker shutting down...")
         self.db.close()
 
@@ -2084,8 +2503,80 @@ def _ensure_schema() -> None:
             conn.execute(text(
                 "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS suspect_reason TEXT"
             ))
+            # Codex review #16: keep schema parity with api/main.py
+            # _ensure_schema. Worker reads finalize_started_at in the
+            # stale-browser reaper.
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS finalize_started_at TIMESTAMP"
+            ))
     except Exception as e:
         logger.warning(f"Schema migration skipped: {e}")
+
+
+def _resolve_browser_staging_dir(staging_dir, job_id: str) -> Optional[Path]:
+    """Return the DB staging_dir only when it is exactly STAGING_DIR/{job_id}.
+
+    A path can be under STAGING_DIR and still belong to another job (or be the
+    staging root itself). Browser finalize reads from this path and every
+    cleanup branch may delete it, so bind it to the job id before use.
+    """
+    staging_root_env = os.getenv("STAGING_DIR", "/downloads/.staging")
+    try:
+        root = Path(staging_root_env).resolve()
+        expected = (root / str(job_id)).resolve()
+        expected.relative_to(root)
+        actual = Path(staging_dir or "").resolve()
+    except ValueError:
+        logger.warning(
+            f"Browser finalize {job_id}: expected staging path escapes "
+            f"STAGING_DIR={staging_root_env!r}; refusing path use"
+        )
+        return None
+    except Exception as e:
+        logger.warning(
+            f"Browser finalize {job_id}: staging_dir resolve failed: {e}"
+        )
+        return None
+    if actual != expected:
+        logger.warning(
+            f"Browser finalize {job_id}: staging_dir {str(staging_dir)!r} "
+            f"resolves to {actual}, expected {expected}; refusing path use"
+        )
+        return None
+    return actual
+
+
+def _safe_cleanup_browser_staging(staging_dir, job_id: str) -> None:
+    """Job-bound staging rmtree for browser-finalize cleanup.
+
+    Mirrors the reapers' guard pattern — only removes paths under the
+    configured STAGING_DIR/{job_id}, refuses otherwise so a poisoned
+    job_metadata.staging_dir can't trick the worker into wiping arbitrary
+    directories or another browser job's staging tree. All errors are logged
+    and swallowed so a cleanup failure doesn't mask the underlying job-failure
+    result we just committed.
+
+    Why this exists separately from `cleanup_staging`
+    (browser_finalize.py): cleanup_staging is a thin rmtree wrapper
+    that pre-dates the multi-source-of-truth concern around
+    `job_metadata.staging_dir`. The reapers always go through a
+    path-containment check before rmtree; this helper brings the same
+    defense to every process_browser_finalize cleanup branch, including
+    success.
+    """
+    sd = _resolve_browser_staging_dir(staging_dir, job_id)
+    if sd is None:
+        return
+    try:
+        if sd.is_dir():
+            shutil.rmtree(sd)
+            logger.info(
+                f"Browser finalize {job_id}: cleaned staging {sd}"
+            )
+    except Exception as e:
+        logger.warning(
+            f"Browser finalize {job_id}: rmtree {str(staging_dir)!r} failed: {e}"
+        )
 
 
 def _reap_zombie_jobs() -> None:
@@ -2094,21 +2585,280 @@ def _reap_zombie_jobs() -> None:
     abandoned by a worker that crashed mid-download. The 2h floor keeps slow
     legitimate HLS jobs from getting clobbered when another worker restarts.
     Idempotent across concurrent worker boots — PG row locks serialise; the
-    second writer just sees no matching rows."""
+    second writer just sees no matching rows.
+
+    Codex review #14: for `mode='browser'` zombies, ALSO rmtree the staging
+    dir. Without this, a worker crash between CAS claim (status flips to
+    'processing') and `cleanup_staging` at successful finalize would leave
+    up to MAX_JOB_STAGING_BYTES of staged segments under STAGING_DIR forever
+    — `_reap_stale_browser_jobs` excludes 'processing' (it's a worker-owned
+    state). This pass is the only safety net for the worker-died-mid-mux
+    failure mode. Defense-in-depth STAGING_DIR containment guard mirrors
+    the stale-reaper.
+    """
+    from datetime import timedelta
+
+    cutoff = datetime.utcnow() - timedelta(hours=2)
+
+    # Codex adversarial-review: scan Redis for live worker heartbeats.
+    # A long-running browser-mode finalize (slow NAS mux on a 50 GB
+    # job) can legitimately exceed the cutoff; without this exclusion,
+    # a peer worker booting during the mux would flip the live row to
+    # 'failed' and rmtree the staging dir under the active process.
+    #
+    # Codex review (P1): if Redis is unreachable we CANNOT confirm
+    # liveness, so we DEFER browser-mode rows to a later boot
+    # (heartbeat_scan_ok=False adds an SQL clause that excludes them).
+    # We still reap non-browser-mode rows (legacy yt-dlp jobs that
+    # don't run multi-hour mux operations) so a permanently-dead
+    # worker's stuck rows get cleaned up. main() also calls this
+    # reaper BEFORE the Redis readiness loop, so a startup race where
+    # Redis is briefly unreachable is the realistic case here — not
+    # a hypothetical.
+    alive_ids: set[str] = set()
+    heartbeat_scan_ok = True
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(
+                cursor=cursor, match=f"{WORKER_HEARTBEAT_KEY_PREFIX}*",
+                count=500,
+            )
+            for k in keys:
+                if k.startswith(WORKER_HEARTBEAT_KEY_PREFIX):
+                    alive_ids.add(k[len(WORKER_HEARTBEAT_KEY_PREFIX):])
+            if cursor in (0, "0"):
+                break
+    except Exception as e:
+        heartbeat_scan_ok = False
+        logger.warning(
+            f"Zombie reaper: heartbeat scan failed ({e}); deferring "
+            f"browser-mode rows until Redis is back, reaping "
+            f"non-browser rows only"
+        )
+
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
+            # Codex adversarial-review: conditional UPDATE+RETURNING
+            # closes the SELECT→UPDATE race where a job that completed
+            # between the two would get clobbered back to 'failed' (and
+            # have its browser staging rmtree'd via the stale snapshot).
+            # The predicate is re-evaluated atomically at UPDATE time;
+            # only rows that actually transitioned are returned for
+            # downstream cleanup. The `id NOT IN :alive_ids` clause
+            # excludes any job whose worker is still publishing a
+            # heartbeat. Cutoff is a Python parameter so the SQL is
+            # portable (matches _reap_stale_browser_jobs).
+            params: dict = {"cutoff": cutoff}
+            alive_clause = ""
+            extra_bindparams = []
+            if alive_ids:
+                alive_clause = "AND id NOT IN :alive_ids"
+                params["alive_ids"] = list(alive_ids)
+                extra_bindparams.append(
+                    __import__("sqlalchemy").bindparam("alive_ids", expanding=True)
+                )
+            # Codex review (P1): when the heartbeat scan failed (Redis
+            # unreachable at this boot), we cannot tell which workers
+            # are alive. Browser-mode rows are particularly dangerous
+            # to flip-and-rmtree without that signal — a >2h slow-NAS
+            # mux is the legitimate case the heartbeat protects. So
+            # exclude browser-mode rows from this run; the next boot
+            # (Redis presumably back) will reap any genuinely-dead
+            # ones via the scan. Non-browser rows have no equivalent
+            # multi-hour case and are still cleaned.
+            defer_browser_clause = ""
+            if not heartbeat_scan_ok:
+                defer_browser_clause = (
+                    "AND id NOT IN ("
+                    "SELECT job_id FROM job_metadata "
+                    "WHERE mode = 'browser'"
+                    ")"
+                )
+            stmt = text(f"""
                 UPDATE jobs
                 SET status = 'failed',
                     error_message = 'Worker restarted while job was in progress (zombie reaped after 2h)'
                 WHERE status IN ('downloading', 'processing')
                   AND started_at IS NOT NULL
-                  AND started_at < NOW() - INTERVAL '2 hours'
-            """))
-            if result.rowcount > 0:
-                logger.warning(f"Reaped {result.rowcount} zombie in-flight job(s) (>2h with no completion)")
+                  AND started_at < :cutoff
+                  {alive_clause}
+                  {defer_browser_clause}
+                RETURNING id
+            """)
+            if extra_bindparams:
+                stmt = stmt.bindparams(*extra_bindparams)
+            updated = conn.execute(stmt, params).fetchall()
+
+            if not updated:
+                return
+
+            reaped_ids = [r.id for r in updated]
+            # Look up metadata for the rows that ACTUALLY transitioned —
+            # not the stale pre-update set. Same transaction, so the
+            # rows are stable.
+            zombies = conn.execute(text("""
+                SELECT j.id AS id, jm.mode AS mode, jm.staging_dir AS staging_dir
+                FROM jobs j
+                LEFT JOIN job_metadata jm ON j.id = jm.job_id
+                WHERE j.id IN :ids
+            """).bindparams(
+                __import__("sqlalchemy").bindparam("ids", expanding=True)
+            ), {"ids": reaped_ids}).fetchall()
+            logger.warning(f"Reaped {len(reaped_ids)} zombie in-flight job(s) (>2h with no completion)")
+
+        # rmtree browser staging dirs OUTSIDE the transaction so an
+        # OS-level failure doesn't roll back the DB flip.
+        browser_zombies = [row for row in zombies if row.mode == "browser"]
+        for row in browser_zombies:
+            _safe_cleanup_browser_staging(row.staging_dir or "", row.id)
     except Exception as e:
         logger.warning(f"Zombie reaper skipped: {e}")
+
+
+def _reap_stale_browser_jobs() -> None:
+    """Codex review #3 v3: clean up browser-mode jobs that never reached
+    finalize. Covers the cases the extension's abort path can't:
+      - tab closed mid-upload (extension never got the catch block to run)
+      - browser crash
+      - extension uninstalled / disabled mid-job
+      - chrome offscreen evicted before completion message reached SW
+
+    Targets jobs where:
+      - mode='browser' AND status IN ('browser_pending', 'browser_uploading',
+        'browser_finalizing')
+      - created >6h ago
+
+    Codex review #7: 'browser_finalizing' rows that are STILL QUEUED in
+    redis must NOT be reaped. The CAS allowed-set in
+    process_browser_finalize includes 'browser_finalizing' specifically
+    to recover the rpush-succeeded-but-DB-commit-failed window: redis
+    has the work, the worker just hasn't drained it yet. If the worker
+    was down for >6h after finalize enqueued, blindly reaping the row
+    would flip status to 'failed' and rmtree the staging dir; the
+    eventual queue pop's CAS would then skip (status='failed') and the
+    user would lose a fully-staged download. We read the redis queue
+    BEFORE the SQL update and exclude any browser_finalizing job whose
+    id is in the queue.
+
+    For each remaining match: flip status to 'failed' + remove staging
+    dir. The 6h floor is generous — the largest legitimate browser-side
+    job we expect is a 4-hour movie at 4K, all segments done in well
+    under that.
+
+    Failure-tolerant: SQL errors and rmtree errors both just log; the
+    next worker boot retries. Sqlite test path uses a Python-side date
+    comparison instead of Postgres INTERVAL syntax to keep this
+    portable.
+    """
+    from datetime import timedelta
+
+    cutoff = datetime.utcnow() - timedelta(hours=6)
+
+    # Codex review #7: snapshot the redis queue BEFORE touching the DB.
+    # Any browser_finalizing job_id present here is "still has work to
+    # do" — leave it for the run loop to pick up. If redis is
+    # unreachable, defer the reaper entirely (next boot retries) rather
+    # than risk destroying queued staging.
+    queued_finalize_ids: set[str] = set()
+    try:
+        for raw in redis_client.lrange("browser_finalize_queue", 0, -1):
+            # decode_responses=True on the client; raw is already a str.
+            queued_finalize_ids.add(raw)
+    except Exception as e:
+        logger.warning(
+            f"Stale browser-job reaper deferred — cannot read "
+            f"browser_finalize_queue ({e}); next boot retries"
+        )
+        return
+
+    try:
+        with engine.begin() as conn:
+            # Codex adversarial-review: conditional UPDATE+RETURNING
+            # with the full stale-predicate (mode + status + age + queue
+            # exclusion) evaluated AT UPDATE TIME, in a single statement.
+            # This closes the SELECT→UPDATE race where a /finalize CAS
+            # that bumped finalize_started_at (uploading→finalizing)
+            # between the two would still get clobbered back to 'failed'
+            # by an UPDATE WHERE id IN :ids.
+            #
+            # Codex review #16: for browser_finalizing rows, use
+            # finalize_started_at via COALESCE instead of created_at.
+            # A slow-upload job (created hours ago) that just CAS'd to
+            # finalizing has a fresh fsa, so this branch's age check
+            # (`fsa < :cutoff`) is false and the row is NOT reaped.
+            # Codex review #7: still-queued browser_finalizing rows are
+            # protected via the redis snapshot; the worker may yet drain
+            # the queue. The exclusion lives in SQL now (NOT IN
+            # :queued_ids) so it's part of the same atomic predicate.
+            params: dict = {
+                "now": datetime.utcnow(),
+                "cutoff": cutoff,
+            }
+            queued_clause = ""
+            extra_bindparams = []
+            if queued_finalize_ids:
+                queued_clause = "AND jobs.id NOT IN :queued_ids"
+                params["queued_ids"] = list(queued_finalize_ids)
+                extra_bindparams.append(
+                    __import__("sqlalchemy").bindparam("queued_ids", expanding=True)
+                )
+
+            # SQLite's UPDATE...FROM ... RETURNING only allows columns
+            # of the target table; staging_dir lives on jm. So we
+            # RETURNING jobs.id, then look up jm.staging_dir for the
+            # actually-transitioned ids in the same transaction.
+            sql = f"""
+                UPDATE jobs
+                SET status = 'failed',
+                    error_message = 'Stale browser job reaped at startup (>6h pre-finalize)',
+                    completed_at = :now
+                FROM job_metadata jm
+                WHERE jm.job_id = jobs.id
+                  AND jm.mode = 'browser'
+                  AND (
+                    (jobs.status IN ('browser_pending', 'browser_uploading')
+                     AND jobs.created_at < :cutoff)
+                    OR
+                    (jobs.status = 'browser_finalizing'
+                     AND COALESCE(jm.finalize_started_at, jobs.created_at) < :cutoff
+                     {queued_clause})
+                  )
+                RETURNING jobs.id AS id
+            """
+            stmt = text(sql)
+            if extra_bindparams:
+                stmt = stmt.bindparams(*extra_bindparams)
+
+            updated = conn.execute(stmt, params).fetchall()
+
+            if not updated:
+                return
+
+            reaped_ids = [r.id for r in updated]
+            stale_to_reap = conn.execute(text("""
+                SELECT j.id AS id, jm.staging_dir AS staging_dir
+                FROM jobs j JOIN job_metadata jm ON jm.job_id = j.id
+                WHERE j.id IN :ids
+            """).bindparams(
+                __import__("sqlalchemy").bindparam("ids", expanding=True)
+            ), {"ids": reaped_ids}).fetchall()
+
+            logger.warning(
+                f"Reaped {len(reaped_ids)} stale browser-mode job(s) "
+                f"(>6h pre-finalize)"
+            )
+
+        # Best-effort staging wipe for each REAPED row. Outside the
+        # transaction so an rmtree failure doesn't roll back the DB flip.
+        # stale_to_reap is exactly the set of rows the UPDATE actually
+        # transitioned; rows that no longer matched the predicate at
+        # UPDATE time (fresh CAS, status changed by worker, etc.) are
+        # not in the list and their staging is untouched.
+        for row in stale_to_reap:
+            _safe_cleanup_browser_staging(row.staging_dir or "", row.id)
+    except Exception as e:
+        logger.warning(f"Stale browser-job reaper skipped: {e}")
 
 
 def main():
@@ -2135,6 +2885,13 @@ def main():
             time.sleep(2)
 
     _ensure_schema()
+    # _reap_zombie_jobs only needs the DB. The heartbeat scan it runs
+    # against Redis fails-deferred for browser-mode rows (Codex P1):
+    # if Redis is unreachable here, browser-mode zombies are skipped
+    # this boot and will be reaped by a later run when Redis is up.
+    # Non-browser rows are still cleaned, so a permanently-dead
+    # legacy worker doesn't leak rows. Safe to call before Redis is
+    # ready.
     _reap_zombie_jobs()
 
     # Wait for Redis to be ready
@@ -2149,6 +2906,15 @@ def main():
                 sys.exit(1)
             logger.warning(f"Waiting for Redis... ({i+1}/{max_retries})")
             time.sleep(2)
+
+    # Codex review (P2): the stale-browser reaper DEFERS entirely when
+    # Redis is unavailable (it must read browser_finalize_queue to
+    # avoid destroying still-queued jobs). Run it AFTER the Redis
+    # readiness loop succeeds — otherwise compose-style boot ordering
+    # (worker starts before redis-server) skips the reaper for the
+    # whole worker lifetime, leaving stale browser_pending /
+    # browser_uploading staging dirs on disk until the next restart.
+    _reap_stale_browser_jobs()
 
     # Initialize cross-process per-host concurrency throttle (no-op when
     # HOST_CONCURRENCY_CAP is unset). Must run after redis is reachable.
@@ -2177,4 +2943,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

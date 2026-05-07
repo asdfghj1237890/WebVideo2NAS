@@ -58,6 +58,8 @@
       'sort.tooltip': 'Click to cycle sort',
       'empty.noVideos.title': '🔍 No videos detected yet',
       'empty.noVideos.hint': 'Browse to a video streaming site',
+      'empty.deepDetected.title': 'Stream content detected',
+      'empty.deepDetected.hint': 'Waiting for a downloadable manifest URL',
       'empty.noJobs.title': '📥 No recent downloads on NAS',
       'empty.noJobs.short': 'No recent downloads',
 
@@ -89,6 +91,9 @@
       'jobStatus.completed': 'Completed',
       'jobStatus.failed': 'Failed',
       'jobStatus.cancelled': 'Cancelled',
+      'jobStatus.browser_pending': 'Preparing upload',
+      'jobStatus.browser_uploading': 'Uploading',
+      'jobStatus.browser_finalizing': 'Finalizing',
 
       'error.unknown.type': 'Unknown Error',
       'error.unknown.message': 'No error details available',
@@ -242,6 +247,8 @@
       'sort.tooltip': '點擊切換排序',
       'empty.noVideos.title': '🔍 尚未偵測到影片',
       'empty.noVideos.hint': '請前往影片串流網站瀏覽',
+      'empty.deepDetected.title': '已偵測到串流內容',
+      'empty.deepDetected.hint': '正在等待可下載的播放清單 URL',
       'empty.noJobs.title': '📥 NAS 沒有近期下載',
       'empty.noJobs.short': '沒有近期下載',
 
@@ -273,6 +280,9 @@
       'jobStatus.completed': '已完成',
       'jobStatus.failed': '失敗',
       'jobStatus.cancelled': '已取消',
+      'jobStatus.browser_pending': '準備上傳',
+      'jobStatus.browser_uploading': '瀏覽器上傳中',
+      'jobStatus.browser_finalizing': '處理中',
 
       'error.unknown.type': '未知錯誤',
       'error.unknown.message': '沒有可用的錯誤細節',
@@ -411,6 +421,8 @@
       'section.recentDownloads': 'NAS 最近下载',
       'empty.noVideos.title': '🔍 尚未检测到视频',
       'empty.noVideos.hint': '请前往视频流媒体网站浏览',
+      'empty.deepDetected.title': '已检测到串流内容',
+      'empty.deepDetected.hint': '正在等待可下载的播放列表 URL',
       'empty.noJobs.title': '📥 NAS 没有最近下载',
       'empty.noJobs.short': '没有最近下载',
 
@@ -440,6 +452,9 @@
       'jobStatus.completed': '已完成',
       'jobStatus.failed': '失败',
       'jobStatus.cancelled': '已取消',
+      'jobStatus.browser_pending': '准备上传',
+      'jobStatus.browser_uploading': '浏览器上传中',
+      'jobStatus.browser_finalizing': '处理中',
 
       'error.unknown.type': '未知错误',
       'error.unknown.message': '没有可用的错误详情',
@@ -544,6 +559,8 @@
       'section.recentDownloads': 'NAS の最近のダウンロード',
       'empty.noVideos.title': '🔍 まだ動画が検出されていません',
       'empty.noVideos.hint': '動画配信サイトを開いてください',
+      'empty.deepDetected.title': 'ストリーム内容を検出しました',
+      'empty.deepDetected.hint': 'ダウンロード可能なマニフェスト URL を待っています',
       'empty.noJobs.title': '📥 NAS に最近のダウンロードはありません',
       'empty.noJobs.short': '最近のダウンロードはありません',
 
@@ -573,6 +590,9 @@
       'jobStatus.completed': '完了',
       'jobStatus.failed': '失敗',
       'jobStatus.cancelled': 'キャンセル済み',
+      'jobStatus.browser_pending': 'アップロード準備中',
+      'jobStatus.browser_uploading': 'ブラウザでアップロード中',
+      'jobStatus.browser_finalizing': '処理中',
 
       'error.unknown.type': '不明なエラー',
       'error.unknown.message': 'エラー詳細がありません',
@@ -660,6 +680,8 @@
       'section.recentDownloads': 'NAS 최근 다운로드',
       'empty.noVideos.title': '🔍 아직 감지된 동영상이 없습니다',
       'empty.noVideos.hint': '동영상 스트리밍 사이트로 이동해 보세요',
+      'empty.deepDetected.title': '스트리밍 콘텐츠가 감지되었습니다',
+      'empty.deepDetected.hint': '다운로드 가능한 매니페스트 URL을 기다리는 중입니다',
       'empty.noJobs.title': '📥 NAS에 최근 다운로드가 없습니다',
       'empty.noJobs.short': '최근 다운로드 없음',
 
@@ -689,6 +711,9 @@
       'jobStatus.completed': '완료',
       'jobStatus.failed': '실패',
       'jobStatus.cancelled': '취소됨',
+      'jobStatus.browser_pending': '업로드 준비 중',
+      'jobStatus.browser_uploading': '브라우저 업로드 중',
+      'jobStatus.browser_finalizing': '마무리 중',
 
       'error.unknown.type': '알 수 없는 오류',
       'error.unknown.message': '사용 가능한 오류 세부 정보가 없습니다',
@@ -776,6 +801,8 @@
       'section.recentDownloads': 'Téléchargements récents sur le NAS',
       'empty.noVideos.title': '🔍 Aucune vidéo détectée pour le moment',
       'empty.noVideos.hint': 'Ouvrez un site de streaming vidéo',
+      'empty.deepDetected.title': 'Contenu de streaming détecté',
+      'empty.deepDetected.hint': 'En attente d’une URL de manifeste téléchargeable',
       'empty.noJobs.title': '📥 Aucun téléchargement récent sur le NAS',
       'empty.noJobs.short': 'Aucun téléchargement récent',
 
@@ -805,6 +832,9 @@
       'jobStatus.completed': 'Terminé',
       'jobStatus.failed': 'Échec',
       'jobStatus.cancelled': 'Annulé',
+      'jobStatus.browser_pending': 'Préparation du téléversement',
+      'jobStatus.browser_uploading': 'Téléversement navigateur',
+      'jobStatus.browser_finalizing': 'Finalisation',
 
       'error.unknown.type': 'Erreur inconnue',
       'error.unknown.message': 'Aucun détail d’erreur disponible',
@@ -892,6 +922,8 @@
       'section.recentDownloads': 'Descargas recientes en el NAS',
       'empty.noVideos.title': '🔍 Aún no se detectaron videos',
       'empty.noVideos.hint': 'Navega a un sitio de streaming',
+      'empty.deepDetected.title': 'Contenido de streaming detectado',
+      'empty.deepDetected.hint': 'Esperando una URL de manifiesto descargable',
       'empty.noJobs.title': '📥 No hay descargas recientes en el NAS',
       'empty.noJobs.short': 'No hay descargas recientes',
 
@@ -921,6 +953,9 @@
       'jobStatus.completed': 'Completado',
       'jobStatus.failed': 'Fallido',
       'jobStatus.cancelled': 'Cancelado',
+      'jobStatus.browser_pending': 'Preparando subida',
+      'jobStatus.browser_uploading': 'Subiendo desde navegador',
+      'jobStatus.browser_finalizing': 'Finalizando',
 
       'error.unknown.type': 'Error desconocido',
       'error.unknown.message': 'No hay detalles de error disponibles',
@@ -1008,6 +1043,8 @@
       'section.recentDownloads': 'Downloads recentes no NAS',
       'empty.noVideos.title': '🔍 Nenhum vídeo detectado ainda',
       'empty.noVideos.hint': 'Acesse um site de streaming de vídeo',
+      'empty.deepDetected.title': 'Conteúdo de streaming detectado',
+      'empty.deepDetected.hint': 'Aguardando uma URL de manifesto baixável',
       'empty.noJobs.title': '📥 Nenhum download recente no NAS',
       'empty.noJobs.short': 'Nenhum download recente',
 
@@ -1037,6 +1074,9 @@
       'jobStatus.completed': 'Concluído',
       'jobStatus.failed': 'Falhou',
       'jobStatus.cancelled': 'Cancelado',
+      'jobStatus.browser_pending': 'Preparando upload',
+      'jobStatus.browser_uploading': 'Enviando do navegador',
+      'jobStatus.browser_finalizing': 'Finalizando',
 
       'error.unknown.type': 'Erro desconhecido',
       'error.unknown.message': 'Sem detalhes de erro disponíveis',
@@ -1158,4 +1198,3 @@
     getLanguage: () => currentLang
   };
 })();
-

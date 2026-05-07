@@ -5,6 +5,7 @@
 
 let settings = {};
 let detectedUrls = [];
+let deepHits = [];
 let jobs = [];
 let expandedErrorIds = new Set();
 let activeTabId = null;
@@ -391,6 +392,7 @@ function loadDetectedUrls() {
   const seq = ++loadDetectedUrlsSeq;
 
   detectedUrls = [];
+  deepHits = [];
   renderDetectedUrls({ keepPulse: false });
 
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -407,6 +409,7 @@ function loadDetectedUrls() {
       }
 
       detectedUrls = (response && response.urls) ? response.urls : [];
+      deepHits = (response && Array.isArray(response.deepHits)) ? response.deepHits : [];
       renderDetectedUrls({ keepPulse: true });
     });
   });
@@ -576,10 +579,11 @@ function renderDetectedUrls(opts) {
 
   // Empty state
   if (total === 0) {
+    const hasDeepHits = Array.isArray(deepHits) && deepHits.length > 0;
     listElement.innerHTML = `
       <div class="empty-state">
-        <p>${escapeHtml(t('empty.noVideos.title'))}</p>
-        <p class="hint">${escapeHtml(t('empty.noVideos.hint'))}</p>
+        <p>${escapeHtml(t(hasDeepHits ? 'empty.deepDetected.title' : 'empty.noVideos.title'))}</p>
+        <p class="hint">${escapeHtml(t(hasDeepHits ? 'empty.deepDetected.hint' : 'empty.noVideos.hint'))}</p>
       </div>
     `;
     selected.clear();
@@ -1058,12 +1062,37 @@ function renderJobs() {
   });
 }
 
+// Codex review (P3): the v2.5 browser-side states (browser_pending,
+// browser_uploading, browser_finalizing) are ACTIVE for display
+// purposes — they hold staging disk and progress towards completion,
+// so the sidepanel must render them as in-flight rather than as an
+// "unknown inactive status".
+//
+// Codex adversarial-review (medium): all three browser_* states are
+// ALSO cancellable. browser_pending: DELETE handles CAS + staging
+// cleanup atomically (extension never started uploading). browser_
+// uploading: cancelJob() fires CANCEL_BROWSER_JOB to offscreen first
+// so the AbortController halts in-flight PUTs, then DELETE flips the
+// row and rmtrees staging. browser_finalizing: brief window before the
+// API flips to 'pending'; treated the same as pending by DELETE. This
+// closes the gap where a long HLS/DASH browser-side job had no user-
+// visible stop path even while consuming bandwidth + staging quota.
 function isActiveStatus(s) {
-  return s === 'downloading' || s === 'processing' || s === 'merging';
+  return (
+    s === 'downloading'
+    || s === 'processing'
+    || s === 'merging'
+    || s === 'browser_pending'
+    || s === 'browser_uploading'
+    || s === 'browser_finalizing'
+  );
 }
 
 function getJobInnerHtml(job) {
-  const canCancel = ['pending', 'downloading', 'processing'].includes(job.status);
+  const canCancel = [
+    'pending', 'downloading', 'processing',
+    'browser_pending', 'browser_uploading', 'browser_finalizing',
+  ].includes(job.status);
   const showProgress = isActiveStatus(job.status);
   const isFailed = job.status === 'failed';
   const errorInfo = isFailed ? getErrorInfo(job.error_message) : null;
@@ -1105,7 +1134,9 @@ function getJobInnerHtml(job) {
   return `
     <div class="job-thumb" style="background:${tone}"></div>
     <div class="job-body">
-      <div class="job-title" title="${escapeHtml(job.title)}"${statusTooltip ? ` data-tip="${escapeHtml(statusTooltip)}"` : ''}>${escapeHtml(job.title)}</div>
+      <div class="job-title" title="${escapeHtml(job.title)}"${statusTooltip ? ` data-tip="${escapeHtml(statusTooltip)}"` : ''}>${
+        job.mode === 'browser' ? '<span class="mode-badge mode-browser" title="Downloaded in browser session (v2.5)">browser</span>' : ''
+      }${escapeHtml(job.title)}</div>
       <div class="job-meta status-${escapeHtml(job.status)}">
         <span class="status-text" data-status-text>${escapeHtml(jobStatusLabel(job))}</span>
         ${job.status === 'downloading' && job.speed != null ? `<span class="meta-sep"> · </span><span data-speed>${escapeHtml(String(job.speed))} MB/s</span>` : ''}
@@ -1177,8 +1208,13 @@ function getJobInnerHtml(job) {
 }
 
 function ringStrokeForStatus(status) {
-  if (status === 'downloading') return 'var(--accent)';
-  if (status === 'processing' || status === 'merging') return 'var(--warn)';
+  if (status === 'downloading' || status === 'browser_uploading') return 'var(--accent)';
+  if (
+    status === 'processing'
+    || status === 'merging'
+    || status === 'browser_pending'
+    || status === 'browser_finalizing'
+  ) return 'var(--warn)';
   if (status === 'failed') return 'var(--err)';
   return 'var(--text-mid)';
 }
@@ -1187,6 +1223,16 @@ function jobStatusLabel(job) {
   const pct = Number(job.progress) || 0;
   if (job.status === 'downloading') return `${getStatusLabel(job.status)} ${pct.toFixed(2)}%`;
   if (job.status === 'processing' || job.status === 'merging') return `${getStatusLabel(job.status)} ${pct.toFixed(2)}%`;
+  // Browser-side: the API doesn't update `progress` during upload (the
+  // extension does its own in-memory tracking), so we just show the
+  // state label without a numeric percentage.
+  if (
+    job.status === 'browser_pending'
+    || job.status === 'browser_uploading'
+    || job.status === 'browser_finalizing'
+  ) {
+    return getStatusLabel(job.status);
+  }
   if (job.status === 'completed') return getStatusLabel(job.status);
   if (job.status === 'failed') return job.error_message ? getStatusLabel(job.status) : getStatusLabel(job.status);
   return getStatusLabel(job.status);
@@ -1314,6 +1360,19 @@ async function cancelJob(jobId) {
     });
 
     if (response.ok) {
+      // DELETE is the authoritative user-cancel transition. Only after
+      // the NAS accepts it do we stop any browser-mode offscreen upload,
+      // and we mark the resulting FAILED message as user-cancelled so
+      // background cleanup does not race DELETE with /abort.
+      try {
+        await chrome.runtime.sendMessage({
+          target: 'offscreen',
+          type: 'CANCEL_BROWSER_JOB',
+          payload: { jobId, userCancelled: true },
+        });
+      } catch (_) {
+        // No offscreen receiver (most jobs aren't browser-mode) — ignore.
+      }
       showToast(t('toast.jobCancelled'));
       await loadRecentJobs();
     } else {
@@ -1516,6 +1575,10 @@ function getStatusLabel(status) {
     case 'completed': return t('jobStatus.completed');
     case 'failed': return t('jobStatus.failed');
     case 'cancelled': return t('jobStatus.cancelled');
+    // v2.5 browser-side states (Codex P3 review).
+    case 'browser_pending': return t('jobStatus.browser_pending');
+    case 'browser_uploading': return t('jobStatus.browser_uploading');
+    case 'browser_finalizing': return t('jobStatus.browser_finalizing');
     default: return status;
   }
 }

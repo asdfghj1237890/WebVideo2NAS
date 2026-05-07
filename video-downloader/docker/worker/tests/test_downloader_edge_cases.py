@@ -247,6 +247,65 @@ def test_try_download_returns_bytes_on_success(tmp_path):
     assert out == payload
 
 
+def test_try_download_honors_segment_byte_range(tmp_path):
+    """HLS EXT-X-BYTERANGE segments must send Range and require 206."""
+    payload = _make_valid_ts_sample(packet_count=3)
+    response = _FakeResponse(
+        status_code=206,
+        content=payload,
+        headers={"Content-Type": "video/mp2t"},
+    )
+
+    class _CapturingSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return response
+
+    session = _CapturingSession()
+    d = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        session=session,
+    )
+
+    out = d._try_download_with_headers(
+        "https://example.com/media.bin",
+        {"Range": "bytes=0-1", "range": "bytes=2-3"},
+        index=0,
+        byte_range={"offset": 100, "length": len(payload)},
+    )
+
+    assert out == payload
+    _, kwargs = session.calls[0]
+    assert kwargs["stream"] is True
+    assert kwargs["headers"]["Range"] == f"bytes=100-{100 + len(payload) - 1}"
+    assert "range" not in kwargs["headers"]
+
+
+def test_try_download_rejects_unhonored_byte_range(tmp_path):
+    payload = _make_valid_ts_sample(packet_count=3)
+    response = _FakeResponse(
+        status_code=200,
+        content=payload + payload,
+        headers={"Content-Type": "video/mp2t"},
+    )
+    d = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        session=_StaticSession(response),
+    )
+    out = d._try_download_with_headers(
+        "https://example.com/media.bin",
+        {},
+        index=0,
+        byte_range={"offset": 0, "length": len(payload)},
+    )
+    assert out is None
+
+
 # --- Backoff jitter --------------------------------------------------------
 
 

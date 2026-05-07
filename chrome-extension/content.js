@@ -226,11 +226,33 @@
     }
   }
 
-  // Listen for manifest detections from inject.js (MAIN world)
+  function forwardDeepHit(data) {
+    if (!data || data.type !== 'WV2NAS_DEEP_DETECTED') return;
+    try {
+      chrome.runtime.sendMessage({
+        action: 'deepDetected',
+        kind: data.kind || 'unknown',
+        format: data.format || null,
+        source: data.source || 'deepsearch',
+        url: data.url || null,
+        mime: data.mime || null,
+        pageUrl: window.location.href,
+        timestamp: Date.now()
+      });
+    } catch (e) {
+      // Extension context may be invalid
+    }
+  }
+
+  // Listen for detections from inject.js / deepsearch.js (MAIN world)
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
-    if (!event.data || event.data.type !== 'WV2NAS_MANIFEST_DETECTED') return;
-    forwardManifest(event.data);
+    if (!event.data) return;
+    if (event.data.type === 'WV2NAS_MANIFEST_DETECTED') {
+      forwardManifest(event.data);
+    } else if (event.data.type === 'WV2NAS_DEEP_DETECTED') {
+      forwardDeepHit(event.data);
+    }
   });
 
   // Ask inject.js to re-send any manifests detected before we were ready

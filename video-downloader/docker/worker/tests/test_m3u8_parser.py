@@ -27,19 +27,28 @@ class _FakeSession:
 
 
 def test_sanitize_headers_removes_br_when_brotli_unavailable(monkeypatch):
-    monkeypatch.setattr(m3u8_parser, "BROTLI_AVAILABLE", False)
+    # v2.5: parser implementation moved to shared.parsers.m3u8; monkeypatch
+    # the real module (the worker shim re-exports the symbol but rebinding
+    # the shim copy doesn't affect the implementation's namespace).
+    monkeypatch.setattr("shared.parsers.m3u8.BROTLI_AVAILABLE", False)
     p = M3U8Parser("https://example.com/a/b/c.m3u8", headers={"Accept-Encoding": "gzip, br, deflate"}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
     assert p.headers["Accept-Encoding"] == "gzip, deflate"
 
 
 def test_sanitize_headers_removes_br_case_insensitive(monkeypatch):
-    monkeypatch.setattr(m3u8_parser, "BROTLI_AVAILABLE", False)
+    # v2.5: parser implementation moved to shared.parsers.m3u8; monkeypatch
+    # the real module (the worker shim re-exports the symbol but rebinding
+    # the shim copy doesn't affect the implementation's namespace).
+    monkeypatch.setattr("shared.parsers.m3u8.BROTLI_AVAILABLE", False)
     p = M3U8Parser("https://example.com/x.m3u8", headers={"Accept-Encoding": "gzip, BR"}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
     assert p.headers["Accept-Encoding"] == "gzip"
 
 
 def test_sanitize_headers_drops_header_if_only_br(monkeypatch):
-    monkeypatch.setattr(m3u8_parser, "BROTLI_AVAILABLE", False)
+    # v2.5: parser implementation moved to shared.parsers.m3u8; monkeypatch
+    # the real module (the worker shim re-exports the symbol but rebinding
+    # the shim copy doesn't affect the implementation's namespace).
+    monkeypatch.setattr("shared.parsers.m3u8.BROTLI_AVAILABLE", False)
     p = M3U8Parser("https://example.com/x.m3u8", headers={"Accept-Encoding": "br"}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
     assert "Accept-Encoding" not in p.headers
 
@@ -106,7 +115,7 @@ seg1.ts
     assert result["segments"][0]["key"]["iv"] == bytes.fromhex("00000000000000000000000000000001")
 
 
-def test_parse_media_playlist_does_not_crash_on_invalid_iv(monkeypatch):
+def test_parse_media_playlist_rejects_invalid_iv():
     url = "https://cdn.example.com/vod/playlist.m3u8"
     content = """#EXTM3U
 #EXT-X-VERSION:3
@@ -118,8 +127,8 @@ seg0.ts
 """
     playlist = m3u8.loads(content, uri=url)
     parser = M3U8Parser(url, headers={}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
-    result = parser._parse_media_playlist(playlist, content)
-    assert result["segments"][0]["key"]["iv"] is None
+    with pytest.raises(ValueError, match="Invalid AES-128 IV"):
+        parser._parse_media_playlist(playlist, content)
 
 
 # --- HLS-fMP4 (CMAF) detection ---------------------------------------------
@@ -148,6 +157,46 @@ seg-2-v1-a1.m4s
     assert result["init_segment_url"] == "https://cdn.example.com/vod/init.mp4"
     assert result["segment_count"] == 2
     assert result["segments"][0]["url"].endswith(".m4s")
+
+
+def test_parse_media_playlist_preserves_hls_byte_ranges():
+    url = "https://cdn.example.com/vod/playlist.m3u8"
+    content = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:6
+#EXT-X-MAP:URI="asset.mp4",BYTERANGE="24@0"
+#EXT-X-BYTERANGE:1000@24
+#EXTINF:5.0,
+asset.mp4
+#EXT-X-BYTERANGE:500
+#EXTINF:5.0,
+asset.mp4
+#EXT-X-ENDLIST
+"""
+    playlist = m3u8.loads(content, uri=url)
+    parser = M3U8Parser(url, headers={}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
+    result = parser._parse_media_playlist(playlist, content)
+
+    assert result["init_segment_url"] == "https://cdn.example.com/vod/asset.mp4"
+    assert result["init_segment_byte_range"] == {"offset": 0, "length": 24}
+    assert result["segments"][0]["byte_range"] == {"offset": 24, "length": 1000}
+    assert result["segments"][1]["byte_range"] == {"offset": 1024, "length": 500}
+
+
+def test_parse_media_playlist_rejects_unsupported_encryption_method():
+    url = "https://cdn.example.com/vod/playlist.m3u8"
+    content = """#EXTM3U
+#EXT-X-VERSION:5
+#EXT-X-TARGETDURATION:10
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="key.bin"
+#EXTINF:10,
+seg0.ts
+#EXT-X-ENDLIST
+"""
+    playlist = m3u8.loads(content, uri=url)
+    parser = M3U8Parser(url, headers={}, session=_FakeSession(_FakeResponse(content=b"#EXTM3U\n")))
+    with pytest.raises(ValueError, match="Unsupported HLS encryption method"):
+        parser._parse_media_playlist(playlist, content)
 
 
 def test_parse_media_playlist_detects_fmp4_from_extension_without_init():

@@ -5,6 +5,7 @@ let detectedUrls = new Set();
 let currentTabUrls = {};
 let currentTabUrlKeys = {};
 let lastNotifyAtByTab = {};
+let deepHitsByTab = {};
 
 // Some sites fetch media via Service Worker / browser context where tabId is -1.
 // Keep these "orphan" detections and later attach them to the active tab by initiator/documentUrl.
@@ -480,6 +481,57 @@ function notifyDetectedUrlsUpdated(tabId) {
   }
 }
 
+function pruneDeepHitsForTab(tabId) {
+  const MAX = 20;
+  const MAX_AGE_MS = 10 * 60_000;
+  const now = Date.now();
+  const list = Array.isArray(deepHitsByTab[tabId]) ? deepHitsByTab[tabId] : [];
+  deepHitsByTab[tabId] = list
+    .filter(x => x && (now - (Number(x.timestamp) || 0)) <= MAX_AGE_MS)
+    .slice(-MAX);
+  return deepHitsByTab[tabId];
+}
+
+function registerDeepHit(tabId, payload) {
+  if (tabId == null || typeof tabId !== 'number' || tabId < 0) return;
+  const list = pruneDeepHitsForTab(tabId);
+  const key = [
+    payload.kind || 'unknown',
+    payload.format || '',
+    payload.source || '',
+    payload.url || '',
+    payload.mime || '',
+  ].join('|');
+  const now = Date.now();
+  const existing = list.find(x => x && x.key === key);
+  if (existing) {
+    existing.timestamp = now;
+    existing.hitCount = (Number(existing.hitCount) || 0) + 1;
+    existing.pageUrl = payload.pageUrl || existing.pageUrl || '';
+  } else {
+    list.push({
+      key,
+      kind: payload.kind || 'unknown',
+      format: payload.format || null,
+      source: payload.source || 'deepsearch',
+      url: payload.url || null,
+      mime: payload.mime || null,
+      pageUrl: payload.pageUrl || '',
+      timestamp: Number(payload.timestamp) || now,
+      hitCount: 1,
+    });
+  }
+  pruneDeepHitsForTab(tabId);
+  notifyDetectedUrlsUpdated(tabId);
+}
+
+function getDeepHitsForTab(tabId) {
+  return pruneDeepHitsForTab(tabId)
+    .slice()
+    .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0))
+    .map(({ key, ...rest }) => rest);
+}
+
 // Load settings on startup
 chrome.storage.sync.get(['autoDetect', 'showNotifications'], (result) => {
   if (result.autoDetect !== undefined) userSettings.autoDetect = result.autoDetect;
@@ -774,6 +826,7 @@ function updateBadge(tabId) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete currentTabUrls[tabId];
   delete currentTabUrlKeys[tabId];
+  delete deepHitsByTab[tabId];
   delete userClickedVideoByTab[tabId];
   delete pageThumbnailsByTab[tabId];
 });
@@ -784,6 +837,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
     // Clear URLs for this tab on navigation/reload
     currentTabUrls[details.tabId] = [];
     currentTabUrlKeys[details.tabId] = new Set();
+    deepHitsByTab[details.tabId] = [];
     delete userClickedVideoByTab[details.tabId];
     delete pageThumbnailsByTab[details.tabId];
     updateBadge(details.tabId);
@@ -1187,14 +1241,32 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // missing, substitution falls back to strict initiator equality.
 async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
   try {
-    const formatHint = getDetectedFormat(url);
+    // Codex review (P1): `getDetectedFormat()` only returns a value
+    // when the URL was detected via Content-Type sniffing. Most
+    // streams are detected via URL-pattern matching in
+    // onBeforeRequest, where `detectedFormat` stays unset → null.
+    // The browser-side router below then keeps `useBrowserSide`
+    // false and the cookie/IP-bound streams this whole feature
+    // exists for fall back to NAS-direct.
+    //
+    // Fall back to URL-suffix sniffing for the common .m3u8 / .mpd
+    // case so the routing decision matches user intent. Same
+    // pattern as `probeVideoMeta`, which already does this.
+    let formatHint = getDetectedFormat(url);
+    if (!formatHint) {
+      const lower = url.toLowerCase();
+      if (lower.includes('.m3u8')) formatHint = 'm3u8';
+      else if (lower.includes('.mpd')) formatHint = 'mpd';
+    }
     if (!isCandidateVideoUrl(url) && !formatHint) {
       showNotification('Error', 'Not a valid video URL');
       return;
     }
 
     // Get settings
-    const settings = await chrome.storage.sync.get(['nasEndpoint', 'apiKey', 'nasOutputSubdir']);
+    const settings = await chrome.storage.sync.get([
+      'nasEndpoint', 'apiKey', 'nasOutputSubdir', 'useBrowserSide',
+    ]);
 
     if (!settings.nasEndpoint || !settings.apiKey) {
       showNotification('Configuration Required', 'Please configure NAS settings in extension options');
@@ -1340,6 +1412,85 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
       console.log('  Cookie preview:', requestBody.headers.Cookie.substring(0, 200));
     }
     
+    // v2.5: route HLS/DASH through browser-side path when the user has it
+    // enabled (default on for hls/dash). The browser-side path fetches
+    // segments in this extension's session — solves expired-token / IP-bound
+    // / cookie-bound URLs that nas-direct can't reach. MP4 still goes
+    // through nas-direct: it's a single GET, the NAS pipeline already
+    // handles range requests, and there's no payoff in browser-side fetch.
+    let useBrowserSide =
+      (settings.useBrowserSide !== false) &&
+      (formatHint === 'm3u8' || formatHint === 'mpd');
+
+    // Pre-check the master URL against the browser-side safety gate
+    // before attempting browser-side mode. Private/metadata/local or
+    // split-horizon-looking rejections are terminal: silently sending
+    // them to /api/download would bypass the always-on browser-side
+    // gate because the legacy NAS SSRF guard is environment-gated.
+    // The only compatibility fallback we keep is a public-looking
+    // same-site plain-HTTP legacy stream, which browser-side rejects
+    // solely because it cannot use HTTPS DNS-rebinding protection.
+    if (useBrowserSide && requestBody && requestBody.url) {
+      const masterSafety = _wv2nasIsManifestUrlSafeForBrowser(
+        requestBody.url,
+        pageUrl || requestBody.source_page || null,
+      );
+      if (!masterSafety.safe) {
+        if (_wv2nasCanUseNasDirectForBrowserUnsafeUrl(
+          requestBody.url,
+          pageUrl || requestBody.source_page || null,
+        )) {
+          console.log(
+            `[wv2nas] Browser-side skipped for ${requestBody.url} `
+            + `(${masterSafety.reason}); routing HTTP legacy stream to NAS-direct`,
+          );
+          useBrowserSide = false;
+        } else {
+          throw new Error(
+            `Unsafe browser-side manifest URL refused: ${masterSafety.reason}`,
+          );
+        }
+      }
+    }
+
+    if (useBrowserSide) {
+      let browserSideErr = null;
+      try {
+        await runBrowserSideJob({
+          nasEndpoint: settings.nasEndpoint,
+          apiKey: settings.apiKey,
+          requestBody,
+          title,
+          pageUrl,
+          formatHint,
+        });
+        return;
+      } catch (err) {
+        browserSideErr = err;
+      }
+      // Codex adversarial-review: legacy compat fallback is now
+      // gated to 404 only (legacy NAS without /api/jobs/init). Other
+      // 4xx — especially 422 from the URL safety gate — are TERMINAL
+      // because /api/download's SSRF guard is env-gated and would
+      // re-open the exact intranet/metadata access the gate blocks.
+      // The proactive master-URL pre-check above already handles
+      // legitimate HTTP-only streams without going through 422.
+      if (!browserSideErr.fallbackable) {
+        console.error('Browser-side job failed:', browserSideErr);
+        showNotification(
+          'Browser-side job failed',
+          browserSideErr.message || String(browserSideErr),
+        );
+        return;
+      }
+      console.warn(
+        '[wv2nas] Browser-side init returned 404 (legacy NAS?); '
+        + 'falling back to NAS-direct:',
+        browserSideErr.message,
+      );
+      // Fall through to the NAS-direct submission below.
+    }
+
     // Send to NAS API
     const response = await fetch(`${settings.nasEndpoint}/api/download`, {
       method: 'POST',
@@ -1500,6 +1651,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return;
   }
 
+  if (request.action === 'deepDetected') {
+    const tabId = sender.tab?.id;
+    registerDeepHit(tabId, {
+      kind: request.kind,
+      format: request.format,
+      source: request.source,
+      url: request.url,
+      mime: request.mime,
+      pageUrl: request.pageUrl,
+      timestamp: request.timestamp,
+    });
+    sendResponse({ success: true });
+    return;
+  }
+
   // Handle user clicking on a video element (from content script)
   if (request.action === 'userClickedVideo' || request.action === 'videoStartedPlaying') {
     const tabId = sender.tab?.id;
@@ -1566,7 +1732,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           requestedTabId
         );
         scheduleProbesForRows(urls, requestedTabId);
-        sendResponse({ urls });
+        sendResponse({ urls, deepHits: getDeepHitsForTab(requestedTabId) });
       });
       return true;
     }
@@ -1581,10 +1747,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             tabs[0].id
           );
           scheduleProbesForRows(urls, tabs[0].id);
-          sendResponse({ urls });
+          sendResponse({ urls, deepHits: getDeepHitsForTab(tabs[0].id) });
         });
       } else {
-        sendResponse({ urls: [] });
+        sendResponse({ urls: [], deepHits: [] });
       }
     });
     return true; // Keep channel open for async response
@@ -1645,4 +1811,1681 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 });
 
+// ---------------------------------------------------------------------------
+// v2.5 browser-side job orchestrator.
+//
+// SW-side responsibility:
+//   1. POST /api/jobs/init with manifest URL or text + headers we captured
+//      → server returns the segment plan (URLs + AES key URI + IV).
+//   2. Build DNR session rules so segment fetches in offscreen carry the
+//      Referer/Origin/UA we recorded from the player.
+//   3. Open offscreen.html and post START_BROWSER_JOB with the plan.
+//   4. Wait for BROWSER_JOB_DONE / BROWSER_JOB_FAILED — clean up DNR rules
+//      and close the offscreen document either way.
+//
+// dnrRules.js / segmentDownloader.js are full ES modules with their own
+// vitest coverage; we don't import them here because background.js is a
+// classic service worker. The DNR helpers below mirror dnrRules.js's
+// shape — keep them in sync if the ruleset evolves.
+// ---------------------------------------------------------------------------
+
+// DNR ID allocation strategy (post-Codex review): each concurrent
+// browser-side job claims a unique slot in the rule ID space. Without
+// this, two parallel jobs would build rules at the same constant base
+// and either silently overwrite each other's spoof rules (via
+// updateSessionRules) or have one job's cleanup remove the other's
+// active rules. MV3 caps session rules at 5000; we cap at 50 slots ×
+// 100 IDs/slot = 5000.
+const _BROWSER_DNR_BASE_ID = 10000;
+const _BROWSER_DNR_PER_JOB_RANGE = 100;
+const _BROWSER_DNR_RESPONSE_OFFSET = 50; // within a slot, response rules at base+50
+const _BROWSER_DNR_MAX_SLOTS = 50;
+const _wv2nasUsedDnrSlots = new Set();
+
+// Per-job runtime state (Codex review #2): registered when a job starts,
+// deleted in cleanup. Used to ref-count the offscreen document so a
+// finishing job doesn't close offscreen out from under another that's
+// still mid-segment.
+const _wv2nasActiveBrowserJobs = new Map(); // jobId -> { dnrSlot, ruleIds }
+
+function _wv2nasAllocateDnrSlot() {
+  for (let slot = 0; slot < _BROWSER_DNR_MAX_SLOTS; slot++) {
+    if (!_wv2nasUsedDnrSlots.has(slot)) {
+      _wv2nasUsedDnrSlots.add(slot);
+      return slot;
+    }
+  }
+  throw new Error(
+    `Browser-side DNR slots exhausted (max ${_BROWSER_DNR_MAX_SLOTS} concurrent jobs).`
+  );
+}
+
+function _wv2nasReleaseDnrSlot(slot) {
+  _wv2nasUsedDnrSlots.delete(slot);
+}
+
+function _wv2nasUrlsToFilters(urls) {
+  const groups = new Map();
+  for (const u of urls) {
+    let parsed;
+    try { parsed = new URL(u); } catch (_) { continue; }
+    const origin = `${parsed.protocol}//${parsed.host}`;
+    const dir = parsed.pathname.replace(/[^/]*$/, '');
+    const key = origin + dir;
+    if (!groups.has(key)) groups.set(key, { origin, dir });
+  }
+  const filters = [];
+  for (const { origin, dir } of groups.values()) {
+    const escaped = (origin + dir).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    filters.push(`^${escaped}.*`);
+  }
+  return filters;
+}
+
+// `idBase` is the starting rule ID for THIS job's slot — the caller
+// allocates it via _wv2nasAllocateDnrSlot. Within each slot we have
+// _BROWSER_DNR_RESPONSE_OFFSET (50) request-rule slots and 50 paired
+// response-rule slots. Hard-cap origin groups at 50 to fit the slot.
+//
+// Codex review #10: CORS-relax response rules ONLY apply to
+// `trustedSegmentUrls` (subset of `segmentUrls` whose origins share
+// the manifest's registrable-domain). Foreign origins get neither
+// header-spoof nor CORS-relax; fetch uses default browser headers and
+// the response remains unreadable cross-origin, defeating credential
+// leakage and DNS-rebinding exfil.
+function _wv2nasBuildDnrRules({
+  segmentUrls, trustedSegmentUrls, referer, origin, userAgent, idBase,
+  initiatorDomain,
+}) {
+  const filters = _wv2nasUrlsToFilters(segmentUrls);
+  if (filters.length === 0) return [];
+  if (filters.length > _BROWSER_DNR_RESPONSE_OFFSET) {
+    // Don't silently truncate — fail loudly so the caller knows something
+    // about the segment URL distribution is unusual (>50 origin groups).
+    throw new Error(
+      `Too many segment URL origin groups (${filters.length}) for DNR slot; max ${_BROWSER_DNR_RESPONSE_OFFSET}`
+    );
+  }
+  // Build trust set from per-URL trust filtering. Default = all
+  // trusted (single-trust-level back-compat).
+  const trustedFilters = new Set(_wv2nasUrlsToFilters(
+    trustedSegmentUrls === undefined ? segmentUrls : trustedSegmentUrls
+  ));
+
+  const reqHeaders = [];
+  if (referer) reqHeaders.push({ header: 'referer', operation: 'set', value: referer });
+  if (origin) reqHeaders.push({ header: 'origin', operation: 'set', value: origin });
+  if (userAgent) reqHeaders.push({ header: 'user-agent', operation: 'set', value: userAgent });
+
+  // Codex review #11: scope conditions to the extension's own initiator
+  // (chrome.runtime.id) so unrelated tabs that fetch a matching URL
+  // during the download window do NOT benefit from the CORS rewrite.
+  // Without this, a malicious page that learns or guesses a CDN segment
+  // URL while a job is active could read responses cross-origin.
+  function makeCondition(regexFilter) {
+    const cond = {
+      regexFilter,
+      resourceTypes: ['xmlhttprequest', 'media', 'other'],
+    };
+    if (initiatorDomain) {
+      cond.initiatorDomains = [initiatorDomain];
+    }
+    return cond;
+  }
+
+  const rules = [];
+  let id = idBase;
+  for (const regexFilter of filters) {
+    const trusted = trustedFilters.has(regexFilter);
+    // Request header-spoof: ONLY for trusted origin groups.
+    // Codex adversarial-review: foreign hosts no longer receive the
+    // captured Referer/Origin/User-Agent — Referers for player pages
+    // can carry signed URLs / session tokens. Must stay in lockstep
+    // with dnrRules.js::buildHeaderRules.
+    if (reqHeaders.length > 0 && trusted) {
+      rules.push({
+        id,
+        priority: 1,
+        action: { type: 'modifyHeaders', requestHeaders: reqHeaders },
+        condition: makeCondition(regexFilter),
+      });
+    }
+    // Response CORS-relax: ONLY for trusted origin groups. Codex #10.
+    if (trusted) {
+      rules.push({
+        id: id + _BROWSER_DNR_RESPONSE_OFFSET,
+        priority: 1,
+        action: {
+          type: 'modifyHeaders',
+          responseHeaders: [
+            { header: 'access-control-allow-origin', operation: 'set', value: '*' },
+            { header: 'access-control-allow-credentials', operation: 'remove' },
+          ],
+        },
+        condition: makeCondition(regexFilter),
+      });
+    }
+    id += 1;
+  }
+  return rules;
+}
+
+
+// Codex review #10: per-segment trust check matching segmentDownloader's
+// isTrustedForCredentials. Same protection boundary applied at
+// DNR-rule-building time so foreign origins don't receive CORS-relax
+// response rewrites.
+//
+// Codex adversarial-review: the predicate must not trust upward —
+// rejecting the case where a manifest on a subdomain (e.g.
+// attacker.example.com) claims trust over its parent host
+// (example.com). See segmentDownloader.isTrustedForCredentials for
+// the threat-model rationale. Both predicates MUST stay in lockstep,
+// otherwise DNR rules diverge from fetch-time behavior.
+function _wv2nasIsTrustedDnrUrl(segmentUrl, trustedBase) {
+  if (!trustedBase) return false;
+  let segHost, baseHost, segOrigin, baseOrigin;
+  try {
+    const seg = new URL(segmentUrl);
+    const base = new URL(trustedBase);
+    if (seg.protocol !== 'https:' && seg.protocol !== 'http:') return false;
+    segHost = seg.hostname.toLowerCase();
+    baseHost = base.hostname.toLowerCase();
+    segOrigin = seg.origin;
+    baseOrigin = base.origin;
+  } catch (_) {
+    return false;
+  }
+  if (segOrigin === baseOrigin) return true;
+  if (segHost.endsWith('.' + baseHost)) return true;
+  return false;
+}
+
+// Collect every URL DNR rules need to cover for a job: init segments,
+// media segments, AND AES-128 key URIs (Codex review #3 — without keys
+// in the DNR scope, segment fetches succeed but the subsequent key
+// fetch hits the protected origin without our Referer/Origin/UA spoof
+// or CORS relaxation, and decryption fails). Use a Set to dedup —
+// keys typically rotate per-segment with the SAME URI, but this also
+// guards against duplicates from rare per-segment-key streams.
+function _wv2nasPlanSegmentUrls(plan) {
+  const out = new Set();
+  if (plan.init_segment_url) out.add(plan.init_segment_url);
+  for (const trackName of Object.keys(plan.tracks || {})) {
+    const t = plan.tracks[trackName];
+    if (t.init_segment_url) out.add(t.init_segment_url);
+    for (const s of t.segments || []) {
+      if (s.url) out.add(s.url);
+      // AES key URI (HLS EXT-X-KEY URI=...) — extension's offscreen
+      // segmentDownloader fetches this in browser context too. Some
+      // streams put keys on a different origin (CDN auth gateway)
+      // making this critical.
+      if (s.key && s.key.uri) out.add(s.key.uri);
+    }
+  }
+  return Array.from(out);
+}
+
+let _browserOffscreenCreating = null;
+// Codex adversarial-review (high): the offscreen document's
+// chrome.runtime.onMessage listener registers asynchronously when the
+// document loads — `chrome.offscreen.createDocument` resolves as soon
+// as the document is created, NOT once its listener is ready. Without
+// a handshake, the very next chrome.runtime.sendMessage with
+// target:'offscreen' can race the listener registration and fail with
+// "Could not establish connection. Receiving end does not exist." On
+// cold offscreen creation the SW would then bail out of the job after
+// /api/jobs/init has already allocated server staging + DNR rules.
+// `_browserOffscreenReady` is set whenever a creation is in flight and
+// resolves when offscreen.js's OFFSCREEN_READY ping reaches the SW.
+// Existing-doc fast path resolves immediately (the listener was
+// registered when the doc loaded earlier).
+let _browserOffscreenReady = null;
+let _browserOffscreenReadyResolve = null;
+const _BROWSER_OFFSCREEN_READY_TIMEOUT_MS = 10_000;
+
+function _markOffscreenReady() {
+  if (_browserOffscreenReadyResolve) {
+    _browserOffscreenReadyResolve();
+    _browserOffscreenReadyResolve = null;
+  } else {
+    // No creation in flight (existing doc just sent a duplicate ping,
+    // or a stale ack arrived after closeDocument). Pre-resolve so the
+    // next _ensureOffscreenDocument call returns immediately.
+    _browserOffscreenReady = Promise.resolve();
+  }
+}
+
+async function _ensureOffscreenDocument() {
+  const url = chrome.runtime.getURL('offscreen.html');
+  if (chrome.offscreen.hasDocument) {
+    const exists = await chrome.offscreen.hasDocument();
+    if (exists) {
+      // Document already alive (e.g. concurrent job kept it open, or
+      // SW restarted with offscreen still up). Its listener has been
+      // registered since the original load — safe to send immediately.
+      if (!_browserOffscreenReady) _browserOffscreenReady = Promise.resolve();
+      return _browserOffscreenReady;
+    }
+  }
+  // Coalesce concurrent calls so we don't race two creations.
+  if (_browserOffscreenCreating) {
+    await _browserOffscreenCreating;
+    return _browserOffscreenReady || Promise.resolve();
+  }
+  _browserOffscreenReady = new Promise((resolve, reject) => {
+    _browserOffscreenReadyResolve = resolve;
+    setTimeout(() => {
+      if (_browserOffscreenReadyResolve) {
+        _browserOffscreenReadyResolve = null;
+        reject(new Error(
+          `offscreen document did not signal ready within ` +
+          `${_BROWSER_OFFSCREEN_READY_TIMEOUT_MS}ms`
+        ));
+      }
+    }, _BROWSER_OFFSCREEN_READY_TIMEOUT_MS);
+  });
+  _browserOffscreenCreating = chrome.offscreen.createDocument({
+    url,
+    reasons: ['BLOBS', 'WORKERS'],
+    justification: 'Run long-form HLS/DASH segment downloader for browser-side jobs',
+  }).finally(() => { _browserOffscreenCreating = null; });
+  await _browserOffscreenCreating;
+  return _browserOffscreenReady;
+}
+
+async function _closeOffscreenDocument() {
+  try {
+    if (chrome.offscreen.hasDocument) {
+      const exists = await chrome.offscreen.hasDocument();
+      if (!exists) return;
+    }
+    await chrome.offscreen.closeDocument();
+  } catch (e) {
+    console.warn('[wv2nas] closeOffscreenDocument failed:', e);
+  } finally {
+    // Reset the readiness gate so the NEXT createDocument waits for
+    // a fresh OFFSCREEN_READY ack (the new document re-registers its
+    // listener from scratch).
+    _browserOffscreenReady = null;
+    _browserOffscreenReadyResolve = null;
+  }
+}
+
+// Pick the highest-BANDWIDTH variant URL from an HLS master playlist.
+// Mirrors `_plan_hls_from_text`'s server-side variant pick so the extension
+// and server agree on which media playlist gets used. Returns null when no
+// parsable variants are found.
+function _wv2nasPickBestHlsVariant(masterText, masterUrl) {
+  const lines = masterText.split(/\r?\n/);
+  let bestBw = -1;
+  let bestUrl = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith('#EXT-X-STREAM-INF:')) {
+      const bwMatch = line.match(/BANDWIDTH=(\d+)/);
+      const bw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+      // The very next non-comment line is the variant URI per RFC 8216.
+      let j = i + 1;
+      while (j < lines.length && (lines[j].trim() === '' || lines[j].trim().startsWith('#'))) j++;
+      if (j < lines.length) {
+        try {
+          const u = new URL(lines[j].trim(), masterUrl).href;
+          if (bw > bestBw) {
+            bestBw = bw;
+            bestUrl = u;
+          }
+        } catch (_) {}
+      }
+    }
+  }
+  return bestUrl;
+}
+
+// Fetch the manifest in browser context (with credentials, so cookies +
+// session ride along) and resolve HLS master → variant ourselves so the
+// server never has to retry the fetch from its IP. Returns
+// {manifest_text, base_url} on success, null when browser fetch fails
+// (caller falls back to NAS-side URL fetch). Codex review #1: this is
+// the critical path — without it, /api/jobs/init still relies on the
+// NAS being able to reach the manifest, defeating the whole browser-side
+// design for IP-bound / short-TTL / session-bound playlists.
+// Codex review: filter captured request headers down to a set safe for
+// `fetch(url, { headers })`. Forbidden headers (Cookie, Origin, Referer,
+// User-Agent, Host, etc.) are either silently dropped by fetch or are
+// already handled by DNR / credentials: 'include'. Authorization,
+// X-* auth tokens, and similar custom headers DO ride along — without
+// this filtering pass the manifest fetch would 401/403 on protected
+// streams that need a header token, even though the legacy NAS-direct
+// path passes the same headers via the requestBody.
+function _wv2nasFilterFetchHeaders(rawHeaders) {
+  const out = {};
+  if (!rawHeaders || typeof rawHeaders !== 'object') return out;
+  const skip = new Set([
+    'accept-charset',
+    'accept-encoding',// fetch sets this automatically
+    'access-control-request-headers',
+    'access-control-request-method',
+    'connection',     // forbidden
+    'content-length', // forbidden
+    'cookie',         // forbidden — credentials: 'include' carries cookies
+    'date',
+    'dnt',
+    'expect',
+    'host',           // forbidden
+    'keep-alive',
+    'origin',         // forbidden — set via DNR
+    'permissions-policy',
+    'range',          // set explicitly only for byte-range media fetches
+    'referer',        // forbidden — set via DNR
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+    'user-agent',     // forbidden in some browsers — set via DNR
+    'via',
+    'x-http-method',
+    'x-http-method-override',
+    'x-method-override',
+    'sec-ch-ua',      // forbidden (UA client hints)
+    'sec-ch-ua-mobile',
+    'sec-ch-ua-platform',
+  ]);
+  for (const [k, v] of Object.entries(rawHeaders)) {
+    const lower = k.toLowerCase();
+    if (!skip.has(lower) && !lower.startsWith('sec-')
+        && !lower.startsWith('proxy-') && v != null) {
+      out[k] = String(v);
+    }
+  }
+  return out;
+}
+
+
+// Codex review (P2): bound manifest body reads. Server-side cap on
+// `manifest_text` is 10 MB (api/main.py JobInitRequest); align the
+// client cap so an oversize misdetected URL or a hostile manifest
+// can't fill SW memory before the server-side rejection. Streaming
+// read with mid-stream abort, mirroring readBodyWithCap in
+// segmentDownloader.js (which exists in the offscreen document — we
+// can't share helpers across SW and offscreen).
+const _WV2NAS_MAX_MANIFEST_BYTES = 10 * 1024 * 1024;
+
+
+async function _wv2nasReadManifestText(response, maxBytes, label) {
+  // Upfront content-length gate — saves the wire bytes when the
+  // server is honest about its size.
+  const cl = response.headers && typeof response.headers.get === 'function'
+    ? response.headers.get('content-length')
+    : null;
+  if (cl) {
+    const n = parseInt(cl, 10);
+    if (Number.isFinite(n) && n > maxBytes) {
+      try {
+        if (response.body && typeof response.body.cancel === 'function') {
+          response.body.cancel();
+        }
+      } catch (_) { /* best-effort */ }
+      throw new Error(
+        `${label}: Content-Length ${n} exceeds cap ${maxBytes}`,
+      );
+    }
+  }
+
+  // Streaming path — production Chrome always exposes resp.body.
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let total = 0;
+    let text = '';
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          try { reader.cancel(); } catch (_) { /* best-effort */ }
+          throw new Error(
+            `${label}: response exceeded cap ${maxBytes} bytes mid-stream`,
+          );
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      // Flush any trailing pending bytes from the decoder.
+      text += decoder.decode();
+    } catch (err) {
+      try { reader.cancel(); } catch (_) { /* best-effort */ }
+      throw err;
+    }
+    return text;
+  }
+
+  // Fallback for test mocks without a streaming body. Still post-
+  // checks size to bound memory at one full response.
+  const fallback = await response.text();
+  if (fallback.length > maxBytes) {
+    throw new Error(
+      `${label}: response size ${fallback.length} exceeds cap ${maxBytes}`,
+    );
+  }
+  return fallback;
+}
+
+
+function _wv2nasClassifyIpv4Literal(host) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return null;
+  const octets = [1, 2, 3, 4].map((i) => parseInt(m[i], 10));
+  if (octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return { safe: false, reason: 'invalid IPv4 literal' };
+  }
+  const [a, b, c] = octets;
+  if (a === 0) return { safe: false, reason: 'unspecified (0/8)' };
+  if (a === 10) return { safe: false, reason: 'RFC 1918 (10/8)' };
+  if (a === 127) return { safe: false, reason: 'IPv4 loopback (127/8)' };
+  if (a === 169 && b === 254) {
+    return { safe: false, reason: 'link-local (169.254/16) - incl. AWS metadata' };
+  }
+  if (a === 172 && b >= 16 && b <= 31) {
+    return { safe: false, reason: 'RFC 1918 (172.16/12)' };
+  }
+  if (a === 192 && b === 168) {
+    return { safe: false, reason: 'RFC 1918 (192.168/16)' };
+  }
+  if (a === 100 && b >= 64 && b <= 127) {
+    return { safe: false, reason: 'shared CGN (100.64/10)' };
+  }
+  if (a === 192 && b === 0 && c === 0) {
+    return { safe: false, reason: 'IETF special-use (192.0.0/24)' };
+  }
+  if (a === 192 && b === 0 && c === 2) return { safe: false, reason: 'TEST-NET-1' };
+  if (a === 198 && (b === 18 || b === 19)) {
+    return { safe: false, reason: 'benchmarking (198.18/15)' };
+  }
+  if (a === 198 && b === 51 && c === 100) return { safe: false, reason: 'TEST-NET-2' };
+  if (a === 203 && b === 0 && c === 113) return { safe: false, reason: 'TEST-NET-3' };
+  if (a >= 224) return { safe: false, reason: 'multicast/reserved (>=224)' };
+  return { safe: true };
+}
+
+
+function _wv2nasParseIpv4Octets(raw) {
+  const classified = _wv2nasClassifyIpv4Literal(raw);
+  if (!classified) return null;
+  if (!classified.safe && classified.reason === 'invalid IPv4 literal') return null;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(raw);
+  if (!m) return null;
+  return [1, 2, 3, 4].map((i) => parseInt(m[i], 10));
+}
+
+
+function _wv2nasExpandIpv6Literal(inner) {
+  if (!inner || inner.includes('%')) return null;
+  let text = inner.toLowerCase();
+  const lastColon = text.lastIndexOf(':');
+  const maybeIpv4Tail = lastColon >= 0 ? text.slice(lastColon + 1) : '';
+  if (maybeIpv4Tail.includes('.')) {
+    const octets = _wv2nasParseIpv4Octets(maybeIpv4Tail);
+    if (!octets) return null;
+    const high = ((octets[0] << 8) | octets[1]).toString(16);
+    const low = ((octets[2] << 8) | octets[3]).toString(16);
+    text = `${text.slice(0, lastColon)}:${high}:${low}`;
+  }
+
+  const compressed = text.includes('::');
+  if ((text.match(/::/g) || []).length > 1) return null;
+  const sides = text.split('::');
+  const left = sides[0] ? sides[0].split(':') : [];
+  const right = compressed && sides[1] ? sides[1].split(':') : [];
+  if (left.some((g) => !g) || right.some((g) => !g)) return null;
+
+  let groups;
+  if (compressed) {
+    const fill = 8 - left.length - right.length;
+    if (fill < 1) return null;
+    groups = [...left, ...Array(fill).fill('0'), ...right];
+  } else {
+    groups = left;
+    if (groups.length !== 8) return null;
+  }
+
+  if (groups.length !== 8) return null;
+  const parsed = [];
+  for (const group of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(group)) return null;
+    parsed.push(parseInt(group, 16));
+  }
+  return parsed;
+}
+
+
+function _wv2nasClassifyIpv6Literal(inner) {
+  const groups = _wv2nasExpandIpv6Literal(inner);
+  if (!groups) return { safe: false, reason: 'invalid IPv6 literal' };
+
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d / ::ffff:hhhh:hhhh) should follow
+  // the exact IPv4 literal policy, not a separate IPv6 shortcut.
+  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
+    const ip4 = [
+      (groups[6] >> 8) & 0xff, groups[6] & 0xff,
+      (groups[7] >> 8) & 0xff, groups[7] & 0xff,
+    ].join('.');
+    return _wv2nasClassifyIpv4Literal(ip4) || {
+      safe: false,
+      reason: 'invalid IPv4-mapped IPv6 literal',
+    };
+  }
+
+  if (groups.every((g) => g === 0)) {
+    return { safe: false, reason: 'IPv6 unspecified' };
+  }
+  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) {
+    return { safe: false, reason: 'IPv6 loopback' };
+  }
+  if ((groups[0] & 0xfe00) === 0xfc00) {
+    return { safe: false, reason: 'IPv6 unique-local' };
+  }
+  if ((groups[0] & 0xffc0) === 0xfe80) {
+    return { safe: false, reason: 'IPv6 link-local' };
+  }
+  if ((groups[0] & 0xffc0) === 0xfec0) {
+    return { safe: false, reason: 'IPv6 site-local' };
+  }
+  if ((groups[0] & 0xff00) === 0xff00) {
+    return { safe: false, reason: 'IPv6 multicast' };
+  }
+  if (groups[0] === 0x2001 && groups[1] === 0x0db8) {
+    return { safe: false, reason: 'IPv6 documentation range (2001:db8/32)' };
+  }
+  if (groups[0] === 0x2001 && groups[1] <= 0x01ff) {
+    return { safe: false, reason: 'IPv6 IETF special-use (2001::/23)' };
+  }
+  if (groups[0] === 0x3ffe) {
+    return { safe: false, reason: 'IPv6 6bone documentation/deprecated range' };
+  }
+  if ((groups[0] & 0xe000) !== 0x2000) {
+    return { safe: false, reason: 'IPv6 literal is not global unicast' };
+  }
+  return { safe: true };
+}
+
+
+// Codex adversarial-review (high): pre-validate any URL we're about
+// to fetch in the extension context with credentials. The server's
+// _enforce_plan_url_safety only runs AFTER `manifest_text` has been
+// posted from the browser, so a forged or misdetected manifest URL
+// could otherwise drive a credentialed fetch to localhost / private
+// IPs / metadata services on the user's machine and forward the
+// response to the NAS API. Mirror the server policy here:
+//   - HTTPS only (DNS rebinding mitigation rides on cert-name mismatch)
+//   - reject localhost / IP literals in private / loopback / link-local
+//     / shared-CGN / TEST-NET / reserved ranges
+//   - DNS-resolvable hostnames are accepted (we can't do DNS lookups
+//     client-side; the HTTPS gate is the safety net)
+function _wv2nasIsManifestUrlSafeForBrowser(url, pageUrl) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (_) {
+    return { safe: false, reason: 'malformed URL' };
+  }
+  if (parsed.protocol !== 'https:') {
+    return {
+      safe: false,
+      reason: `plain ${parsed.protocol} rejected (HTTPS-only — DNS rebinding mitigation)`,
+    };
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!host) return { safe: false, reason: 'no host' };
+  if (host === 'localhost' || host === '0.0.0.0'
+      || host === 'broadcasthost' || host.endsWith('.localhost')) {
+    return { safe: false, reason: `local hostname ${host}` };
+  }
+  // IPv6 literal — URL.hostname returns it WITH the brackets.
+  if (host.startsWith('[') && host.endsWith(']')) {
+    return _wv2nasClassifyIpv6Literal(host.slice(1, -1));
+  }
+  // IPv4 literal.
+  const ipv4Safety = _wv2nasClassifyIpv4Literal(host);
+  if (ipv4Safety) return ipv4Safety;
+  // DNS name — needs a trust anchor. The HTTPS-only requirement
+  // catches DNS-rebinding to a public-cert-bound private IP, but
+  // CANNOT defeat split-horizon DNS where a public hostname has an
+  // internal-CA cert that the corporate machine trusts (e.g.
+  // `https://internal.corp.example/`). Without DNS resolution we
+  // can't distinguish that from a real public host.
+  //
+  // Codex adversarial-review: require same-site relationship to
+  // the page that surfaced this URL. Legitimate cookie-bound
+  // streams (Vimeo private videos, paid streaming sites) are
+  // typically same-site by design — that's where the cookies live.
+  // Cross-site streams (YouTube/Twitch-style with URL-embedded
+  // tokens) don't need browser-side credentials and can fall
+  // through to NAS-side planning, where `_safe_fetch` does
+  // resolve-and-public-IP-check before fetching.
+  //
+  // When pageUrl is not provided (back-compat for unit tests of
+  // this helper), we fall back to the prior behavior — accept any
+  // public-resolving DNS name. Production runBrowserSideJob always
+  // passes pageUrl through dnrContext.
+  if (pageUrl) {
+    if (!_wv2nasIsTrustedDnrUrl(url, pageUrl)) {
+      return {
+        safe: false,
+        reason: (
+          `host ${host} is not same-site with page (${pageUrl}); `
+          + `refusing browser fetch — split-horizon DNS / internal-CA `
+          + `hosts cannot be distinguished client-side from public hosts`
+        ),
+      };
+    }
+  }
+  return { safe: true };
+}
+
+
+function _wv2nasHttpsEquivalent(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.protocol = 'https:';
+    return parsed.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+
+function _wv2nasCanUseNasDirectForBrowserUnsafeUrl(url, pageUrl) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (_) {
+    return false;
+  }
+  if (parsed.protocol !== 'http:') return false;
+
+  const httpsUrl = _wv2nasHttpsEquivalent(url);
+  if (!httpsUrl) return false;
+  const httpsPageUrl = pageUrl ? _wv2nasHttpsEquivalent(pageUrl) : null;
+  const hostSafety = _wv2nasIsManifestUrlSafeForBrowser(
+    httpsUrl,
+    httpsPageUrl,
+  );
+  return !!hostSafety.safe;
+}
+
+
+async function _wv2nasFetchManifestInBrowser(url, dnrContext = null) {
+  // Codex adversarial-review: gate the credentialed fetch on the same
+  // URL safety policy the server runs on plan URLs. Without this, a
+  // forged manifest URL pointing at intranet/metadata hosts gets
+  // fetched with the user's cookies before any server check runs.
+  // Pass dnrContext.pageUrl so the gate can also reject DNS hostnames
+  // that aren't same-site with the page (split-horizon mitigation).
+  const safety = _wv2nasIsManifestUrlSafeForBrowser(
+    url, dnrContext && dnrContext.pageUrl,
+  );
+  if (!safety.safe) {
+    console.warn(
+      `[wv2nas] Refusing browser-side manifest fetch for ${url}: ${safety.reason}`,
+    );
+    return { safetyRejected: true, reason: safety.reason, url };
+  }
+  // Codex review: a manifest gated on Authorization or X-* auth tokens
+  // would 401/403 here without the captured headers. DNR can only
+  // spoof Referer/Origin/UA; everything else has to ride the fetch
+  // call directly. Filter forbidden ones so fetch doesn't reject.
+  const fetchHeaders = dnrContext
+    ? _wv2nasFilterFetchHeaders(dnrContext.headers)
+    : {};
+
+  let response;
+  try {
+    response = await fetch(url, {
+      credentials: 'include',
+      headers: fetchHeaders,
+      // Codex review (P1): refuse to follow redirects on browser-side
+      // manifest fetches. The safety gate only validates the
+      // ORIGINAL URL — a 30x to a different origin or to an
+      // intranet/metadata host would otherwise be followed
+      // automatically with `credentials: 'include'`, leaking cookies
+      // to the redirect target and pulling its response body back
+      // for upload to /api/jobs/init as `manifest_text`.
+      // `redirect: 'error'` causes fetch to throw TypeError on any
+      // 30x; caller catches and falls back to NAS-side planning
+      // where _safe_fetch performs per-hop SSRF revalidation.
+      redirect: 'error',
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+  } catch (e) {
+    console.warn('[wv2nas] In-browser manifest fetch failed; will fall back to NAS-fetch:', e);
+    return null;
+  }
+
+  let text;
+  try {
+    text = await _wv2nasReadManifestText(
+      response, _WV2NAS_MAX_MANIFEST_BYTES, `manifest ${url}`,
+    );
+  } catch (e) {
+    console.warn('[wv2nas] manifest body read failed:', e);
+    return null;
+  }
+
+  // HLS master playlist: resolve to the chosen variant + fetch its body
+  // too, so the server only sees a media playlist (no further fetches
+  // needed on its side).
+  if (text.includes('#EXT-X-STREAM-INF')) {
+    const variantUrl = _wv2nasPickBestHlsVariant(text, url);
+    if (variantUrl && variantUrl !== url) {
+      // Codex adversarial-review (high): the variant URL came from
+      // server-controlled master playlist text — apply the same
+      // pre-fetch safety gate as the master to refuse credentialed
+      // requests against intranet/metadata hosts. The variant URL
+      // is already exercised by the server-side
+      // _enforce_plan_url_safety after init, but only if init RUNS;
+      // we never want a malicious master to drive a private-IP
+      // browser fetch BEFORE the server sees the plan. The pageUrl
+      // anchor is the master URL itself (we already accepted it
+      // above) — variant must stay within master's trust boundary.
+      const variantSafety = _wv2nasIsManifestUrlSafeForBrowser(
+        variantUrl, url,
+      );
+      if (!variantSafety.safe) {
+        console.warn(
+          `[wv2nas] Refusing variant fetch for ${variantUrl}: ${variantSafety.reason}`,
+        );
+        return {
+          safetyRejected: true,
+          reason: variantSafety.reason,
+          url: variantUrl,
+        };
+      }
+      // Codex adversarial-review: scope cookies AND captured auth
+      // headers to the master URL's trust boundary. A malicious or
+      // misdetected master could point its highest-bandwidth variant
+      // at attacker-controlled `evil.com`; without scoping, the
+      // captured Authorization / X-* tokens (and session cookies)
+      // would leak to that host. `_wv2nasIsTrustedDnrUrl` matches
+      // the offscreen-side `isTrustedForCredentials` semantics —
+      // same-origin or deeper-subdomain only.
+      const variantTrusted = _wv2nasIsTrustedDnrUrl(variantUrl, url);
+      // Codex review: the variant URL may sit on a different directory
+      // or origin from the master, so the phase-1 DNR rule (built
+      // from the master URL only) won't match the variant fetch. Sites
+      // that gate variant playlists on Referer/Origin/UA would 403
+      // here. Install a complementary header-spoof rule for the
+      // variant URL before fetching. New rule IDs are appended to
+      // `dnrContext.ruleIds` so the caller's phase-2 swap removes
+      // them atomically alongside the phase-1 rules.
+      //
+      // Codex adversarial-review (high): pass the trust flag through
+      // to the rule builder. CORS-relax must NOT fire for an
+      // untrusted variant — otherwise the extension could read the
+      // variant body cross-origin and exfiltrate it as manifest_text.
+      if (dnrContext) {
+        try {
+          await _wv2nasInstallVariantDnrRule(variantUrl, dnrContext, variantTrusted);
+        } catch (e) {
+          console.warn('[wv2nas] Variant DNR install failed:', e);
+        }
+      }
+      try {
+        const variantResp = await fetch(variantUrl, {
+          credentials: variantTrusted ? 'include' : 'omit',
+          headers: variantTrusted ? fetchHeaders : {},
+          // Codex review (P1): same redirect gate as the master
+          // fetch. A trusted variant URL that 30x's to a foreign /
+          // private host would otherwise leak credentials and pull
+          // back arbitrary content for upload as manifest_text.
+          redirect: 'error',
+        });
+        if (!variantResp.ok) {
+          throw new Error(`HTTP ${variantResp.status}`);
+        }
+        // Codex review (P2): same size-capped streaming read as the
+        // master — variant URL might be on a different origin and
+        // could also be misdetected/hostile.
+        const variantText = await _wv2nasReadManifestText(
+          variantResp, _WV2NAS_MAX_MANIFEST_BYTES, `variant ${variantUrl}`,
+        );
+        return { manifest_text: variantText, base_url: variantUrl };
+      } catch (e) {
+        console.warn(
+          '[wv2nas] Variant fetch failed; submitting master text + URL:', e
+        );
+        // Fall through with master text — server's plan_from_text will
+        // try to fetch the variant itself; that may also fail but at
+        // least we surfaced the master.
+      }
+    }
+  }
+
+  return { manifest_text: text, base_url: url };
+}
+
+
+// Codex review: extend phase-1 DNR coverage to a variant URL whose
+// origin/path falls outside the master URL's filter. Reuses the same
+// per-job slot (id range [idBase, idBase+100)) — phase-1 used
+// idBase+0 (request) and idBase+50 (response). We use idBase+1 and
+// idBase+51 for the variant pair, leaving 48 free slots in the same
+// per-job range. Phase-2's removeRuleIds covers the full ruleIds
+// list, so the variant rules get cleaned up atomically with phase-1
+// when full segment coverage replaces them.
+async function _wv2nasInstallVariantDnrRule(variantUrl, dnrContext, trusted = false) {
+  const { referer, origin, userAgent, idBase, ruleIds } = dnrContext;
+  const variantIdBase = idBase + 1;
+  const variantRules = _wv2nasBuildDnrRules({
+    segmentUrls: [variantUrl],
+    // Codex adversarial-review: explicit trusted set. When the
+    // variant isn't same-site with master, neither header-spoof
+    // nor CORS-relax should emit — header leaks Referer signed
+    // tokens, CORS-relax lets the extension read response body
+    // cross-origin (exfiltration channel).
+    trustedSegmentUrls: trusted ? [variantUrl] : [],
+    referer,
+    origin,
+    userAgent,
+    idBase: variantIdBase,
+    initiatorDomain: chrome.runtime.id,
+  });
+  if (variantRules.length === 0) return;
+  const variantRuleIds = variantRules.map((r) => r.id);
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: variantRuleIds,
+    addRules: variantRules,
+  });
+  // Caller's `ruleIds` is the same array that the phase-2 swap will
+  // pass as removeRuleIds. Mutate in place so our IDs are part of
+  // that atomic remove-then-add.
+  ruleIds.push(...variantRuleIds);
+}
+
+// ---------------------------------------------------------------------------
+// Codex review #12: browser-job persistence for SW-restart resilience.
+//
+// MV3 service workers are evicted aggressively (after ~30s of inactivity)
+// and can be cold-started by the browser at any time. Without persistence:
+//   - Long downloads (multi-minute HLS/DASH) outlive the SW
+//   - The runBrowserSideJob in-memory promise dies with the SW
+//   - DNR session rules survive (browser-session-scoped) but nothing in
+//     this extension knows about them anymore
+//   - Server-side staging stays allocated; only the worker's startup
+//     stale reaper eventually cleans it up (6h)
+//
+// Fix: persist {jobId, ruleIds, dnrSlot, startedAt, ...} to
+// chrome.storage.local at every meaningful transition. On SW boot,
+// `_wv2nasRecoverStaleBrowserJobs` walks persisted entries; any older
+// than the watchdog threshold is treated as orphaned and cleaned up
+// (DNR remove + abort POST + slot release + entry delete).
+// ---------------------------------------------------------------------------
+
+const _BROWSER_JOB_PERSIST_KEY = 'wv2nasBrowserJobs';
+// Codex review #16: jobs are only reaped if their last liveness signal
+// is older than this. With heartbeats from offscreen at 10s cadence,
+// a 5-minute miss is a strong "offscreen is dead" signal. The previous
+// design used `startedAt` age alone (1h) as the liveness signal — which
+// destroyed legitimate long downloads (slow 4-hour movies) where the
+// SW restarted past 1h while offscreen was still actively uploading.
+const _BROWSER_JOB_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
+// Fallback for jobs that NEVER heartbeated (legacy persisted entries
+// from before this fix, or jobs whose offscreen died before sending
+// the first heartbeat). 1h is long enough that a normal start-of-job
+// stall doesn't trip it.
+const _BROWSER_JOB_STALE_MS = 60 * 60 * 1000;
+
+async function _wv2nasReadPersistedBrowserJobs() {
+  try {
+    const cur = await chrome.storage.local.get(_BROWSER_JOB_PERSIST_KEY);
+    return cur[_BROWSER_JOB_PERSIST_KEY] || {};
+  } catch (e) {
+    console.warn('[wv2nas] read persisted browser jobs failed:', e);
+    return {};
+  }
+}
+
+async function _wv2nasWritePersistedBrowserJobs(jobs) {
+  try {
+    await chrome.storage.local.set({ [_BROWSER_JOB_PERSIST_KEY]: jobs });
+  } catch (e) {
+    console.warn('[wv2nas] write persisted browser jobs failed:', e);
+  }
+}
+
+// Codex adversarial-review: persistence is a whole-object R-M-W on a
+// single chrome.storage.local key. Two concurrent jobs (or one job's
+// heartbeat racing another job's state transition) can each read the
+// same snapshot, then each write back a different object — losing the
+// other's entry. If the SW restarts after a lost entry, recovery
+// can't remove the dropped job's DNR rules or abort its server-side
+// staging, which defeats the whole restart-safety mechanism.
+//
+// Fix: serialize all MUTATIONS through a chained promise. Reads stay
+// unsynchronized — they observe whatever state is committed at the
+// time, which is fine because the only consumer (recovery sweep)
+// resolves any ambiguity by deleting per-job through the serialized
+// unpersist path. What we cannot allow is two writers concurrently
+// overwriting the whole map.
+let _wv2nasPersistMutex = Promise.resolve();
+
+function _wv2nasWithPersistLock(fn) {
+  // Chain after any in-flight work; failures don't poison subsequent
+  // callers (each branch falls through to fn()).
+  const next = _wv2nasPersistMutex.then(fn, fn);
+  _wv2nasPersistMutex = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+async function _wv2nasPersistBrowserJob(jobId, data) {
+  return _wv2nasWithPersistLock(async () => {
+    const jobs = await _wv2nasReadPersistedBrowserJobs();
+    jobs[jobId] = { ...(jobs[jobId] || {}), ...data, jobId };
+    await _wv2nasWritePersistedBrowserJobs(jobs);
+  });
+}
+
+async function _wv2nasPersistBrowserJobHeartbeat(jobId, ts) {
+  return _wv2nasWithPersistLock(async () => {
+    const jobs = await _wv2nasReadPersistedBrowserJobs();
+    if (!jobs[jobId]) return false;
+    jobs[jobId] = {
+      ...jobs[jobId],
+      jobId,
+      lastHeartbeat: Number(ts) || Date.now(),
+    };
+    await _wv2nasWritePersistedBrowserJobs(jobs);
+    return true;
+  });
+}
+
+async function _wv2nasUnpersistBrowserJob(jobId) {
+  return _wv2nasWithPersistLock(async () => {
+    const jobs = await _wv2nasReadPersistedBrowserJobs();
+    if (jobs[jobId]) {
+      delete jobs[jobId];
+      await _wv2nasWritePersistedBrowserJobs(jobs);
+    }
+  });
+}
+
+async function _wv2nasPersistAbortRetry(jobId, reason, { dnrCleaned = false } = {}) {
+  const patch = {
+    abortPending: true,
+    abortReason: (reason || 'Browser-side job failed before finalize').slice(0, 500),
+    abortRequestedAt: Date.now(),
+    // The offscreen job is done; do not let a recent heartbeat make boot
+    // recovery preserve this entry as alive instead of retrying abort.
+    lastHeartbeat: 0,
+  };
+  if (dnrCleaned) {
+    // DNR rules were already removed and the slot may be reused. Keeping
+    // old rule ids would let a later abort retry remove a new job's rules.
+    patch.ruleIds = [];
+    patch.dnrSlot = null;
+  }
+  await _wv2nasPersistBrowserJob(jobId, patch);
+}
+
+// Codex review #15: durable completion handler. Registered at SW
+// boot (via the top-level chrome.runtime.onMessage at the bottom of
+// this file), this handles BROWSER_JOB_DONE / BROWSER_JOB_FAILED
+// messages for ANY persisted job — including ones whose
+// per-runBrowserSideJob in-memory listener died with a previous SW
+// instance. Without this, an offscreen completion that arrives after
+// a SW restart was silently dropped, leaving DNR rules + slot
+// reservations + persisted entries to leak indefinitely (until the
+// 1h boot watchdog noticed).
+//
+// Coordination with the per-job in-memory listener: in the SW-alive
+// case both fire. All cleanup operations are idempotent (DNR remove
+// of already-removed IDs is a no-op; Set.delete of missing slot is
+// a no-op; chrome.storage.local entry already missing is a no-op).
+// Worst case: cleanup runs twice. Cheap.
+async function _wv2nasHandleDurableCompletion(msg) {
+  const jobId = msg && msg.payload && msg.payload.jobId;
+  if (!jobId) return;
+  // Codex review #19a: block until the SW-boot recovery finishes
+  // populating `_wv2nasActiveBrowserJobs` so the offscreen-close
+  // decision below sees ALL alive jobs, not just the one we're
+  // completing now. Without this, a second concurrent job that's
+  // still mid-download can be silently torn down because its
+  // recovery hasn't run yet.
+  await _wv2nasInitRecovery();
+  const jobs = await _wv2nasReadPersistedBrowserJobs();
+  const data = jobs[jobId];
+  if (!data) {
+    // In-memory listener already cleaned up (normal path) — nothing
+    // to do. Or the job_id is bogus; either way safe to ignore.
+    return;
+  }
+
+  let dnrCleanupOk = true;
+  if (Array.isArray(data.ruleIds) && data.ruleIds.length > 0) {
+    try {
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: data.ruleIds,
+      });
+    } catch (e) {
+      dnrCleanupOk = false;
+      console.warn(`[wv2nas] durable DNR cleanup for ${jobId} failed:`, e);
+    }
+  }
+
+  if (typeof data.dnrSlot === 'number' && dnrCleanupOk) {
+    _wv2nasUsedDnrSlots.delete(data.dnrSlot);
+  }
+  _wv2nasActiveBrowserJobs.delete(jobId);
+
+  if (_wv2nasActiveBrowserJobs.size === 0) {
+    await _closeOffscreenDocument();
+  }
+
+  // For FAILED with no finalize attempt, tell the server to clean
+  // staging. (For DONE, server already received finalize and cleanup
+  // happens worker-side; for FAILED-after-finalize-attempt, the
+  // server may have committed already — Codex #4.)
+  const userCancelled = !!(msg.payload && msg.payload.userCancelled);
+  const needsAbort = msg.type === 'BROWSER_JOB_FAILED'
+    && !msg.payload.finalizeAttempted
+    && !userCancelled
+    && data.nasEndpoint && data.apiKey;
+  if (needsAbort) {
+    const reason = msg.payload.error || 'Durable handler abort';
+    await _wv2nasPersistAbortRetry(jobId, reason, { dnrCleaned: dnrCleanupOk });
+    const abortOk = await _wv2nasAbortBrowserJob(
+      data.nasEndpoint, data.apiKey, jobId, reason,
+    );
+    if (abortOk) {
+      await _wv2nasUnpersistBrowserJob(jobId);
+    }
+  } else {
+    await _wv2nasUnpersistBrowserJob(jobId);
+  }
+}
+
+
+// Codex review #19a: gate durable completion handling on recovery
+// finishing first.
+//
+// At SW boot, two things race:
+//   1. _wv2nasRecoverStaleBrowserJobs walks chrome.storage.local and
+//      repopulates the in-memory `_wv2nasActiveBrowserJobs` map with
+//      survivor jobs (so the offscreen-close decision can see them).
+//   2. The runtime.onMessage listener immediately starts handling
+//      BROWSER_JOB_DONE / BROWSER_JOB_FAILED via the durable handler.
+//
+// If a completion message lands BEFORE recovery has populated the
+// map, the durable handler sees `_wv2nasActiveBrowserJobs.size === 0`
+// and closes the offscreen document — even though OTHER recovered
+// jobs are about to be added to the map and are still actively
+// downloading via the same offscreen. The torn-down jobs then get
+// reaped by the watchdog hours later.
+//
+// Fix: capture the recovery promise once at SW boot and have the
+// durable handler `await` it before reading the map. The promise's
+// catch() converts errors to resolutions so a failed recovery
+// doesn't deadlock subsequent completions.
+let _wv2nasRecoveryComplete = null;
+
+function _wv2nasInitRecovery() {
+  if (_wv2nasRecoveryComplete === null) {
+    _wv2nasRecoveryComplete = _wv2nasRecoverStaleBrowserJobs().catch((e) => {
+      console.warn('[wv2nas] stale browser-job recovery at SW boot failed:', e);
+    });
+  }
+  return _wv2nasRecoveryComplete;
+}
+
+
+// Top-level call (runs on every SW boot, including cold-starts after
+// MV3 eviction). Reads persisted jobs, recovers anything stranded.
+async function _wv2nasRecoverStaleBrowserJobs() {
+  const jobs = await _wv2nasReadPersistedBrowserJobs();
+  const now = Date.now();
+  // Codex adversarial-review: track stale job ids and delete per-job
+  // through the serialized unpersist path. The previous version wrote
+  // a `survivors` map back wholesale, which raced with concurrent
+  // heartbeat/persist calls (possible during boot if a queued
+  // BROWSER_JOB_DONE/FAILED message wakes the SW alongside this
+  // sweep) and dropped their entries.
+  const staleJobIds = [];
+  let recovered = 0;
+
+  for (const [jobId, data] of Object.entries(jobs)) {
+    const startedAt = Number(data.startedAt) || 0;
+    const lastHeartbeat = Number(data.lastHeartbeat) || 0;
+    const now2 = now;  // local alias for clarity below
+
+    // Codex review #16: prefer heartbeat-based liveness when available.
+    // A job that's actively heartbeating is alive regardless of how
+    // old startedAt is. Without this, legitimate slow downloads
+    // (multi-hour 4K movies) get reaped after 1h while still uploading.
+    const abortPending = data.abortPending === true;
+    let isAlive;
+    if (abortPending) {
+      isAlive = false;
+    } else if (lastHeartbeat > 0) {
+      isAlive = (now2 - lastHeartbeat) < _BROWSER_JOB_HEARTBEAT_TIMEOUT_MS;
+    } else {
+      // No heartbeat yet — either pre-fix legacy entry or offscreen
+      // died before sending one. Fall back to startedAt age.
+      isAlive = (now2 - startedAt) < _BROWSER_JOB_STALE_MS;
+    }
+    const age = now - startedAt;
+
+    if (isAlive) {
+      // Recent job — could still be in-flight on offscreen. Leave it
+      // for the in-memory listener (or a later boot) to handle.
+      // Note: if SW restart happened, the in-memory listener is gone;
+      // the next boot's stale-recovery sweep catches it eventually.
+      // Codex review #14: SW restart leaves _wv2nasUsedDnrSlots empty.
+      // If we don't re-reserve the survivor's slot, a brand-new job
+      // can allocate the SAME slot — its updateSessionRules call would
+      // overwrite the in-flight survivor's DNR rules, breaking the
+      // running download. Restore the reservation so allocation
+      // skips this slot. Same with the active-jobs map for offscreen
+      // ref-counting.
+      if (typeof data.dnrSlot === 'number') {
+        _wv2nasUsedDnrSlots.add(data.dnrSlot);
+      }
+      _wv2nasActiveBrowserJobs.set(jobId, {
+        dnrSlot: data.dnrSlot,
+        ruleIds: Array.isArray(data.ruleIds) ? data.ruleIds : [],
+      });
+      continue;
+    }
+
+    recovered += 1;
+    console.warn(
+      `[wv2nas] recovering stale browser job ${jobId} (age ${Math.round(age / 60000)}min)`
+    );
+
+    // Remove DNR rules (idempotent — stale IDs are silently skipped).
+    let dnrCleanupOk = true;
+    if (Array.isArray(data.ruleIds) && data.ruleIds.length > 0) {
+      try {
+        await chrome.declarativeNetRequest.updateSessionRules({
+          removeRuleIds: data.ruleIds,
+        });
+      } catch (e) {
+        dnrCleanupOk = false;
+        console.warn(`[wv2nas] DNR cleanup for stale ${jobId} failed:`, e);
+      }
+    }
+
+    // Abort the server-side job + wipe staging.
+    let abortOk = true;
+    if (data.nasEndpoint && data.apiKey) {
+      abortOk = await _wv2nasAbortBrowserJob(
+        data.nasEndpoint, data.apiKey, jobId,
+        data.abortReason || 'Stale browser job recovered at SW boot',
+      );
+    }
+
+    // Release the slot so the next boot doesn't see it as taken.
+    if (typeof data.dnrSlot === 'number' && dnrCleanupOk) {
+      _wv2nasUsedDnrSlots.delete(data.dnrSlot);
+    }
+    if (abortOk) {
+      staleJobIds.push(jobId);
+    } else {
+      await _wv2nasPersistAbortRetry(
+        jobId,
+        data.abortReason || 'Stale browser job recovered at SW boot',
+        { dnrCleaned: dnrCleanupOk },
+      );
+    }
+  }
+
+  // Per-job deletion through the mutex — survivors and any concurrently
+  // added entries (e.g. a heartbeat that arrived during the sweep)
+  // are preserved. Each unpersist re-reads the latest state under the
+  // lock, so we never accidentally resurrect an entry that was being
+  // added concurrently.
+  for (const jobId of staleJobIds) {
+    await _wv2nasUnpersistBrowserJob(jobId);
+  }
+  if (recovered > 0) {
+    console.warn(`[wv2nas] recovered ${recovered} stale browser job(s) at SW boot`);
+  }
+}
+
+// Best-effort abort helper. Tells the NAS to mark the job failed +
+// wipe its staging dir (Codex review #3). Returns true only when the
+// caller can safely forget its persisted abort-retry state.
+async function _wv2nasAbortBrowserJob(nasEndpoint, apiKey, jobId, reason) {
+  try {
+    const resp = await fetch(`${nasEndpoint}/api/jobs/${encodeURIComponent(jobId)}/abort`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ reason: (reason || '').slice(0, 500) }),
+    });
+    if (!resp.ok) {
+      console.warn(`[wv2nas] abort ${jobId} returned ${resp.status}`);
+      return resp.status === 404;
+    }
+    return true;
+  } catch (e) {
+    console.warn(`[wv2nas] abort ${jobId} request failed:`, e);
+    return false;
+  }
+}
+
+async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, pageUrl, formatHint }) {
+  // Codex adversarial-review: SW cold-start kicks off
+  // `_wv2nasInitRecovery()` which re-reserves DNR slots for surviving
+  // offscreen jobs (and re-populates `_wv2nasUsedDnrSlots`). That
+  // recovery is async — if a new browser-side download fires before
+  // it finishes, `_wv2nasAllocateDnrSlot()` reads an empty
+  // `_wv2nasUsedDnrSlots` and reuses a slot that the survivor still
+  // owns. The subsequent `updateSessionRules` call then removes /
+  // overwrites the survivor's DNR rules and the in-flight download
+  // breaks. Waiting for recovery is cheap (single boot pass) and
+  // closes the race deterministically.
+  await _wv2nasInitRecovery();
+
+  // Codex review #8: header context for both DNR phases is computed
+  // up-front so the manifest fetch can also benefit from the player's
+  // captured Referer/Origin/UA. Without this, sites that gate the
+  // manifest itself on header checks return 403 to the browser fetch,
+  // and we fall back to URL-only init where NAS also can't reach the
+  // protected URL — defeating browser-side mode for a core target case.
+  const referer = requestBody.referer || pageUrl;
+  let originValue = null;
+  try { originValue = referer ? new URL(referer).origin : null; } catch (_) {}
+  const userAgent = (requestBody.headers && (requestBody.headers['User-Agent'] || requestBody.headers['user-agent'])) || null;
+
+  // Allocate a per-job DNR slot UP-FRONT (before init, before manifest
+  // fetch) so we can install header-spoof rules that cover the manifest
+  // URL itself. The same slot is reused for the post-init segment+key
+  // rules, so there's no double-allocation cost.
+  const dnrSlot = _wv2nasAllocateDnrSlot();
+  const idBase = _BROWSER_DNR_BASE_ID + dnrSlot * _BROWSER_DNR_PER_JOB_RANGE;
+
+  let ruleIds = [];
+  let jobId = null;
+  // Codex review #3: track whether the happy path completed. Anything
+  // less means the server has a half-staged job + partial files, which
+  // the abort endpoint cleans up.
+  let completionSucceeded = false;
+  let abortReason = null;
+  // Codex review #4: track whether finalize was attempted. After the
+  // finalize POST leaves the wire, the server may have committed the
+  // queue push regardless of what the client sees; calling abort then
+  // would destroy a queued job's staged segments. Only safe to abort
+  // when both completion failed AND finalize was never attempted.
+  let finalizeAttempted = false;
+  let userCancelled = false;
+
+  try {
+    // Codex adversarial-review (high): determine whether the master
+    // URL is same-site with the page that surfaced it. We use this
+    // both to gate the browser-side manifest fetch (handled inside
+    // _wv2nasFetchManifestInBrowser) and to scope phase-1 DNR rules.
+    // Without explicit `trustedSegmentUrls`, _wv2nasBuildDnrRules
+    // defaults to all-trusted and emits CORS-relax rules — which
+    // would let the extension read a cross-origin response (e.g.
+    // an internal split-horizon host) cross-origin and post it as
+    // manifest_text to the NAS. Pass an explicit empty trusted set
+    // for untrusted hosts so neither header-spoof nor CORS-relax
+    // emits.
+    const masterTrustAnchor = pageUrl || (requestBody && requestBody.source_page) || null;
+    const masterTrustedForDnr = masterTrustAnchor
+      ? _wv2nasIsTrustedDnrUrl(requestBody.url, masterTrustAnchor)
+      : false;
+
+    // === Phase 1 DNR: cover the manifest URL ===
+    // Codex review #8: install header-spoof rules for the manifest URL
+    // BEFORE _wv2nasFetchManifestInBrowser runs. Sites that 403 on a
+    // bare fetch will see Referer/Origin/UA matching what the player
+    // sent and serve the manifest the same way.
+    const phase1Rules = _wv2nasBuildDnrRules({
+      segmentUrls: [requestBody.url],
+      // Codex adversarial-review: explicit trusted set — empty when
+      // the master URL isn't same-site with the page so CORS-relax
+      // doesn't fire on an unvalidated host.
+      trustedSegmentUrls: masterTrustedForDnr ? [requestBody.url] : [],
+      referer, origin: originValue, userAgent, idBase,
+      initiatorDomain: chrome.runtime.id,
+    });
+    if (phase1Rules.length > 0) {
+      const phase1Ids = phase1Rules.map((r) => r.id);
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: phase1Ids,
+        addRules: phase1Rules,
+      });
+      ruleIds = phase1Ids;
+    }
+
+    // Now fetch the manifest with DNR rules active.
+    // Codex review: pass the dnrContext so the helper can (1) extend
+    // DNR coverage to the variant URL when an HLS master resolves to
+    // a variant on a different directory/origin, and (2) ride captured
+    // auth headers (Authorization / X-* tokens) along with the fetch.
+    // Without (1), variant fetches lack spoofed Referer/Origin/UA and
+    // 403. Without (2), header-token-gated manifests 401 before init.
+    const browserFetched = await _wv2nasFetchManifestInBrowser(
+      requestBody.url,
+      {
+        referer,
+        origin: originValue,
+        userAgent,
+        idBase,
+        ruleIds,
+        headers: requestBody.headers,
+        // Codex adversarial-review: anchor for the same-site safety
+        // check inside _wv2nasIsManifestUrlSafeForBrowser. The
+        // master URL must be same-site with the page that surfaced
+        // it, otherwise we fall through to NAS-side planning where
+        // _safe_fetch's resolve+public-IP guard runs.
+        pageUrl: pageUrl || requestBody.source_page || null,
+      },
+    );
+    if (browserFetched && browserFetched.safetyRejected) {
+      throw new Error(
+        `Browser-side manifest fetch refused: ${browserFetched.reason || 'unsafe URL'}`
+      );
+    }
+    const initPayload = {
+      title: requestBody.title,
+      referer: requestBody.referer,
+      headers: requestBody.headers,
+      source_page: requestBody.source_page,
+      output_subdir: requestBody.output_subdir,
+      container_hint: formatHint,
+    };
+    if (browserFetched) {
+      initPayload.manifest_text = browserFetched.manifest_text;
+      initPayload.base_url = browserFetched.base_url;
+      // base_url already pinpoints the variant; don't also send url to
+      // avoid the server running a redundant fetch path.
+    } else {
+      initPayload.url = requestBody.url;
+    }
+
+    const initResp = await fetch(`${nasEndpoint}/api/jobs/init`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(initPayload),
+    });
+    if (!initResp.ok) {
+      const errJson = await initResp.json().catch(() => ({}));
+      const detail = formatApiErrorDetail(errJson, initResp.status);
+      const initErr = new Error(`Init failed: ${detail}`);
+      // Codex adversarial-review (high): only 404 is a clear
+      // compatibility issue (the /api/jobs/init endpoint doesn't
+      // exist on a legacy NAS that hasn't been upgraded to v2.5).
+      //
+      // Other 4xx — especially 422 — are SAFETY rejections that
+      // MUST fail closed:
+      //   * 422: HTTPS-required gate, non-public host (localhost /
+      //     RFC 1918 / metadata IP). Falling back to /api/download
+      //     would let the NAS worker fetch the rejected URL
+      //     server-side. /api/download only enforces
+      //     `_enforce_ssrf_guard` when SSRF_GUARD env is set
+      //     (default off in shipped configs), so the fallback
+      //     re-opens the exact intranet/metadata access this gate
+      //     was designed to block.
+      //   * 401/403: bad API key — NAS-direct uses the same key,
+      //     fallback achieves nothing.
+      //   * 400: malformed payload — fallback won't fix a client bug.
+      //   * 429: rate limit — same NAS, same limit.
+      // Keeping these terminal preserves the fail-closed boundary;
+      // users running legitimate HTTP-only streams can disable the
+      // browser-side mode option to use NAS-direct explicitly.
+      if (initResp.status === 404) {
+        initErr.fallbackable = true;
+      }
+      throw initErr;
+    }
+    const initJson = await initResp.json();
+    jobId = initJson.job_id;
+    const plan = initJson.plan;
+
+    // Register active job BEFORE further side effects so the offscreen
+    // ref-count guard sees this job in the map.
+    _wv2nasActiveBrowserJobs.set(jobId, { dnrSlot, ruleIds });
+
+    // Codex review #12: persist to chrome.storage.local so a SW
+    // restart (MV3 evicts SWs aggressively) doesn't strand DNR rules
+    // and server-side staging. The boot-time watchdog
+    // _wv2nasRecoverStaleBrowserJobs walks this storage on every SW
+    // init and aborts/cleans any job older than _BROWSER_JOB_STALE_MS.
+    await _wv2nasPersistBrowserJob(jobId, {
+      ruleIds, dnrSlot, startedAt: Date.now(),
+      nasEndpoint, apiKey,
+    });
+
+    // === Phase 2 DNR: replace with full segment + key URI coverage ===
+    // We've already used the slot for manifest rules; replace those
+    // with the segment / init / AES-key URIs from the plan. Same slot
+    // and same idBase, so updateSessionRules(removeRuleIds: ALL old IDs
+    // + new IDs) cleans up phase 1 in one round trip.
+    //
+    // Codex review #10: filter URLs by trust to feed the new
+    // trustedSegmentUrls parameter. CORS-relax only applies to URLs
+    // sharing the manifest's registrable-domain. Foreign origins still
+    // get header-spoof rules (hotlink protection) but their responses
+    // come back opaque — unread by the extension, can't be exfil'd.
+    const segmentUrls = _wv2nasPlanSegmentUrls(plan);
+    const trustedBaseForDnr = plan.selected_variant_url || plan.source_url || requestBody.url;
+    const trustedSegmentUrls = segmentUrls.filter(
+      (u) => _wv2nasIsTrustedDnrUrl(u, trustedBaseForDnr)
+    );
+    const rules = _wv2nasBuildDnrRules({
+      segmentUrls,
+      trustedSegmentUrls,
+      referer, origin: originValue, userAgent, idBase,
+      initiatorDomain: chrome.runtime.id,
+    });
+    const newIds = rules.map((r) => r.id);
+    if (rules.length > 0) {
+      // removeRuleIds must include both the OLD phase 1 IDs (from
+      // ruleIds) and the new IDs we're about to add — DNR semantics
+      // for updateSessionRules first applies removes then adds, so
+      // including new IDs in removes is a defensive idempotent action.
+      const idsToRemove = Array.from(new Set([...ruleIds, ...newIds]));
+      // Persist the cleanup superset BEFORE the DNR mutation. If the
+      // MV3 service worker is killed after updateSessionRules succeeds
+      // but before the post-update persist, the boot watchdog still has
+      // every rule ID it must remove.
+      await _wv2nasPersistBrowserJob(jobId, { ruleIds: idsToRemove });
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: idsToRemove,
+        addRules: rules,
+      });
+    } else if (ruleIds.length > 0) {
+      // No phase 2 rules but we have phase 1 rules from earlier;
+      // remove them — manifest-only fetch is done.
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: ruleIds,
+      });
+    }
+    ruleIds = newIds;
+    _wv2nasActiveBrowserJobs.get(jobId).ruleIds = ruleIds;
+    // Codex review #12: keep persisted ruleIds in sync so the boot
+    // watchdog removes the LATEST rule set (not the phase-1 stub).
+    await _wv2nasPersistBrowserJob(jobId, { ruleIds });
+
+    // 3) Ensure offscreen exists. Idempotent — reuses existing doc when
+    // another concurrent job already opened it.
+    await _ensureOffscreenDocument();
+
+    const completion = new Promise((resolve, reject) => {
+      function onMessage(msg) {
+        if (!msg || msg.target !== 'service-worker') return;
+        if (msg.payload && msg.payload.jobId !== jobId) return;
+        if (msg.type === 'BROWSER_JOB_DONE') {
+          chrome.runtime.onMessage.removeListener(onMessage);
+          resolve(msg.payload.summary || {});
+        } else if (msg.type === 'BROWSER_JOB_FAILED') {
+          chrome.runtime.onMessage.removeListener(onMessage);
+          // Codex review #4: surface finalizeAttempted so the abort
+          // decision in the catch block can skip cleanup whenever the
+          // failure happened at-or-after the finalize commit boundary.
+          const e = new Error(msg.payload.error || 'browser job failed');
+          e.finalizeAttempted = !!msg.payload.finalizeAttempted;
+          e.userCancelled = !!msg.payload.userCancelled;
+          reject(e);
+        }
+      }
+      chrome.runtime.onMessage.addListener(onMessage);
+    });
+
+    // Strip headers fetch() refuses to set before handing captured
+    // auth/custom headers to the offscreen document. DNR owns
+    // Referer/Origin/UA spoofing; credentials:'include' owns Cookie.
+    const requestHeaders = _wv2nasFilterFetchHeaders(requestBody.headers || {});
+
+    // Codex adversarial-review (high): offscreen.js's listener replies
+    // {ok: true} synchronously on accept (and {ok: false, error: ...}
+    // for "job already running"). If sendMessage throws ("Could not
+    // establish connection") OR returns a non-ack response, the
+    // offscreen runtime is broken — surface as a job error rather than
+    // silently waiting forever on `completion`. The READY handshake
+    // above SHOULD have prevented the connection-loss case; this is
+    // belt-and-braces.
+    const ack = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      type: 'START_BROWSER_JOB',
+      payload: {
+        jobId,
+        nasEndpoint,
+        apiKey,
+        plan,
+        requestHeaders,
+      },
+    });
+    if (!ack || ack.ok !== true) {
+      const reason = (ack && ack.error) || 'no ack from offscreen';
+      throw new Error(`offscreen rejected START_BROWSER_JOB: ${reason}`);
+    }
+
+    const summary = await completion;
+    completionSucceeded = true;
+    if (userSettings.showNotifications) {
+      showNotification(
+        'Browser-side download complete',
+        `"${title}" — ${summary.totalSegments || '?'} segments staged. Worker is muxing.`
+      );
+    }
+    storeJob({ id: jobId, url: requestBody.url, title, status: 'processing', progress: 50, mode: 'browser' });
+  } catch (err) {
+    abortReason = String(err && err.message || err);
+    // err.finalizeAttempted is set by segmentDownloader.runJob and
+    // propagated through offscreen → BROWSER_JOB_FAILED message →
+    // completion promise reject.
+    finalizeAttempted = !!(err && err.finalizeAttempted);
+    userCancelled = !!(err && err.userCancelled);
+    throw err;
+  } finally {
+    // Cleanup order: remove this job's rules → release slot → unregister
+    // job → close offscreen ONLY IF this was the last active job.
+    //
+    // Codex review #8: jobId may be null (init failed before /jobs/init
+    // returned a job_id, or _wv2nasFetchManifestInBrowser failed). The
+    // DNR slot was allocated up-front so it always needs releasing;
+    // ruleIds may have phase-1 (manifest URL) rules even without jobId.
+    let dnrCleanupOk = true;
+    if (ruleIds.length > 0) {
+      try {
+        await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: ruleIds });
+      } catch (e) {
+        dnrCleanupOk = false;
+        console.warn('[wv2nas] DNR cleanup failed:', e);
+      }
+    }
+    if (dnrCleanupOk) {
+      _wv2nasReleaseDnrSlot(dnrSlot);
+    }
+    if (jobId) {
+      _wv2nasActiveBrowserJobs.delete(jobId);
+    }
+    if (_wv2nasActiveBrowserJobs.size === 0) {
+      // Last active job — safe to free the offscreen document. If another
+      // job arrived between our delete() and this check (not possible from
+      // the SW's single-threaded message loop, but being explicit), the
+      // ref-count check still holds because that job would have called
+      // _ensureOffscreenDocument by now.
+      await _closeOffscreenDocument();
+    }
+    // Codex review #3+#4+#8: tell the server to mark the job failed and
+    // wipe its staging dir ONLY when:
+    //   1. We have a jobId (init succeeded — server has staging),
+    //   2. Completion did not succeed,
+    //   3. Finalize was never attempted (post-finalize failures may
+    //      have already committed server-side; abort would destroy
+    //      a queued job's staged segments),
+    //   4. The failure was not produced by an accepted user cancel
+    //      (DELETE owns that state transition and staging cleanup).
+    if (jobId && !completionSucceeded && !finalizeAttempted && !userCancelled) {
+      await _wv2nasPersistAbortRetry(jobId, abortReason, { dnrCleaned: dnrCleanupOk });
+      const abortOk = await _wv2nasAbortBrowserJob(nasEndpoint, apiKey, jobId, abortReason);
+      if (abortOk) {
+        await _wv2nasUnpersistBrowserJob(jobId);
+      }
+    } else if (jobId) {
+      // Codex review #12: remove from chrome.storage so the boot
+      // watchdog doesn't double-clean a job that already finished
+      // normally. unpersist is idempotent (no-op if entry missing).
+      await _wv2nasUnpersistBrowserJob(jobId);
+    }
+  }
+}
+
 console.log('WebVideo2NAS background service worker loaded');
+
+// Codex review #12: run the stale-job watchdog at SW boot so MV3
+// evictions don't permanently strand server staging + DNR rules.
+// Codex review #19a: kicks off the shared recovery promise that the
+// durable completion handler awaits, so a DONE/FAILED message at boot
+// can't tear down the offscreen document before recovery has
+// repopulated _wv2nasActiveBrowserJobs.
+_wv2nasInitRecovery();
+
+// Codex review #15: durable completion listener. Registered at
+// top-level so it survives SW restarts and handles
+// BROWSER_JOB_DONE/FAILED for jobs whose per-call in-memory listener
+// is gone. Coexists with the per-job listener registered inside
+// runBrowserSideJob — all cleanup ops are idempotent so double-fire
+// in the SW-alive case is safe.
+chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
+  if (!msg || msg.target !== 'service-worker') return false;
+  if (msg.type === 'BROWSER_JOB_DONE' || msg.type === 'BROWSER_JOB_FAILED') {
+    _wv2nasHandleDurableCompletion(msg).catch((e) => {
+      console.warn('[wv2nas] durable completion handler failed:', e);
+    });
+  } else if (msg.type === 'BROWSER_JOB_HEARTBEAT') {
+    // Codex review #16: persist the heartbeat so the next SW-boot
+    // watchdog can use it as liveness signal. Fire-and-forget — a
+    // missed heartbeat write isn't fatal (next one will land).
+    const jobId = msg.payload && msg.payload.jobId;
+    if (jobId) {
+      // Only refresh known persisted jobs. A DONE/FAILED cleanup can race
+      // with a queued heartbeat from the offscreen document; recreating the
+      // deleted entry would make the next SW boot recover a phantom job.
+      _wv2nasPersistBrowserJobHeartbeat(
+        jobId,
+        msg.payload && msg.payload.ts,
+      ).catch(() => {});
+    }
+  } else if (msg.type === 'OFFSCREEN_READY') {
+    // Codex adversarial-review (high): offscreen.js sends this once its
+    // chrome.runtime.onMessage listener is registered. Resolves the
+    // gate _ensureOffscreenDocument() awaits, so START_BROWSER_JOB is
+    // never posted before the listener exists.
+    _markOffscreenReady();
+  }
+  return false;
+});

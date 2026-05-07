@@ -3,12 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { loadScriptIntoContext } from './helpers/load-script.js';
 
 function makeChromeStub() {
+  const onMessageListeners = [];
   return {
     runtime: {
       sendMessage: () => {},
       lastError: null,
       onInstalled: { addListener: () => {} },
-      onMessage: { addListener: () => {} },
+      onMessage: { addListener: (fn) => onMessageListeners.push(fn) },
+      __onMessageListeners: onMessageListeners,
       openOptionsPage: () => {},
       getManifest: () => ({ version: '0.0.0' }),
     },
@@ -38,7 +40,7 @@ function makeChromeStub() {
       onUpdated: { addListener: () => {} },
       onActivated: { addListener: () => {} },
       query: (_q, cb) => cb([]),
-      get: (_id, cb) => cb(null),
+      get: (_id, cb) => cb({ id: _id, url: 'https://page.example/watch' }),
     },
     webNavigation: {
       onCommitted: { addListener: () => {} },
@@ -333,5 +335,46 @@ describe('background.js pure helpers', () => {
     expect(ctx.getStoredPageTitle('https://cdn.example.com/v/episode-2.m3u8')).toBe('News · Top Story');
     // Unknown URL → null (caller falls back to whatever the message had)
     expect(ctx.getStoredPageTitle('https://cdn.example.com/v/unknown.m3u8')).toBe(null);
+  });
+
+  it('stores deepDetected messages separately from downloadable URLs', () => {
+    const chrome = makeChromeStub();
+    loadScriptIntoContext('background.js', {
+      chrome,
+    });
+    const listener = chrome.runtime.__onMessageListeners[0];
+    expect(listener).toBeDefined();
+
+    const responses = [];
+    listener({
+      action: 'deepDetected',
+      kind: 'manifest-text-no-url',
+      format: 'm3u8',
+      source: 'atob',
+      pageUrl: 'https://page.example/watch',
+      timestamp: Date.now(),
+    }, { tab: { id: 55 } }, (response) => responses.push(response));
+
+    expect(responses[0]).toEqual({ success: true });
+
+    let detectedResponse = null;
+    const keepAlive = listener({
+      action: 'getDetectedUrls',
+      tabId: 55,
+    }, {}, (response) => {
+      detectedResponse = response;
+    });
+
+    expect(keepAlive).toBe(true);
+    expect(detectedResponse.urls).toEqual([]);
+    expect(detectedResponse.deepHits).toEqual([
+      expect.objectContaining({
+        kind: 'manifest-text-no-url',
+        format: 'm3u8',
+        source: 'atob',
+        pageUrl: 'https://page.example/watch',
+        hitCount: 1,
+      }),
+    ]);
   });
 });

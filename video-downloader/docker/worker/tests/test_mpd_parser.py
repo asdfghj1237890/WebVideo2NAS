@@ -733,6 +733,48 @@ def test_download_init_segment_default_filename_unchanged(tmp_path):
     assert path == str(tmp_path / 'init.mp4')
 
 
+def test_download_init_segment_sends_byte_range(tmp_path):
+    import sys
+    from pathlib import Path
+    worker_dir = Path(__file__).resolve().parents[1]
+    if str(worker_dir) not in sys.path:
+        sys.path.insert(0, str(worker_dir))
+    from worker import DownloadWorker
+
+    init_bytes = b'\x00\x00\x00\x10ftyp' + b'\x00' * 8
+
+    class _RangeSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+
+            class _R:
+                status_code = 206
+                content = init_bytes
+
+                def raise_for_status(self):
+                    pass
+
+            return _R()
+
+    session = _RangeSession()
+    worker = DownloadWorker.__new__(DownloadWorker)
+    path = worker._download_init_segment(
+        'https://x.test/init.mp4',
+        headers={'Range': 'bytes=0-1'},
+        session=session,
+        temp_dir=str(tmp_path),
+        byte_range={"offset": 10, "length": len(init_bytes)},
+    )
+
+    assert path == str(tmp_path / 'init.mp4')
+    _, kwargs = session.calls[0]
+    assert kwargs["stream"] is True
+    assert kwargs["headers"]["Range"] == f"bytes=10-{10 + len(init_bytes) - 1}"
+
+
 def test_extract_all_mpd_urls_finds_baseurl_text():
     xml = """<?xml version="1.0"?>
     <MPD xmlns="urn:mpeg:dash:schema:mpd:2011">

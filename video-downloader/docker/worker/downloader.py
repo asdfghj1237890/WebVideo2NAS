@@ -944,7 +944,37 @@ class SegmentDownloader:
 
         return strategies
     
-    def _try_download_with_headers(self, url: str, headers: Dict, index: int) -> Optional[bytes]:
+    @staticmethod
+    def _byte_range_header(byte_range: Optional[Dict]) -> Optional[str]:
+        if not byte_range:
+            return None
+        try:
+            offset = int(byte_range["offset"])
+            length = int(byte_range["length"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"Invalid byte_range metadata: {byte_range!r}") from e
+        if offset < 0 or length <= 0:
+            raise ValueError(f"Invalid byte_range metadata: {byte_range!r}")
+        return f"bytes={offset}-{offset + length - 1}"
+
+    @classmethod
+    def _headers_for_byte_range(cls, headers: Dict, byte_range: Optional[Dict]) -> Dict:
+        out = dict(headers or {})
+        for name in list(out.keys()):
+            if isinstance(name, str) and name.lower() == "range":
+                out.pop(name, None)
+        range_header = cls._byte_range_header(byte_range)
+        if range_header:
+            out["Range"] = range_header
+        return out
+
+    def _try_download_with_headers(
+        self,
+        url: str,
+        headers: Dict,
+        index: int,
+        byte_range: Optional[Dict] = None,
+    ) -> Optional[bytes]:
         """
         Try downloading a segment with specific headers.
 
@@ -981,6 +1011,7 @@ class SegmentDownloader:
         host_overrides = get_host_headers_for(host)
         if host_overrides:
             headers = {**headers, **host_overrides}
+        headers = self._headers_for_byte_range(headers, byte_range)
 
         # Adaptive inter-segment pacing. acquire_pace_slot() atomically
         # reserves THIS caller's start time so concurrent same-host workers
@@ -1027,7 +1058,7 @@ class SegmentDownloader:
                     url,
                     headers=headers,
                     timeout=self.timeout,
-                    stream=False
+                    stream=bool(byte_range)
                 )
 
                 # Log response cookies for debugging
@@ -1037,9 +1068,25 @@ class SegmentDownloader:
                 if response.status_code == 474:
                     logger.debug(f"Segment {index} got 474 error with current headers")
                     return None
+                if byte_range and response.status_code != 206:
+                    logger.debug(
+                        f"Segment {index} byte-range request was not honored "
+                        f"(HTTP {response.status_code})"
+                    )
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return None
 
                 response.raise_for_status()
                 content = response.content
+                if byte_range and len(content) != int(byte_range["length"]):
+                    logger.debug(
+                        f"Segment {index} byte-range length mismatch: "
+                        f"got {len(content)}, expected {byte_range['length']}"
+                    )
+                    return None
 
                 # Early content-type based blocking detection
                 content_type = ""
@@ -1157,7 +1204,9 @@ class SegmentDownloader:
                 # the cached strategy is still correct — the host is throttled,
                 # not the Referer wrong — and the exception propagates to the
                 # outer retry+backoff without invalidating the cache.
-                content = self._try_download_with_headers(url, headers, index)
+                content = self._try_download_with_headers(
+                    url, headers, index, byte_range=segment.get("byte_range")
+                )
                 if content:
                     used_strategy = strategy['name']
                 else:
@@ -1202,7 +1251,9 @@ class SegmentDownloader:
                     if index == 0 and retry_count == 0:
                         logger.info(f"Trying strategy: {strategy['name']}")
                     
-                    content = self._try_download_with_headers(url, headers, index)
+                    content = self._try_download_with_headers(
+                        url, headers, index, byte_range=segment.get("byte_range")
+                    )
                     
                     if content:
                         used_strategy = strategy['name']
@@ -1589,4 +1640,3 @@ def download_segments(
     )
     
     return downloader.download_all(progress_callback)
-

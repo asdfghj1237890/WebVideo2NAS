@@ -68,6 +68,62 @@ def test_rate_limit_read_bucket_has_higher_limit(monkeypatch):
     assert api_main._RATE_LIMIT_MULTIPLIERS["read"] > api_main._RATE_LIMIT_MULTIPLIERS["write"]
 
 
+def test_rate_limit_upload_bucket_has_high_multiplier(monkeypatch):
+    """Codex review #7: each browser-side segment is a separate PUT,
+    fanned out 6-concurrent. Routing them through the standard write
+    bucket would self-throttle a deployment that legitimately set
+    RATE_LIMIT_PER_MINUTE for /api/download protection. Upload bucket
+    must allow at least ~100 PUTs per minute per RATE_LIMIT_PER_MINUTE
+    unit so a 200-segment job under RATE_LIMIT_PER_MINUTE=100 doesn't
+    self-fail."""
+    api_main = _reload_api_main(monkeypatch, RATE_LIMIT_PER_MINUTE="10")
+    multipliers = api_main._RATE_LIMIT_MULTIPLIERS
+    # Upload >> write (otherwise we'd self-throttle browser uploads).
+    assert multipliers["upload"] > multipliers["write"]
+    # Concretely: the upload bucket should easily absorb a multi-
+    # hundred-segment HLS playlist. 100x is the minimum Codex's
+    # recommendation envisioned.
+    assert multipliers["upload"] >= 100
+
+
+def test_upload_endpoints_use_upload_bucket(monkeypatch):
+    """Defense in depth: walk the FastAPI route table and confirm the
+    new browser-side upload endpoints declared verify_api_key_upload as
+    their auth dependency, not the standard verify_api_key (write
+    bucket). A regression that wires write bucket back in would re-open
+    the self-throttle hole on real deployments."""
+    api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+
+    upload_paths = ("/api/jobs/{job_id}/segments/{seq}",
+                    "/api/jobs/{job_id}/init")
+
+    found = {}
+    for route in api_main.app.routes:
+        if not hasattr(route, "path"):
+            continue
+        if route.path not in upload_paths:
+            continue
+        # The dependant graph carries the Depends(verify_api_key_upload)
+        # call. We just check that verify_api_key_upload is referenced
+        # somewhere in the dependant chain.
+        deps_str = str(route.dependant.dependencies if hasattr(route, "dependant") else [])
+        # FastAPI's Depends wraps the function; the function name shows
+        # up in the repr. Easier: walk the signature defaults.
+        sig = route.endpoint.__defaults__ or ()
+        # The Depends sentinel objects contain `dependency` attr.
+        for dep in sig:
+            if getattr(dep, "dependency", None) is api_main.verify_api_key_upload:
+                found.setdefault(route.path, set()).add("upload")
+            elif getattr(dep, "dependency", None) is api_main.verify_api_key:
+                found.setdefault(route.path, set()).add("write")
+
+    for path in upload_paths:
+        assert "upload" in found.get(path, set()), \
+            f"{path} not wired to verify_api_key_upload"
+        assert "write" not in found.get(path, set()), \
+            f"{path} still references verify_api_key (write bucket)"
+
+
 def test_output_subdir_normalizes_and_validates(monkeypatch):
     api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
 
