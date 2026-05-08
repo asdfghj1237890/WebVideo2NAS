@@ -2,7 +2,7 @@
 
 **English**: `README.md`
 
-> 透過 Chrome 擷取網頁影片（M3U8 / MP4）URL，一鍵送到 NAS，由 NAS 自動下載並轉成 MP4 保存。
+> 透過 Chrome 擷取網頁影片（M3U8 / MPD / MP4 / MOV）URL，一鍵送到 NAS；HLS/DASH 可走 browser-side 模式處理綁定瀏覽器 session 的串流。
 
 > [!IMPORTANT]
 > 本專案**不保證**所有影片都能下載。部分網站可能有 DRM、URL 失效、防盜連、IP 限制或隨時調整傳輸邏輯。
@@ -20,9 +20,9 @@
 
 ## Overview（概覽）
 整體流程很簡單：
-1. Chrome Extension 偵測到影片 URL（M3U8/MP4）
-2. 一鍵送到 NAS 的 API
-3. NAS 背後的 Worker 下載、合併（必要時用 FFmpeg）並放到 `/downloads/`（可在 profile 設定子資料夾）
+1. Chrome Extension 偵測到影片 URL（M3U8/MPD/MP4/MOV）
+2. 一鍵送到 NAS 的 API；HLS/DASH 可由瀏覽器端抓 segment 再上傳 staging
+3. NAS 背後的 Worker 下載或 mux（必要時用 FFmpeg）並放到 `/downloads/`（可在 profile 設定子資料夾）
 
 ## 📦 安裝（Installation）
 
@@ -71,7 +71,7 @@ curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/hea
 # → {"status":"healthy"}
 ```
 
-> 想鎖版本：`.env` 裡設 `IMAGE_TAG=2.3.9`（或任一 [release tag](https://github.com/asdfghj1237890/WebVideo2NAS/releases)；預設 `latest`）。
+> 想鎖版本：`.env` 裡設 `IMAGE_TAG=3.1.0`（或任一 [release tag](https://github.com/asdfghj1237890/WebVideo2NAS/releases)；預設 `latest`）。
 
 <details>
 <summary><strong>用 Synology Container Manager（DSM UI）取代 SSH</strong></summary>
@@ -168,4 +168,3 @@ Synology UI：在 Project 點 **Action → Pull**，再 **Restart**。
 
 ## 需要更完整的內容？
 - 英文完整版（含更多範例、進階設定與完整疑難排解）：請看 `README.md`
-

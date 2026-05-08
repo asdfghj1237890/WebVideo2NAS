@@ -8,7 +8,7 @@
 
 **Languages**: **English** (`README.md`) | **繁體中文** (`README.zh-TW.md`)
 
-> Seamlessly capture web video URLs (M3U8 and MP4) from Chrome and download them to your NAS — even when sites disguise streams with non-standard URLs
+> Seamlessly capture web video URLs (M3U8, MPD, MP4, and MOV) from Chrome and download them to your NAS — including browser-side HLS/DASH jobs for session-bound streams
 
 > [!IMPORTANT]
 > This project does **not** guarantee every video can be downloaded. Some sites use DRM, expiring URLs, anti-hotlinking, IP restrictions, or change their delivery logic at any time.
@@ -907,8 +907,8 @@ Both added via the existing idempotent `_ensure_schema()` migration in API + wor
 
 ---
 
-**Version**: 2.2.2  
-**Last Updated**: 2026-05-04  
+**Version**: 3.1.0
+**Last Updated**: 2026-05-08
 **Port**: 52052 (NAS host port → API container :8000)
 
 ## Star History
