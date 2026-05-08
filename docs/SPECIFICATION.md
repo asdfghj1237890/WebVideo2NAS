@@ -2,14 +2,14 @@
 
 ## 1. Executive Summary
 
-This document specifies a complete system for capturing web video URLs (m3u8 streams and mp4 files) from Chrome and downloading them via a Docker container running on a NAS (Network Attached Storage) device.
+This document specifies a complete system for capturing web video URLs (M3U8, MPD, MP4, and MOV) from Chrome and downloading them through a Docker stack running on a NAS (Network Attached Storage) device. HLS/DASH jobs can run in browser-side mode, where the extension fetches session-bound media segments in the user's browser context and uploads staged bytes to the NAS for FFmpeg muxing.
 
 ### 1.1 System Goals
-- Enable one-click web video URL capture from Chrome (m3u8, mp4)
+- Enable one-click web video URL capture from Chrome (M3U8, MPD, MP4, MOV)
 - Seamless transmission to NAS Docker environment
-- Automated video download and conversion
+- Automated NAS-direct download or browser-side HLS/DASH segment staging
 - Centralized storage on NAS
-- Status tracking and notification
+- Status tracking, live browser-side upload progress, and notification
 
 ---
 
@@ -24,7 +24,7 @@ This document specifies a complete system for capturing web video URLs (m3u8 str
 │   │Extension│   │
 │   └────┬────┘   │
 └────────┼────────┘
-         │ HTTPS
+         │ HTTPS API calls
          ▼
 ┌─────────────────┐
 │   NAS Device    │
@@ -53,29 +53,32 @@ This document specifies a complete system for capturing web video URLs (m3u8 str
 - **Purpose**: Detect and capture video URLs from browser activity
 - **Technology**: Manifest V3 Chrome Extension
 - **Functionality**:
-  - Monitor network requests for `.m3u8` and `.mp4`
+  - Monitor network requests for M3U8, MPD, MP4, and MOV candidates
+  - Intercept disguised HLS manifests via page fetch/XHR inspection
   - Provide context menu option "Send to NAS"
-  - Display badge notification when m3u8 detected
+  - Display detected URLs, recent NAS jobs, and browser-side live progress in the side panel
   - Configure NAS endpoint (IP/hostname + port)
-  - Show download queue status
+  - Browser-side HLS/DASH fetch/upload via service worker + offscreen document
+  - Trusted cross-site CDN suffix allowlist; one-click add stores the exact URL host
 
 #### B. NAS Docker Container
 - **Purpose**: Host download service and API
 - **Technology**: Docker Compose stack
 - **Sub-components**:
-  1. **API Gateway** (Node.js/FastAPI)
+  1. **API Gateway** (FastAPI)
      - REST API endpoints
      - Authentication (API key/token)
      - Job queue management
+     - Browser-side staging endpoints
      - Status tracking
   
   2. **Download Worker** (Python/FFmpeg)
-     - M3U8 parser
-     - Multi-threaded segment downloader
+     - NAS-direct M3U8/MPD/direct-download handling
+     - Browser-side staged segment muxing
      - FFmpeg for stream merging
      - Progress reporting
   
-  3. **Database** (SQLite/PostgreSQL)
+  3. **Database** (PostgreSQL)
      - Job history
      - Download metadata
      - User preferences
@@ -86,8 +89,9 @@ This document specifies a complete system for capturing web video URLs (m3u8 str
 - **Structure**:
   ```
   /downloads/
-    └── completed/
-        └── video_title.mp4
+    ├── <optional-subdir>/
+    │   └── video_title.mp4
+    └── .staging/<job_id>/   # temporary browser-side segments
   ```
 
 ---
@@ -101,8 +105,8 @@ This document specifies a complete system for capturing web video URLs (m3u8 str
 {
   "manifest_version": 3,
   "name": "WebVideo2NAS",
-  "version": "1.9.2",
-  "description": "Send m3u8, mpd, and mp4 videos to your NAS for download",
+  "version": "3.1.0",
+  "description": "Send web videos (m3u8, mpd, mp4, mov) to your NAS for download",
   "permissions": [
     "storage",
     "contextMenus",
@@ -110,7 +114,9 @@ This document specifies a complete system for capturing web video URLs (m3u8 str
     "webRequest",
     "webNavigation",
     "sidePanel",
-    "cookies"
+    "cookies",
+    "declarativeNetRequest",
+    "offscreen"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -129,19 +135,22 @@ This document specifies a complete system for capturing web video URLs (m3u8 str
 #### 3.1.2 Key Functions
 1. **URL Detection**
    - Listen to `webRequest.onBeforeRequest`
-   - Filter: `*.m3u8` or `type: 'application/vnd.apple.mpegurl'`
-   - Store detected URLs in memory
+   - Filter video URL candidates and manifest content types
+   - Store detected URLs per tab in the background service worker
+   - Capture request headers/cookies for the exact source tab
 
 2. **User Interaction**
    - Context menu: "Send to NAS"
-   - Popup interface: 
-     - List detected m3u8 URLs
-     - Configure NAS endpoint
-     - View active downloads
+   - Side panel interface:
+      - List detected video URLs
+      - Filter/search many detected items
+      - Add exact host to trusted-CDN list when needed
+      - View recent jobs and live browser-side progress
 
 3. **Communication**
-   - POST request to NAS API: `https://{NAS_IP}:{PORT}/api/download`
-   - Payload: 
+   - NAS-direct POST request to NAS API: `https://{NAS_IP}:{PORT}/api/download`
+   - Browser-side HLS/DASH requests: `POST /api/jobs/init`, `PUT /api/jobs/{id}/segments/...`, `POST /api/jobs/{id}/finalize`
+   - NAS-direct payload:
      ```json
      {
        "url": "https://example.com/video.m3u8",
@@ -196,17 +205,22 @@ services:
 | GET | `/api/jobs/{id}` | Get job details |
 | DELETE | `/api/jobs/{id}` | Cancel/delete job |
 | GET | `/api/status` | System status |
+| POST | `/api/jobs/init` | Browser-side: create job and return segment plan |
+| PUT | `/api/jobs/{id}/segments/{track}/{seq}` | Browser-side: upload staged media segment |
+| PUT | `/api/jobs/{id}/init/{label}` | Browser-side: upload init segment |
+| POST | `/api/jobs/{id}/finalize` | Browser-side: queue FFmpeg mux |
+| POST | `/api/jobs/{id}/abort` | Browser-side: fail job and clean staging |
 
 #### 3.2.3 Download Worker Logic
 
 **Multi-Worker Design**:
-The system deploys **2 independent workers** by default, both pulling from the same Redis queue:
-- **Worker 1** and **Worker 2** operate independently
+The Synology compose deploys **3 independent workers** by default, all pulling from Redis queues:
+- **Worker 1**, **Worker 2**, and **Worker 3** operate independently
 - Automatic load balancing via Redis BLPOP (first available worker gets next job)
-- Total capacity: Up to 6 videos processing simultaneously (3 per worker)
+- Total capacity scales with worker count and per-worker concurrency settings
 - Scalable: Add more workers for higher throughput
 
-**Flow (per worker)**:
+**NAS-direct flow (per worker)**:
 ```
 1. Receive job from Redis queue (BLPOP - blocking)
 2. Parse m3u8 manifest
@@ -223,6 +237,16 @@ The system deploys **2 independent workers** by default, both pulling from the s
 7. Send notification
 ```
 
+**Browser-side flow**:
+```
+1. API creates browser job + staging dir from /api/jobs/init
+2. Extension uploads init/media segments from the browser session
+3. Extension calls /api/jobs/{id}/finalize
+4. Worker pops browser finalize queue
+5. Worker muxes staged bytes with FFmpeg
+6. Worker removes staging dir and marks completed
+```
+
 **Error Handling**:
 - Network timeout: Retry 3 times with exponential backoff
 - Invalid m3u8: Mark as failed, log details
@@ -236,7 +260,7 @@ The system deploys **2 independent workers** by default, both pulling from the s
   "id": "uuid",
   "url": "string",
   "title": "string",
-  "status": "pending|downloading|processing|completed|failed",
+  "status": "pending|downloading|processing|browser_pending|browser_uploading|browser_finalizing|completed|failed|cancelled",
   "progress": 0-100,
   "created_at": "timestamp",
   "completed_at": "timestamp",
@@ -248,7 +272,10 @@ The system deploys **2 independent workers** by default, both pulling from the s
     "headers": {},
     "source_page": "string",
     "resolution": "1920x1080",
-    "duration": "seconds"
+    "duration": "seconds",
+    "mode": "nas_direct|browser",
+    "staging_dir": "string|null",
+    "output_subdir": "string|null"
   }
 }
 ```
@@ -263,12 +290,17 @@ The system deploys **2 independent workers** by default, both pulling from the s
 2. **Network**
    - Optional: Use reverse proxy (Caddy, Traefik) for HTTPS
    - Optional: Tailscale/Zerotier for secure tunneling
-   - Rate limiting: 10 requests/minute per IP
+   - Rate limiting: configurable per IP via `RATE_LIMIT_PER_MINUTE`
 
 3. **Storage**
-   - Validate URL schemes (https only)
+   - Validate URL schemes and video formats
    - Sanitize filenames (prevent path traversal)
-   - Disk quota limits per user
+   - Browser-side staging byte quota and cleanup on cancel/abort
+
+4. **Browser-side fetch safety**
+   - Extension refuses credentialed browser fetches to HTTP, localhost, private/reserved IP literals, and cross-site DNS names unless the user explicitly trusts a CDN suffix
+   - Trusted-CDN one-click add stores the exact URL host; users can manually widen to a suffix in settings
+   - API always validates every planned browser-side URL with DNS/IP safety checks before accepting segment uploads
 
 ---
 
@@ -277,7 +309,7 @@ The system deploys **2 independent workers** by default, both pulling from the s
 ### 4.1 Chrome Extension
 - JavaScript (ES6+)
 - Chrome Extension Manifest V3 API
-- Webpack for bundling
+- Native extension files loaded directly by Chrome; Vitest covers unit tests
 
 ### 4.2 NAS Backend
 - **API Gateway**: FastAPI (Python 3.11)
@@ -307,19 +339,20 @@ The system deploys **2 independent workers** by default, both pulling from the s
 
 ### 5.2 Download Flow
 1. User browses to video streaming site
-2. Extension detects m3u8 URL (badge notification)
+2. Extension detects video URL candidates in the side panel
 3. User clicks extension icon or right-clicks → "Send to NAS"
-4. Extension sends URL to NAS API
-5. NAS API returns job ID
-6. Extension shows "Job submitted" notification
-7. Worker processes download in background
-8. User receives completion notification
-9. Video available in NAS `/downloads/` (or `/downloads/<subdir>/` when the active profile sets `output_subdir`)
+4. For browser-side HLS/DASH, user presses play first so the player issues current session tokens
+5. Extension sends either a NAS-direct URL job or browser-side staged segment job to the NAS API
+6. NAS API returns job ID
+7. Extension shows "Job submitted" notification and live progress
+8. Worker downloads or muxes in background
+9. User receives completion notification
+10. Video available in NAS `/downloads/` (or `/downloads/<subdir>/` when the active profile sets `output_subdir`)
 
 ### 5.3 Monitoring
-1. User opens extension popup
+1. User opens extension side panel
 2. View list of active downloads with progress bars
-3. Click job to view details
+3. Browser-side upload progress is pushed live from the extension; NAS-direct progress is polled from `/api/jobs`
 4. Optional: Cancel/retry jobs
 
 ---
@@ -344,11 +377,13 @@ RATE_LIMIT_PER_MINUTE=10
 ### 6.2 Extension Configuration
 ```json
 {
-  "nasEndpoint": "https://192.168.1.100:52052",
+  "nasEndpoint": "http://192.168.1.100:52052",
   "apiKey": "your-api-key",
   "autoDetect": true,
-  "notifyOnComplete": true,
-  "preferredQuality": "highest"
+  "showNotifications": true,
+  "useBrowserSide": true,
+  "trustedCdnSuffixes": ["cdn.example.com"],
+  "nasOutputSubdir": "site_a"
 }
 ```
 
@@ -365,7 +400,8 @@ RATE_LIMIT_PER_MINUTE=10
 
 ### 7.2 Logging Strategy
 - **API**: Request/response logs (INFO level)
-- **Worker**: Download progress, errors (DEBUG level)
+- **Worker**: NAS-direct download progress, browser-side mux/finalize, errors (DEBUG level)
+- **Extension**: Browser-side upload progress lives in side panel state and is not persisted server-side during upload
 - **Storage**: Rotate logs daily, keep 30 days
 - **Format**: JSON structured logging
 
@@ -408,13 +444,14 @@ RATE_LIMIT_PER_MINUTE=10
 - Error scenarios (network failure, invalid URLs)
 
 ### 9.3 Manual Testing Checklist
-- [ ] Extension detects m3u8 on popular streaming sites
+- [ ] Extension detects M3U8/MPD/MP4/MOV candidates on representative pages
 - [ ] Download completes successfully
-- [ ] Progress updates accurately
+- [ ] NAS-direct and browser-side progress update accurately
 - [ ] Error notifications work
 - [ ] Multiple simultaneous downloads
 - [ ] Resume after container restart
 - [ ] Disk full scenario handling
+- [ ] Browser-side safety gate rejects localhost/private IP and untrusted cross-site manifest URLs
 
 ---
 
@@ -476,4 +513,3 @@ webvideo2nas/
 ├── pics/
 └── README.md
 ```
-

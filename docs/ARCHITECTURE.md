@@ -17,21 +17,20 @@ This document provides detailed architecture diagrams and explanations for the W
 │  │                                                           │  │
 │  │  ┌─────────────────────────────────────────────────┐     │  │
 │  │  │  Website (Streaming Service)                    │     │  │
-│  │  │  └─→ Serves m3u8 playlist                       │     │  │
+│  │  │  └─→ Serves manifest / media URLs               │     │  │
 │  │  └─────────────────────────────────────────────────┘     │  │
 │  │                         ↑                                 │  │
 │  │                         │ User browses                    │  │
 │  │                         ↓                                 │  │
 │  │  ┌─────────────────────────────────────────────────┐     │  │
 │  │  │  WebVideo2NAS Extension                         │     │  │
-│  │  │  • Detects video URLs (m3u8, mp4)               │     │  │
-│  │  │  • Displays popup UI                           │     │  │
-│  │  │  • Sends to NAS API                            │     │  │
+│  │  │  • Detects m3u8/mpd/mp4/mov URLs               │     │  │
+│  │  │  • Displays side panel UI                      │     │  │
+│  │  │  • Sends jobs or uploads browser segments      │     │  │
 │  │  └─────────────────────────────────────────────────┘     │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                         ↓                                       │
-│                    HTTPS Request                                │
-│                  {url, headers, metadata}                       │
+│       HTTPS API calls: {url, headers} or staged segments         │
 │                         ↓                                       │
 └───────────────────────────────────────────────────────────────┘
                           │
@@ -44,7 +43,7 @@ This document provides detailed architecture diagrams and explanations for the W
 │  │  ┌─────────────────────────────────────────────────┐     │  │
 │  │  │  API Gateway (FastAPI)                          │     │  │
 │  │  │  • Authentication                               │     │  │
-│  │  │  • Job management                               │     │  │
+│  │  │  • Job management + browser-side staging        │     │  │
 │  │  │  • Status tracking                              │     │  │
 │  │  │  Port: 52052 (host → API:8000)                  │     │  │
 │  │  └──────────────┬──────────────┬───────────────────┘     │  │
@@ -61,8 +60,8 @@ This document provides detailed architecture diagrams and explanations for the W
 │  │  ┌─────────────────────────────────────────────────┐     │  │
 │  │  │  Download Worker (Python)                       │     │  │
 │  │  │  • Poll Redis queue                             │     │  │
-│  │  │  • Parse m3u8                                   │     │  │
-│  │  │  • Download segments                            │     │  │
+│  │  │  • NAS-direct downloads                         │     │  │
+│  │  │  • Browser-side staged mux                      │     │  │
 │  │  │  • Merge with FFmpeg                            │     │  │
 │  │  │  • Update database                              │     │  │
 │  │  └──────────────────┬──────────────────────────────┘     │  │
@@ -71,10 +70,9 @@ This document provides detailed architecture diagrams and explanations for the W
 │                        ↓                                       │
 │  ┌─────────────────────────────────────────────────────┐     │
 │  │  NAS Storage Volume                                 │     │
-│  │  /volume1/downloads/m3u8/                          │     │
-│  │  ├── completed/                                     │     │
-│  │  ├── processing/                                    │     │
-│  │  └── failed/                                        │     │
+│  │  /downloads/                                        │     │
+│  │  ├── <optional-subdir>/                             │     │
+│  │  └── .staging/<job_id>/                             │     │
 │  └─────────────────────────────────────────────────────┘     │
 └────────────────────────────────────────────────────────────────┘
 ```
@@ -82,6 +80,13 @@ This document provides detailed architecture diagrams and explanations for the W
 ---
 
 ## 2. Data Flow - Download Job Lifecycle
+
+WebVideo2NAS has two job paths:
+
+- **NAS-direct** (`/api/download`): the NAS worker fetches the media URL itself. This remains the path for MP4/MOV and for HLS/DASH when browser-side mode is disabled.
+- **Browser-side** (`/api/jobs/init` + segment PUTs): the extension fetches HLS/DASH manifests and segments in the user's browser session, uploads staged bytes to the NAS, and the worker only muxes them with FFmpeg. This is the default for M3U8/MPD because many streams bind tokens/cookies to the browser session or public IP.
+
+### 2.1 NAS-direct lifecycle
 
 ```
 ┌─────────────┐
@@ -154,7 +159,7 @@ This document provides detailed architecture diagrams and explanations for the W
          │      └─→ Update progress: 90-99%     │
          │                                      │
          │  Step 5: Finalize                    │
-         │  └─→ Move to /completed/             │
+         │  └─→ Move to /downloads/...          │
          │      └─→ Update status='completed'   │
          │          └─→ progress = 100%         │
          │                                      │
@@ -171,6 +176,26 @@ This document provides detailed architecture diagrams and explanations for the W
                   └─────────────┘
 ```
 
+### 2.2 Browser-side HLS/DASH lifecycle
+
+```
+Chrome Extension / Offscreen
+├─→ Safety gate master URL
+│   └─ HTTPS-only, local/private IP refusal, same-site or trusted CDN suffix
+├─→ Fetch manifest in browser session
+├─→ POST /api/jobs/init {manifest_text, base_url, headers}
+│   └─ API builds plan and runs always-on plan URL safety checks
+├─→ PUT /api/jobs/{id}/segments/{track}/{seq}
+│   └─ Extension fetches/decrypts media segments and uploads bytes
+├─→ POST /api/jobs/{id}/finalize
+│   └─ API queues a browser finalize job
+└─→ BROWSER_JOB_PROGRESS → sidepanel live progress
+
+Worker
+└─→ BLPOP browser finalize queue
+    └─ FFmpeg mux staged bytes → /downloads/... → completed
+```
+
 ---
 
 ## 3. Component Interaction Diagram
@@ -182,22 +207,27 @@ This document provides detailed architecture diagrams and explanations for the W
 
 1. Background Script (Service Worker)
    ├─→ Listen: webRequest.onBeforeRequest
-   │   └─→ Filter: *.m3u8
+   │   └─→ Filter: m3u8/mpd/mp4/mov candidates
    │       └─→ Store: detectedUrls[]
    │           └─→ Update: Badge count
    │
    ├─→ Listen: contextMenus.onClicked
    │   └─→ Action: sendToNAS(url)
-   │       └─→ API: POST /api/download
+   │       ├─→ API: POST /api/download (NAS-direct)
+   │       └─→ API: POST /api/jobs/init + PUT segments (browser-side)
+   │
+   ├─→ Own offscreen document
+   │   └─→ Long-lived browser-side segment fetch/upload loop
    │
    └─→ Listen: chrome.alarms
        └─→ Action: pollJobStatus()
            └─→ API: GET /api/jobs
 
-2. Popup UI
+2. Side panel UI
    ├─→ Display: Detected URLs
    ├─→ Display: Active downloads
-   │   └─→ Progress bars
+   │   └─→ NAS progress + browser-side live progress
+   ├─→ Trusted CDN textbox and per-tile exact-host "+" button
    └─→ Button: Send to NAS
 
 3. Settings Page
@@ -212,7 +242,7 @@ This document provides detailed architecture diagrams and explanations for the W
 FastAPI Application
 ├─→ Middleware
 │   ├─→ CORS (allow Chrome extension)
-│   ├─→ Rate limiting (10 req/min)
+│   ├─→ Rate limiting (configurable per-IP buckets)
 │   └─→ Authentication (API key)
 │
 ├─→ Routers
@@ -222,6 +252,21 @@ FastAPI Application
 │   │   ├─→ INSERT into PostgreSQL
 │   │   ├─→ RPUSH to Redis
 │   │   └─→ Return 201 + job_id
+│   │
+│   ├─→ /api/jobs/init
+│   │   ├─→ Validate manifest text or URL
+│   │   ├─→ Enforce browser plan URL safety
+│   │   ├─→ Create browser job + staging dir
+│   │   └─→ Return job_id + segment plan
+│   │
+│   ├─→ /api/jobs/{id}/segments/{track}/{seq}
+│   │   └─→ Store staged browser-side media bytes
+│   │
+│   ├─→ /api/jobs/{id}/finalize
+│   │   └─→ Queue worker mux for staged bytes
+│   │
+│   ├─→ /api/jobs/{id}/abort
+│   │   └─→ Fail browser job + remove staging
 │   │
 │   ├─→ /api/jobs
 │   │   ├─→ SELECT from PostgreSQL
@@ -276,6 +321,12 @@ Download Function
 └─→ merge_with_ffmpeg(segment_files)
     ├─→ subprocess.run(['ffmpeg', '-i', ...])
     └─→ return output_file
+
+Browser Finalize Function
+├─→ Read job_metadata.mode='browser' + staging_dir
+├─→ Concatenate staged track segments in sequence
+├─→ ffmpeg mux staged bytes
+└─→ Mark completed and remove staging_dir
 ```
 
 ---
@@ -289,7 +340,7 @@ Download Function
 │ Column       │ Type         │ Description                   │
 ├──────────────┼──────────────┼──────────────────────────────┤
 │ id           │ UUID         │ Primary key                   │
-│ url          │ TEXT         │ M3U8 URL                      │
+│ url          │ TEXT         │ Source media/manifest URL     │
 │ title        │ VARCHAR(255) │ Video title                   │
 │ status       │ VARCHAR(20)  │ pending/downloading/...       │
 │ progress     │ INTEGER      │ 0-100                         │
@@ -314,6 +365,12 @@ Download Function
 │ resolution   │ VARCHAR(20)  │ Video resolution              │
 │ duration     │ INTEGER      │ Video duration (seconds)      │
 │ segment_count│ INTEGER      │ Total segments                │
+│ output_subdir│ TEXT         │ Optional /downloads subdir    │
+│ actual_duration│ INTEGER    │ ffprobe measured duration     │
+│ suspect_reason│ TEXT        │ Output integrity warning      │
+│ mode         │ VARCHAR(20)  │ nas_direct/browser            │
+│ staging_dir  │ TEXT         │ Browser-side staging path     │
+│ finalize_started_at│ TIMESTAMP│ Browser finalize timestamp  │
 └──────────────┴──────────────┴──────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
@@ -349,7 +406,14 @@ Indexes:
      - BLPOP download_queue 0         # Dequeue (blocking)
      - LLEN download_queue            # Queue length
 
-2. Active Jobs (Set)
+2. Browser Finalize Queue (List)
+   Key: "browser_finalize_queue"
+   Type: LIST
+   Operations:
+     - RPUSH browser_finalize_queue {job_id}
+     - BLPOP browser_finalize_queue 0
+
+3. Active Jobs (Set)
    Key: "active_jobs"
    Type: SET
    Operations:
@@ -357,17 +421,12 @@ Indexes:
      - SREM active_jobs {job_id}      # Remove when done
      - SCARD active_jobs              # Count active
 
-3. Job Progress (Hash)
-   Key: "progress:{job_id}"
-   Type: HASH
-   Fields:
-     - downloaded_segments: 42
-     - total_segments: 100
-     - current_speed: "5.2 MB/s"
-     - eta: "120 seconds"
-   TTL: 86400 (24 hours)
+4. Browser Staged Bytes (String)
+   Key: "browser_staged_bytes:{job_id}"
+   Type: STRING
+   Purpose: enforce per-job staging byte quota
 
-4. Rate Limiting (String)
+5. Rate Limiting (String)
    Key: "ratelimit:{ip}"
    Type: STRING
    Value: request_count
@@ -391,6 +450,9 @@ What's actually implemented in the code today:
 | IP allowlist | Optional `ALLOWED_CLIENT_CIDRS` — request rejected if peer not in list | `api/main.py:_enforce_client_allowlist` |
 | URL validation | Pydantic `HttpUrl` (must be http(s)); plus extension/format-hint check | `api/main.py:DownloadRequest` |
 | SSRF guard | Optional `SSRF_GUARD=true` — resolves the URL host and blocks loopback / private / link-local / multicast / reserved ranges | `api/main.py:_enforce_ssrf_guard`, `worker/worker.py` |
+| Browser-side URL gate | Extension refuses browser credentialed fetches to HTTP, localhost, private/reserved IP literals, and cross-site DNS names unless the user explicitly trusts a CDN suffix | `chrome-extension/background.js:_wv2nasIsManifestUrlSafeForBrowser` |
+| Browser plan URL safety | Always-on API check resolves every planned segment/init/key URL and rejects non-public hosts before accepting staged browser jobs | `api/main.py:_enforce_plan_url_safety` |
+| Header/CORS scoping | DNR header spoof and CORS relaxation are scoped to same-site or explicitly trusted URLs; foreign plan URLs do not receive captured auth headers | `chrome-extension/background.js`, `chrome-extension/segmentDownloader.js` |
 | Filename sanitization | `safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_'))` — strips path separators and dots | `worker/worker.py` |
 | Container hardening | Non-root `appuser` (uid 1026) inside the unified image; matches Synology's default uid:gid | `Dockerfile` |
 | Supply chain | `pip install --require-hashes` against a hash-locked `requirements.txt`; image built with provenance + SBOM via `docker/build-push-action@v6` | `Dockerfile`, `.github/workflows/create-release.yml` |
@@ -420,7 +482,7 @@ All errors are logged to stdout (captured by Docker → host logs) and persisted
 
 ### 8.1 Worker Pool Design
 
-The system deploys **2 independent download workers** by default to maximize throughput and reliability.
+The Synology compose deploys **3 independent download workers** by default to maximize throughput and reliability.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -433,23 +495,22 @@ The system deploys **2 independent download workers** by default to maximize thr
                     │  (FIFO)      │
                     └──────┬───────┘
                            │
-            ┌──────────────┼──────────────┐
-            │              │              │
-            ↓              ↓              ↓
-    ┌──────────────┐ ┌──────────────┐  (Scalable)
-    │   Worker 1   │ │   Worker 2   │
-    │              │ │              │
-    │ • BLPOP      │ │ • BLPOP      │
-    │ • Download   │ │ • Download   │
-    │ • Merge      │ │ • Merge      │
-    │ • Update DB  │ │ • Update DB  │
-    └──────────────┘ └──────────────┘
+       ┌────────────────┼────────────────┐
+       │                │                │
+       ↓                ↓                ↓
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│   Worker 1   │ │   Worker 2   │ │   Worker 3   │
+│ • BLPOP      │ │ • BLPOP      │ │ • BLPOP      │
+│ • Download   │ │ • Download   │ │ • Download   │
+│ • Merge      │ │ • Merge      │ │ • Merge      │
+│ • Update DB  │ │ • Update DB  │ │ • Update DB  │
+└──────────────┘ └──────────────┘ └──────────────┘
 ```
 
 ### 8.2 How It Works
 
 **Load Balancing via Redis Queue:**
-- Both workers pull jobs from the **same Redis queue** using blocking pop (BLPOP)
+- All workers pull jobs from the **same Redis queues** using blocking pop (BLPOP)
 - First available worker gets the next job (automatic load distribution)
 - No job duplication - each job is processed by exactly one worker
 - Workers operate independently with no coordination needed

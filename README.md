@@ -38,15 +38,16 @@
 ## Overview
 
 This system enables you to:
-1. 🔍 Detect M3U8 and MP4 video URLs in Chrome (including disguised streams)
+1. 🔍 Detect M3U8, MPD, MP4, and MOV video URLs in Chrome (including disguised streams)
 2. 📤 Send URLs to your NAS with one click
-3. ⬇️ Automatically download and convert to MP4
+3. ⬇️ Download through NAS-direct or browser-side mode for session-bound HLS/DASH streams
 4. 💾 Store videos on your NAS storage
 
 ## System Architecture
 
 ```
-Chrome Extension → NAS Docker (API + Worker) → Video Storage
+Chrome Extension → NAS Docker API → Worker mux/download → Video Storage
+        └──── browser-side HLS/DASH segment upload ────┘
 ```
 
 ![Overall System Architecture](pics/overall_system_architecture.png)
@@ -71,11 +72,13 @@ Chrome Extension → NAS Docker (API + Worker) → Video Storage
 ## Key Features
 
 ### Chrome Extension
-- ✅ Automatic M3U8 and MP4 URL detection
+- ✅ Automatic M3U8, MPD, MP4, and MOV URL detection
 - ✅ Deep manifest interception — detects disguised streams (e.g. `.jpg`-wrapped HLS) via fetch/XHR content inspection
 - ✅ One-click send to NAS
 - ✅ Side panel interface for easy access
-- ✅ Real-time download progress
+- ✅ Browser-side HLS/DASH mode for cookie/IP-bound streams
+- ✅ Live browser-side upload progress and NAS job progress
+- ✅ Trusted cross-site CDN allowlist with exact-host one-click add
 - ✅ Cookie & header forwarding for authenticated streams
 - ✅ Context menu integration
 - ✅ Configurable NAS endpoint
@@ -83,6 +86,7 @@ Chrome Extension → NAS Docker (API + Worker) → Video Storage
 ### NAS Docker Service
 - ✅ RESTful API for job management
 - ✅ **Multi-worker architecture** (3 workers by default in the Synology compose) for parallel processing
+- ✅ Browser-side staging APIs for segment upload + finalize
 - ✅ Multi-threaded segment downloader
 - ✅ FFmpeg-based video merging
 - ✅ Job queue with Redis
@@ -181,7 +185,7 @@ curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/hea
 # → {"status":"healthy"}
 ```
 
-> Pin a specific image version: set `IMAGE_TAG=1.9.2` in `.env` (defaults to `latest`).
+> Pin a specific image version: set `IMAGE_TAG=3.1.0` in `.env` (defaults to `latest`).
 
 <details>
 <summary><strong>Synology Container Manager (DSM UI alternative to CLI)</strong></summary>
@@ -238,11 +242,12 @@ Synology UI: open the Project → **Action → Pull** → **Restart**.
 ## Usage
 
 1. Browse to any video streaming site
-2. When video URL (M3U8/MP4) is detected, extension badge shows notification
+2. When a video URL (M3U8/MPD/MP4/MOV) is detected, the extension side panel lists it
 3. Click extension icon to open side panel, or right-click → "Send to NAS"
-4. Video downloads automatically to your NAS (with cookies for authenticated streams)
-5. Monitor progress in the side panel
-6. Access completed videos in `/downloads/` (or `/downloads/<subdir>/` if a per-profile subfolder is configured)
+4. For browser-side HLS/DASH, press play on the page first so the player issues the current session token
+5. Video downloads automatically to your NAS (with cookies/headers for authenticated streams)
+6. Monitor NAS-direct or browser-side upload progress in the side panel
+7. Access completed videos in `/downloads/` (or `/downloads/<subdir>/` if a per-profile subfolder is configured)
 
 ## Configuration
 
@@ -252,7 +257,7 @@ The full list with inline comments lives in [`.env.example`](video-downloader/do
 
 | Variable | Default | Effect |
 |---|---|---|
-| `IMAGE_TAG` | `latest` | Pin to a specific release (e.g. `1.9.2`) instead of tracking latest |
+| `IMAGE_TAG` | `latest` | Pin to a specific release (e.g. `3.1.0`) instead of tracking latest |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose troubleshooting; `WARNING` to quiet down |
 | `MAX_DOWNLOAD_WORKERS` | `20` | Per-worker thread pool for HLS segment downloads |
 | `FFMPEG_THREADS` | `2` | Threads ffmpeg uses during merge |

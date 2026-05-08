@@ -119,7 +119,7 @@ extension 自己有三個 JS context：
 | User 設定（NAS endpoint, API key, theme, language） | `chrome.storage.sync` | 跨 device 同步；不大 (~1KB) |
 | AV-task history (hidden mode) | `chrome.storage.local` | 可能很大 (URL × 100 entries)，sync 會超 100KB ceiling |
 | Job 狀態 | Postgres `jobs` | 唯一可靠的 source of truth；多 worker 共享 |
-| In-flight job 進度 | Postgres `jobs.progress` | UI 透過 polling /api/jobs 拿；worker 每 2s update |
+| In-flight job 進度 | Postgres `jobs.progress` + sidepanel `liveBrowserProgress` | NAS-direct / worker mux 進度在 Postgres；browser-side segment upload 由 extension 即時 push，sidepanel render 前覆蓋 API 的 stale `progress=0` |
 | Queue（pending jobs） | Redis `download_queue` | atomic BLPOP，多 worker 競爭安全 |
 | Captured browser headers (server side) | 沒 — 從 client request body 拿 | 每個 download submit 時透過 `headers` 欄位帶過來，存進 `job_metadata.headers` (JSONB) |
 
