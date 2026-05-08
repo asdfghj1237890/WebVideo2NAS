@@ -348,6 +348,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
+### [3.1.0] - 2026-05-08
+
+#### Added
+- **Per-user trusted-CDN allowlist for the v3.0 browser-side gate**. The same-site safety gate refuses cross-site CDN streams (page on a brand domain, manifest on a separate CDN eTLD+1) to mitigate split-horizon-DNS / internal-CA misuse on the client. But that also blocks legitimate streams whose HMAC tokens are bound to the browser's IP — NAS-direct can't reach those either. New `chrome.storage.sync.trustedCdnSuffixes` (default empty) lets the user opt in per host suffix. Strict dotted-suffix match (`cdn.example.com` matches `media.cdn.example.com` but never `evilcdn.example.com`); hard rejections (private IP, localhost, IPv6 reserved, HTTPS-only, malformed URL) still fire — the allowlist only relaxes the same-site check.
+- **Sidepanel UI for trusted CDNs lives next to the detected-pane**: per-tile **`+`** button (top-right of the thumbnail, hover-reveal) derives the exact URL host and stores it in one click; trusted CDNs textbox sits in a collapsed `<details>` below the section label with a count badge. `+` button shows green `✓` (disabled) on tiles whose host is already covered.
+- **Browser-side upload progress is now surfaced live**. `segmentDownloader.runJob` emits `{track, seq, done, total}` per media segment via its `onProgress` callback; offscreen.js relays a throttled `BROWSER_JOB_PROGRESS` (200 ms; first/last events always send) to the SW; the SW broadcasts `action: 'browserJobProgress'` to the sidepanel, which keeps a `liveBrowserProgress` map and re-applies it after every `loadRecentJobs()` poll so the API's stale `progress=0` doesn't overwrite. The progress ring + percentage now move continuously through the segment-upload phase instead of staying blank until the brief finalize moment.
+
+#### Fixed
+- **Active browser-side jobs sorted to the bottom of the recent-jobs list**. `STATUS_RANK_ACTIVE` and `STATUS_RANK_FAILED` had no entry for `browser_pending` / `browser_uploading` / `browser_finalizing`, so they fell through to the `?? 99` rank fallback. Added the three states alongside their NAS-direct counterparts (`browser_uploading` ↔ `downloading`, `browser_finalizing` ↔ `merging`, `browser_pending` ↔ `pending`).
+
+#### Notes
+- The trusted-CDN allowlist also relaxes the master-URL CORS-relax DNR decision (`masterTrustedForDnr`) — without that, the manifest response comes back opaque cross-origin and `_wv2nasFetchManifestInBrowser` can't read it as `manifest_text`.
+- The variant-URL trust check (master → variant) stays strict regardless of allowlist — that boundary is structural integrity, not user-config. Otherwise an allowlisted master could surface variants on attacker-controlled hosts that share an unrelated allowlisted suffix.
+- The progress pipeline only writes to live state when the job exists in the local `jobs` array AND has status `browser_*`; pruning runs on every `loadRecentJobs()` to bound the in-memory map.
+- 22 new tests in this release: 16 covering the trusted-CDN matcher / gate / typosquat boundary, 1 covering one-click trusted-CDN host derivation, 5 covering `runJob.onProgress` (done/total counters, init-segment exclusion, multi-track flatten, callback-throws-but-upload-continues, omitted-callback). 300/300 green.
+
+### [3.0.0] - 2026-05-07
+
+#### Added
+- **Browser-side HLS/DASH pipeline** for streams whose tokens or cookies are bound to the user's browser session (signed CDN URLs, paid-streaming sites, anything where NAS-direct gets 401/403). The extension now fetches the manifest, downloads each media segment, AES-128-decrypts where applicable, and uploads each segment to a per-job NAS staging directory; the worker is reduced to ffmpeg mux only. A new offscreen document owns the long-lived fetch loop so it survives the SW's 30-second idle eviction; `chrome.declarativeNetRequest` session rules spoof Referer / Origin / User-Agent + relax CORS per-host so credentialed segment fetches behave like the original player.
+- **Same-site safety gate (`_wv2nasIsManifestUrlSafeForBrowser`)** on every URL the extension is about to fetch in browser context. Rejects HTTPS-only failures, private/loopback/link-local/CGN/TEST-NET IPv4 + IPv6 reserved literals, localhost, malformed URLs, AND DNS hostnames that aren't same-site with the page that surfaced them (split-horizon-DNS / internal-CA mitigation — a public-looking name on a corporate machine could resolve to intranet content the browser would then post to NAS as `manifest_text`). 14 rounds of Codex adversarial-review hardened the gate against typosquats, redirect-following, variant URLs on different sites, oversize-manifest DoS, AES-key URI off-CDN, and per-URL header scoping leaks.
+- **Server-side always-on `_enforce_plan_url_safety`** at `/api/jobs/init` walks every URL in the plan (segment / init / AES-key URIs) and rejects the whole plan if any points at a non-public address or non-http(s) scheme. Always on regardless of `SSRF_GUARD` env var (which only protects `/api/download`).
+- **DB schema**: new `mode` (`'nas_direct' | 'browser'`) + `staging_dir` columns on `job_metadata`; new statuses `browser_pending` / `browser_uploading` / `browser_finalizing`. Stale-browser-job reaper at worker boot (>6 h pre-finalize → failed). DNR-rule slots are persisted per active job and recovered on SW restart so a SW eviction mid-upload doesn't strand session rules.
+
+#### Notes
+- This is the v2.5.x design landing as a major release. The default for `useBrowserSide` flipped to ON for HLS/DASH (MP4 still goes NAS-direct because there's no payoff for a single GET).
+- See [docs/development/03-chrome-extension.md](docs/development/03-chrome-extension.md#8-browser-side-pipeline-v30) for the request/response flow + state machine.
+
 ### [2.3.9] - 2026-05-05
 
 #### Fixed
@@ -881,4 +909,3 @@ Both added via the existing idempotent `_ensure_schema()` migration in API + wor
 ## Star History
 
 If you find this project useful, please consider giving it a star! ⭐
-

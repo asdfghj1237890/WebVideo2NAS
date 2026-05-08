@@ -152,6 +152,19 @@ elif is_m3u8:    self._process_m3u8_download(...)
 
 worker 階段細節看 [ch 04](./04-worker-pipeline.md)。
 
+### 5.1 m3u8 / mpd 的 browser-side 替代路徑(v3.0+)
+
+當 stream 的 token / cookie 綁在 user 的瀏覽器 session(signed CDN URL、付費串流站、anti-hotlink 嚴格的站),NAS-direct 從不同 IP 帶同一個 token 過去就 403。Extension 預設改走 **browser-side**:
+
+| 階段 | 誰做 | 寫入 |
+|---|---|---|
+| Manifest fetch + parse | extension(SW + offscreen,帶 user 的 cookies) | POST `/api/jobs/init` 帶 `manifest_text` |
+| Plan 安全檢查 | API(`_enforce_plan_url_safety`,always-on) | reject 私網 IP / non-http(s) → 422 |
+| Segment fetch + AES decrypt + 上傳 | extension(offscreen 跑 segmentDownloader) | PUT 到 `/api/jobs/{id}/segments/...` |
+| Finalize(ffmpeg mux 已 staged 的 segments) | worker | `/downloads/...` |
+
+走這條時 worker 只做 ffmpeg mux,不接觸 source CDN — 所以 IP 綁定的 token / 短期 HMAC 都能用。Browser-side 只對 m3u8 / mpd 預設 on(MP4 走 NAS-direct 沒差)。完整 state machine + 安全 gate 看 [ch 03 §8](./03-chrome-extension.md#8-browser-side-pipeline-v30)。
+
 ## 6. 可信邊界
 
 哪些東西是可信的、哪些一定要 validate：

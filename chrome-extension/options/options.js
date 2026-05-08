@@ -221,6 +221,41 @@ function localizeStaticText() {
   setText('hiddenModeComment', '# ' + (t('options.hiddenMode.help') || ''));
   setText('hiddenModeUrlTemplateComment', '# ' + (t('options.hiddenModeUrlTemplate.help') || ''));
 
+  // Hidden-mode task-history table headers + clear button
+  setText('hiddenModeColCode',      t('options.hiddenMode.col.code') || 'code');
+  setText('hiddenModeColTitle',     t('options.hiddenMode.col.title') || 'title');
+  setText('hiddenModeColSubmitted', t('options.hiddenMode.col.submitted') || 'submitted');
+  setText('hiddenModeColStatus',    t('options.hiddenMode.col.status') || 'status');
+  setText('hiddenModeColUrl',       t('options.hiddenMode.col.url') || 'url');
+  setText('hiddenModeHistoryClearText', t('options.hiddenMode.history.clear') || 'clear');
+  // Empty-state cell that lives inside a re-rendered <tbody>; it
+  // also gets re-localized by renderHiddenModeHistory() (which
+  // rebuilds the row tree). Setting it here too covers the case
+  // where renderHiddenModeHistory hasn't run yet on this locale flip.
+  setText('hiddenModeHistoryEmpty', t('options.hiddenMode.history.empty') || 'no tasks yet — input a code in the side panel');
+
+  // Status-bar "X unsaved" suffix word
+  setText('unsavedLabel', t('options.unsaved.suffix') || 'unsaved');
+
+  // Ping rows carry transient state (idle / pinging / ok / err)
+  // applied via CSS classes; re-localize the text-token states
+  // (idle, pinging, unreachable). 'ok' shows dynamic latency text
+  // ("OK 124ms") that we don't try to reconstruct here — the next
+  // ping flips it back to a localizable token automatically.
+  for (const rowId of ['pingRow', 'lastPingRow']) {
+    const row = $(rowId);
+    if (!row) continue;
+    const labelEl = row.querySelector('.label');
+    if (!labelEl) continue;
+    if (row.classList.contains('pinging')) {
+      labelEl.textContent = t('options.ping.pinging') || 'pinging…';
+    } else if (row.classList.contains('err')) {
+      labelEl.textContent = t('options.ping.unreachable') || 'unreachable';
+    } else if (row.classList.contains('idle')) {
+      labelEl.textContent = t('options.ping.idle') || 'not tested';
+    }
+  }
+
   // Profiles
   setText('addProfileText', t('options.profiles.addBtn') || '[profile.new] — save current as profile');
 }
@@ -710,9 +745,11 @@ async function renderHiddenModeHistory(rowsArg) {
   }
 
   if (rows.length === 0) {
+    const emptyText = t('options.hiddenMode.history.empty')
+      || 'no tasks yet — input a code in the side panel';
     tbody.innerHTML = `
       <tr class="empty-row">
-        <td colspan="5" id="hiddenModeHistoryEmpty">no tasks yet — input a code in the side panel</td>
+        <td colspan="5" id="hiddenModeHistoryEmpty">${escapeHtml(emptyText)}</td>
       </tr>
     `;
     return;
@@ -857,10 +894,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   // chrome.storage.local.avTaskHistory, written by background.js. Initial
   // render + live updates via storage.onChanged so concurrent fetches
   // appear without manual refresh.
+  //
+  // The sync-area branch keeps the options page in lockstep with the
+  // sidepanel for shared user prefs (uiLanguage, uiTheme): when the
+  // user changes language/theme in the sidepanel the options page
+  // already-open in another window/tab re-applies them too.
   await renderHiddenModeHistory();
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === 'local' && changes.avTaskHistory) {
       renderHiddenModeHistory(changes.avTaskHistory.newValue || []);
+    }
+    if (areaName === 'sync') {
+      if (changes.uiLanguage) {
+        const newVal = changes.uiLanguage.newValue || '';
+        const normalized = newVal === 'zh' ? 'zh-TW' : newVal;
+        // Don't clobber the dropdown if the user is currently
+        // interacting with it (avoid mid-click value reset).
+        const sel = $('uiLanguage');
+        if (sel && document.activeElement !== sel) {
+          sel.value = normalized;
+        }
+        applyUiLanguage(normalized);
+        // History table cells may include translated status labels;
+        // re-render to pick the new locale up.
+        renderHiddenModeHistory().catch(() => {});
+      }
+      if (changes.uiTheme) {
+        applyTheme(changes.uiTheme.newValue || 'dark');
+      }
     }
   });
   const clearBtn = $('hiddenModeHistoryClearBtn');

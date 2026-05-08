@@ -3529,6 +3529,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
         msg.payload && msg.payload.ts,
       ).catch(() => {});
     }
+  } else if (msg.type === 'BROWSER_JOB_PROGRESS') {
+    // Forward offscreen's per-segment progress to other extension
+    // contexts (sidepanel listens for `action: 'browserJobProgress'`).
+    // The NAS API doesn't track upload progress for browser-side jobs
+    // — the extension owns this counter, so the SW just relays it.
+    // Fire-and-forget; lastError swallows "no receiver" when no
+    // sidepanel/options page is open.
+    const p = msg.payload || {};
+    if (p.jobId) {
+      chrome.runtime.sendMessage({
+        action: 'browserJobProgress',
+        jobId: p.jobId,
+        done: p.done,
+        total: p.total,
+      }, () => { void chrome.runtime.lastError; });
+    }
   } else if (msg.type === 'OFFSCREEN_READY') {
     // Codex adversarial-review (high): offscreen.js sends this once its
     // chrome.runtime.onMessage listener is registered. Resolves the

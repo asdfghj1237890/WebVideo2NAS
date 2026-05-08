@@ -4,17 +4,22 @@
 
 ## 1. Endpoint 全表
 
-7 個 endpoint，按權限類型分：
+按權限類型分:
 
 | 路徑 | Method | Auth | Rate limit bucket | 用途 |
 |---|---|---|---|---|
-| `/` | GET | 無 | — | 名片 page（name + version） |
+| `/` | GET | 無 | — | 名片 page(name + version) |
 | `/api/health` | GET | ✅ Bearer | write | DB + Redis 連線 check |
-| `/api/download` | POST | ✅ Bearer | write | 建立 download job |
-| `/api/jobs` | GET | ✅ Bearer | read (×6) | 列 jobs（可選 status filter） |
+| `/api/download` | POST | ✅ Bearer | write | 建立 download job(NAS-direct path) |
+| `/api/jobs` | GET | ✅ Bearer | read (×6) | 列 jobs(可選 status filter) |
 | `/api/jobs/{id}` | GET | ✅ Bearer | read (×6) | 單 job 詳情 |
 | `/api/jobs/{id}` | DELETE | ✅ Bearer | write | 取消 job |
-| `/api/status` | GET | ✅ Bearer | read (×6) | 系統狀態（active downloads / queue length） |
+| `/api/status` | GET | ✅ Bearer | read (×6) | 系統狀態(active downloads / queue length) |
+| `/api/jobs/init` | POST | ✅ Bearer | write | **v3.0+** browser-side: 建 job + 解析 manifest_text → plan |
+| `/api/jobs/{id}/segments/{track}/{seq}` | PUT | ✅ Bearer | write | **v3.0+** browser-side: 上傳一段 staged segment |
+| `/api/jobs/{id}/init/{label}` | PUT | ✅ Bearer | write | **v3.0+** browser-side: 上傳 init segment(label = `video` / `audio`) |
+| `/api/jobs/{id}/finalize` | POST | ✅ Bearer | write | **v3.0+** browser-side: 觸發 worker mux |
+| `/api/jobs/{id}/abort` | POST | ✅ Bearer | write | **v3.0+** browser-side: 客戶端中斷,刪 staging |
 
 **Read 跟 write bucket 分開**：read 限額是 write 的 6 倍（[main.py:145](../../video-downloader/docker/api/main.py:145)）。預設 `RATE_LIMIT_PER_MINUTE=60` 表示 60 write/min + 360 read/min per IP。
 
@@ -59,9 +64,12 @@ error_message   TEXT
 retry_count     INTEGER DEFAULT 0
 ```
 
-`status` 機械: `pending` → `downloading` → `processing` (merge phase) → `completed` / `failed` / `cancelled`。
+`status` 機械:
 
-只有 `(pending, downloading, processing)` 是 in-flight；DELETE /api/jobs/{id} 在這三個 status 才能做 cancel（line 530）。
+- **NAS-direct path** (v2 預設、v3+ MP4): `pending` → `downloading` → `processing` (merge phase) → `completed` / `failed` / `cancelled`
+- **Browser-side path** (v3.0+ HLS/DASH 預設): `browser_pending` → `browser_uploading` → `browser_finalizing` → `completed` / `failed` / `cancelled`
+
+In-flight 狀態 (DELETE 可 cancel):`pending` / `downloading` / `processing` / `browser_pending` / `browser_uploading` / `browser_finalizing`。Browser-side 狀態的 DELETE 會先 fire `CANCEL_BROWSER_JOB` 給 offscreen 中斷 in-flight PUT,再 rmtree staging dir。
 
 `file_path` 在 `failed` / `cancelled` 也可能有值（partial file）— `db_cleanup` service 會 rm 這些 partial。
 
@@ -81,6 +89,9 @@ user_agent       TEXT
 output_subdir    TEXT                              -- normalized 過的相對路徑（例如 "site_a"）
 actual_duration  INTEGER                           -- ffprobe 量出來的實際時長
 suspect_reason   TEXT                              -- 非 null 表示「這支看起來不對」
+mode             VARCHAR(20)                       -- v3.0+: 'nas_direct' | 'browser'
+staging_dir      TEXT                              -- v3.0+: browser-side staging 路徑(/downloads/.staging/<job_id>)
+finalize_started_at TIMESTAMP                      -- v3.0+: browser-side 進 finalize 的時間(stale reaper 用)
 ```
 
 `output_subdir`、`actual_duration`、`suspect_reason` 是後加的欄位（[migration in main.py:64-90](../../video-downloader/docker/api/main.py:64)），所以舊 row 可能是 NULL。

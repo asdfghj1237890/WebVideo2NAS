@@ -27,6 +27,23 @@
               <span class="pulse-dot" aria-hidden="true"></span>
               <span id="detectedCountText">0 on page</span>
             </span>
+            <!-- Browser-side mode indicator. Visible only when
+                 settings.useBrowserSide !== false (the default). Tells
+                 the user that HLS/DASH downloads will fetch segments
+                 in the browser session and stream them to NAS, which
+                 is what enables IP/cookie-bound CDN tokens to work
+                 but also why play-first is required. -->
+            <span id="modeBadge" class="mode-badge" hidden
+                  title="HLS/DASH downloads run in this browser's session and stream to NAS. Required for IP-bound / cookie-bound CDN tokens; disable in extension options for legacy NAS-direct downloads.">
+              <span class="mode-badge-icon" aria-hidden="true">
+                <svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor"
+                     stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="6" cy="6" r="4.5"/>
+                  <path d="M1.5 6h9M6 1.5c1.7 1.6 1.7 7.4 0 9M6 1.5c-1.7 1.6-1.7 7.4 0 9"/>
+                </svg>
+              </span>
+              <span id="modeBadgeText">BROWSER</span>
+            </span>
           </div>
         </div>
         <div class="header-right">
@@ -117,9 +134,9 @@
             </summary>
             <div class="trusted-cdn-row">
               <input id="trustedCdnSuffixes" class="trusted-cdn-input" type="text"
-                     placeholder="phncdn.com, akamaized.net"
+                     placeholder="cdn.example.com, media.example.net"
                      spellcheck="false" autocomplete="off"
-                     title="Comma-separated host suffixes (e.g. 'phncdn.com'). Bypasses the cross-site gate for browser-side mode. SECURITY: only add CDNs you trust — they receive cookies + CORS-relax.">
+                     title="Comma-separated host suffixes (e.g. 'cdn.example.com'). Bypasses the cross-site gate for browser-side mode. SECURITY: only add CDNs you trust — they receive cookies + CORS-relax.">
             </div>
           </details>
           <div id="detectedUrlsList" class="grid">

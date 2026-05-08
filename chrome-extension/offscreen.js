@@ -87,7 +87,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       payload: { jobId, ts: Date.now() },
     }).catch(() => {});
 
-    runJob({ ...msg.payload, signal: controller.signal })
+    // Throttled progress emitter. segmentDownloader.runJob calls
+    // onProgress per media segment; for a 65-segment HLS that's 65
+    // events. Many quick events would still be cheap on the SW message
+    // bus, but throttling avoids hammering chrome.runtime.sendMessage
+    // when the UI doesn't need pixel-precise updates. Always emit the
+    // first event (so the bar leaves 0% promptly) and the last event
+    // (so it lands on 100%); throttle the middle.
+    const PROGRESS_THROTTLE_MS = 200;
+    let lastProgressTs = 0;
+    const onProgress = ({ done, total }) => {
+      const now = Date.now();
+      const isFirst = done === 1;
+      const isLast = total > 0 && done >= total;
+      if (!isFirst && !isLast && now - lastProgressTs < PROGRESS_THROTTLE_MS) return;
+      lastProgressTs = now;
+      chrome.runtime.sendMessage({
+        type: 'BROWSER_JOB_PROGRESS',
+        target: 'service-worker',
+        payload: { jobId, done, total, ts: now },
+      }).catch(() => {});
+    };
+
+    runJob({ ...msg.payload, signal: controller.signal, onProgress })
       .then(async (summary) => {
         await deliverCompletionWhileAlive({
           type: 'BROWSER_JOB_DONE',

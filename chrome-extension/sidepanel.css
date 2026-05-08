@@ -152,6 +152,32 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   animation: wv2nPulseDot 2s ease-in-out infinite;
 }
 
+/* Browser-side mode pill. Sits next to .count-badge in the status
+   row. Accent-tinted border + text so the user can scan three
+   chips at a glance — green (connection), neutral (page count),
+   accent (browser mode active). */
+.mode-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10px;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-family: var(--mono); font-weight: 600;
+  padding: 3px 8px 3px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-dim, var(--glass-border-hi));
+  background: color-mix(in oklch, var(--accent) 6%, transparent);
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: border-color 320ms, color 320ms, background 320ms;
+}
+.mode-badge[hidden] { display: none; }
+.mode-badge-icon {
+  display: inline-flex; align-items: center;
+  color: var(--accent);
+  opacity: 0.85;
+}
+
 .icon-btn {
   width: 30px; height: 30px; border-radius: 6px;
   background: transparent; border: none;
@@ -543,6 +569,27 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   box-shadow: 0 4px 14px rgba(0,0,0,0.4);
 }
 .send-btn:active { transform: scale(0.95); }
+/* Browser-side play-first gate: button is disabled with a play-arrow
+   icon (rendered in JS) until the page's player has actually called
+   play(). Tooltip carries the explanation. Visual cue: muted color
+   + slightly translucent + no hover transform so it reads as
+   "waiting on you" not "broken". */
+.send-btn.play-first-blocked,
+.send-btn[disabled] {
+  background: rgba(0,0,0,0.45);
+  color: rgba(255,255,255,0.55);
+  border-color: rgba(255,255,255,0.10);
+  cursor: not-allowed;
+  opacity: 0.85;
+}
+.send-btn.play-first-blocked:hover,
+.send-btn[disabled]:hover {
+  background: rgba(0,0,0,0.45);
+  color: rgba(255,255,255,0.55);
+  border-color: rgba(255,255,255,0.10);
+  transform: none;
+  box-shadow: none;
+}
 
 /* Crossfade arrow → check icon when tile has been sent */
 .send-icon {

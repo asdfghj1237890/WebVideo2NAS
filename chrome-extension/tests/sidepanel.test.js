@@ -83,4 +83,19 @@ describe('sidepanel.js helper functions', () => {
     err.name = 'AbortError';
     expect(ctx.connectionReasonFromError(err)).toBe('error.timeout.type');
   });
+
+  it('deriveTrustedCdnSuffix uses the full host instead of guessing eTLD+1', () => {
+    const ctx = loadScriptIntoContext('sidepanel.js', {
+      chrome: makeChromeStub(),
+      document: makeDocumentStub(),
+      window: {},
+    });
+
+    expect(ctx.deriveTrustedCdnSuffix('https://cdn.example.co.uk/video/master.m3u8'))
+      .toBe('cdn.example.co.uk');
+    expect(ctx.deriveTrustedCdnSuffix('media.example.net:443/path/master.m3u8'))
+      .toBe('media.example.net');
+    expect(ctx.deriveTrustedCdnSuffix('https://127.0.0.1/x.m3u8')).toBeNull();
+    expect(ctx.deriveTrustedCdnSuffix('localhost')).toBeNull();
+  });
 });

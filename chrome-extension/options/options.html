@@ -312,9 +312,13 @@
               <div class="kv">
                 <span class="key">url_template</span>
                 <span class="eq">=</span>
-                <input id="hiddenModeUrlTemplate" class="input" type="text"
-                       placeholder="https://missav.ws/dm18/{code}"
-                       spellcheck="false" autocomplete="off">
+                <span class="kv-edit">
+                  <span class="quote">"</span>
+                  <input id="hiddenModeUrlTemplate" class="input" type="text"
+                         placeholder="https://missav.ws/dm18/{code}"
+                         spellcheck="false" autocomplete="off">
+                  <span class="quote">"</span>
+                </span>
                 <span class="comment-inline" id="hiddenModeUrlTemplateComment"># {code} is replaced with the input</span>
               </div>
 
@@ -413,7 +417,7 @@
           <span>UTF-8</span>
           <span>TOML</span>
           <span>LF</span>
-          <span class="unsaved" id="unsavedIndicator">● <span id="unsavedCount">0</span> unsaved</span>
+          <span class="unsaved" id="unsavedIndicator">● <span id="unsavedCount">0</span> <span id="unsavedLabel">unsaved</span></span>
           <span class="autosave-hint" id="autosaveHint">↻ auto-saves on edit</span>
           <span class="status-toast hidden" id="statusToast"></span>
           <span class="grow"></span>

@@ -259,6 +259,30 @@ docker exec -it video_worker_1 python /app/worker/backfill_suspect.py --report-o
 
 詳細 flag 跟運作模式 → script 自己的 docstring。
 
+## 9.1 Browser-side mode (v3.0+):worker 只做 ffmpeg mux
+
+當 extension 走 [browser-side pipeline](./03-chrome-extension.md#8-browser-side-pipeline-v30),worker 完全不接觸 source CDN。流程:
+
+```
+extension PUT segments → /api/jobs/{id}/segments/...
+   → API 寫 staging_dir/track/seg_NNNNNNNN.bin
+extension POST /api/jobs/{id}/finalize
+   → API: status='browser_finalizing', RPUSH download_queue
+[Worker BLPOP] →
+   1. SELECT * FROM job_metadata 看 mode='browser' + staging_dir
+   2. ffmpeg -f mpegts -i pipe:0 -c copy ... < concat(staging_dir/video/seg_*)
+      (audio track 同理,如果有)
+   3. UPDATE jobs SET status='completed', file_path='...'
+   4. rmtree staging_dir
+```
+
+關鍵差異:
+
+- `_process_m3u8_download` 等三條原本的 path **不會跑** — 看 `mode='browser'` 進另一個 branch
+- 沒有 segment fetch、AES decrypt、token retry 那些 — 那段全在 extension 端做完了
+- HostThrottle、anti-hotlink detection 對這條 path 都不適用
+- Stale-browser-job reaper 在啟動時跑(超過 6h 還在 `browser_pending` / `browser_uploading` / `browser_finalizing` → 標 failed,清 staging_dir)
+
 ## 10. 改 worker 時要注意
 
 - **改 m3u8 path 不會自動 cover MPD / direct path** — 三條獨立。改 `_process_m3u8_download` 的時候別假設 MPD 也會跟著修

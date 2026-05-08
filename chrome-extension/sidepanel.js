@@ -7,6 +7,13 @@ let settings = {};
 let detectedUrls = [];
 let deepHits = [];
 let jobs = [];
+// Browser-side jobs: live segment-upload progress pushed from the
+// offscreen document via the SW (BROWSER_JOB_PROGRESS → action:
+// 'browserJobProgress'). The NAS API doesn't track upload-phase
+// progress for browser-side jobs, so we keep our own map here and
+// re-apply it after every loadRecentJobs() poll (which would
+// otherwise overwrite job.progress with the API's stale 0).
+const liveBrowserProgress = new Map();  // jobId(string) → { done, total, percent }
 let expandedErrorIds = new Set();
 let activeTabId = null;
 let loadDetectedUrlsSeq = 0;
@@ -23,16 +30,24 @@ let jobSort = 'failed';           // 'failed' | 'active' — recent jobs sort mo
 
 const JOB_SORT_CYCLE = ['failed', 'active'];
 
+// browser-side states sit in the same priority class as their
+// NAS-direct counterparts so they share rank with active in-flight
+// work instead of falling through to the `?? 99` fallback (which put
+// them at the bottom of the list mid-upload). browser_uploading
+// mirrors downloading (actively transferring bytes); browser_finalizing
+// mirrors merging (server is muxing); browser_pending mirrors pending.
 const STATUS_RANK_ACTIVE = {
-  downloading: 0, processing: 1, merging: 1,
-  pending: 2,
+  downloading: 0, browser_uploading: 0,
+  processing: 1, merging: 1, browser_finalizing: 1,
+  pending: 2, browser_pending: 2,
   completed: 3,
   failed: 4, cancelled: 5,
 };
 const STATUS_RANK_FAILED = {
   failed: 0,
   downloading: 1, processing: 1, merging: 1,
-  pending: 2,
+  browser_uploading: 1, browser_finalizing: 1,
+  pending: 2, browser_pending: 2,
   completed: 3,
   cancelled: 4,
 };
@@ -71,6 +86,14 @@ async function loadSettingsFromStorage() {
     'nasEndpoint', 'apiKey', 'uiLanguage', 'uiTheme', 'jobSort',
     'hiddenMode', 'hiddenModeUrlTemplate',
     'trustedCdnSuffixes',
+    // useBrowserSide drives the play-first hide, the bulk-skip
+    // filter, and the new mode-badge in the header. Was missing
+    // from this list — references treated it as undefined, which
+    // happens to coincide with the default-on semantics, so the
+    // bug stayed dormant unless the user turned the option off
+    // (in which case sidepanel kept hiding non-playing tiles
+    // even though NAS-direct doesn't need play-first).
+    'useBrowserSide',
   ]);
   if (settings.jobSort && JOB_SORT_CYCLE.includes(settings.jobSort)) {
     jobSort = settings.jobSort;
@@ -103,6 +126,19 @@ function parseTrustedCdnSuffixesInput(raw) {
   return Array.from(seen);
 }
 
+function applyModeBadge() {
+  const badge = document.getElementById('modeBadge');
+  if (!badge) return;
+  const on = !settings || settings.useBrowserSide !== false;
+  badge.hidden = !on;
+  // Title (tooltip) stays static — set in HTML — so no need to
+  // localize per render. The visible text key is fixed and short
+  // enough that running it through t() each time is a no-op
+  // unless the user changes locale.
+  const txt = document.getElementById('modeBadgeText');
+  if (txt) txt.textContent = t('header.browserMode');
+}
+
 function populateTrustedCdnInput() {
   const input = document.getElementById('trustedCdnSuffixes');
   if (!input) return;
@@ -131,32 +167,43 @@ async function saveTrustedCdnInput() {
   }
 }
 
-// Derive a reasonable host-suffix from a URL for the per-tile "+"
-// trust button. Last 2 dot-separated parts cover the vast majority
-// of CDN domains (phncdn.com, akamaized.net, cloudfront.net, ...).
-// Edge cases (co.uk, com.tw) get over-broad results; the user can
-// edit the trusted CDNs textbox to narrow if needed.
+// Derive the exact hostname from a URL for the per-tile "+" trust
+// button. We intentionally store the full host rather than guessing
+// an eTLD+1 from the last two labels: without a Public Suffix List,
+// hosts like `cdn.example.co.uk` would collapse to the dangerously
+// broad `co.uk`. The matcher still treats entries as suffixes, so a
+// user can manually widen the trust boundary in the textbox when they
+// really mean to trust a whole CDN suffix.
 //
 // Returns null when "+" trust would be meaningless: malformed URL,
 // IP literal (gate rejects regardless of trust list), single-label
 // host (e.g. localhost — also rejected by gate).
 function deriveTrustedCdnSuffix(urlOrHost) {
   if (typeof urlOrHost !== 'string' || !urlOrHost) return null;
-  let host;
-  if (urlOrHost.includes('://')) {
-    try { host = new URL(urlOrHost).hostname; } catch (_) { return null; }
-  } else {
-    host = urlOrHost;
+  const raw = urlOrHost.trim();
+  if (!raw) return null;
+  let host = raw;
+  try {
+    if (raw.includes('://')) {
+      host = new URL(raw).hostname;
+    } else if (raw.includes('/') || raw.includes(':')) {
+      host = new URL(`https://${raw}`).hostname;
+    }
+  } catch (_) {
+    return null;
   }
   if (!host) return null;
-  host = host.toLowerCase();
+  host = host.toLowerCase().replace(/^\.+|\.+$/g, '');
   // IP literal (v4 or bracketed v6) — gate rejects at IP-classification
   // step, no trust list change can unblock these.
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return null;
   if (host.startsWith('[')) return null;
   const parts = host.split('.').filter(Boolean);
   if (parts.length < 2) return null;
-  return parts.slice(-2).join('.');
+  // Conservative DNS-ish shape check. URL.hostname already punycodes
+  // IDNs, so xn-- labels are fine here.
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host)) return null;
+  return host;
 }
 
 // Pure JS twin of background.js's `_wv2nasMatchesTrustedCdnSuffix`.
@@ -274,6 +321,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyUiLanguage();
   populateTrustedCdnInput();
   updateTrustedCdnCount();
+  applyModeBadge();
 
   checkConnection();
   loadDetectedUrls();
@@ -286,9 +334,41 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (activeTabId != null && message.tabId === activeTabId) {
         loadDetectedUrls();
       }
+    } else if (message && message.action === 'browserJobProgress') {
+      handleBrowserJobProgress(message);
     }
   });
 });
+
+function handleBrowserJobProgress(message) {
+  const idStr = String(message.jobId || '');
+  if (!idStr) return;
+  const total = Number(message.total) || 0;
+  const done = Number(message.done) || 0;
+  const percent = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+  liveBrowserProgress.set(idStr, { done, total, percent });
+
+  const job = jobs.find((j) => String(j.id) === idStr);
+  if (!job) return;
+  // Promote browser_pending → browser_uploading once the first
+  // segment lands. The API status update may lag; the user-visible
+  // progress should kick in on the first event.
+  if (job.status === 'browser_pending') job.status = 'browser_uploading';
+  job.progress = percent;
+
+  const itemEl = document.getElementById(`job-${idStr}`);
+  if (!itemEl) return;
+  const oldStatus = itemEl.dataset.status;
+  itemEl.dataset.status = job.status;
+  itemEl.dataset.progress = String(job.progress);
+  if (shouldFullRender(oldStatus, job.status)) {
+    itemEl.innerHTML = getJobInnerHtml(job);
+    bindJobEvents(itemEl, idStr);
+  } else {
+    updateJobElement(itemEl, job);
+  }
+  startTween(itemEl, idStr, percent);
+}
 
 function setupEventListeners() {
   document.getElementById('settingsBtn').addEventListener('click', openSettings);
@@ -400,10 +480,21 @@ function setupEventListeners() {
       if (needsUiUpdate) {
         settings.uiLanguage = changes.uiLanguage.newValue || '';
         applyUiLanguage();
+        applyModeBadge();   // re-localize "BROWSER" label
         renderDetectedUrls({ keepPulse: false });
         const listElement = document.getElementById('recentJobsList');
         if (listElement) listElement.innerHTML = '';
         renderJobs();
+      }
+
+      if (changes.useBrowserSide) {
+        // Toggling browser-side flips the play-first hide AND the
+        // mode badge. Update settings cache, badge, and re-render
+        // detected tiles so previously-hidden ones (or vice versa)
+        // pop in/out without waiting for the next detection event.
+        settings.useBrowserSide = changes.useBrowserSide.newValue;
+        applyModeBadge();
+        renderDetectedUrls({ keepPulse: false });
       }
 
       if (needsThemeUpdate) {
@@ -532,14 +623,26 @@ function shortHost(endpoint) {
 function loadDetectedUrls() {
   const seq = ++loadDetectedUrlsSeq;
 
-  detectedUrls = [];
-  deepHits = [];
-  renderDetectedUrls({ keepPulse: false });
-
+  // Don't clear-and-render before the async tabs.query/sendMessage
+  // round-trip — that path made the grid flash to the empty state
+  // EVERY time a new URL was detected (background notifies us at
+  // most once a second, but the user still saw a brief blank gap).
+  // Only clear when the active tab actually changed; for same-tab
+  // updates keep the existing list visible and let renderDetectedUrls
+  // do an in-place swap when the response lands.
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (seq !== loadDetectedUrlsSeq) return;
 
-    activeTabId = (tabs && tabs[0]) ? tabs[0].id : null;
+    const newTabId = (tabs && tabs[0]) ? tabs[0].id : null;
+    const tabChanged = newTabId !== activeTabId;
+    activeTabId = newTabId;
+
+    if (tabChanged) {
+      detectedUrls = [];
+      deepHits = [];
+      renderDetectedUrls({ keepPulse: false });
+    }
+
     chrome.runtime.sendMessage({ action: 'getDetectedUrls', tabId: activeTabId }, (response) => {
       if (seq !== loadDetectedUrlsSeq) return;
 
@@ -658,6 +761,23 @@ function uniqueQualityLabels(items) {
   return order.filter(q => set.has(q));
 }
 
+// Browser-side play-first gate. HLS / DASH downloads need the
+// browser session's just-issued (often IP-bound, expiring-in-
+// minutes) token; the page's player typically only requests it
+// at the moment it calls play(). Sending before that gives the
+// extension a stale URL and the segments 403. Doesn't apply to
+// MP4 (NAS-direct, the URL is the auth material) or when the
+// user has explicitly disabled useBrowserSide.
+function urlInfoRequiresPlayFirst(urlInfo) {
+  if (!urlInfo || !urlInfo.url) return false;
+  const browserSideOn = !settings || settings.useBrowserSide !== false;
+  if (!browserSideOn) return false;
+  const fmt = (urlInfo.detectedFormat || classifyVideoType(urlInfo.url) || '').toUpperCase();
+  if (fmt !== 'M3U8' && fmt !== 'MPD') return false;
+  const isNowPlaying = !!urlInfo.isNowPlaying || !!urlInfo.isLive;
+  return !isNowPlaying;
+}
+
 function visibleDetectedUrls() {
   let items = sortedDetectedUrls();
   if (qualityFilter !== 'all') {
@@ -666,6 +786,14 @@ function visibleDetectedUrls() {
   if (searchQuery) {
     items = items.filter(it => String(it.url || '').toLowerCase().includes(searchQuery));
   }
+  // Browser-side play-first hide: HLS/DASH tiles whose page hasn't
+  // started playback yet are useless to the user (the IP-bound HMAC
+  // token isn't issued until play()), so we hide them rather than
+  // showing a disabled button. The corresponding empty-state message
+  // (in renderDetectedUrls) explains why the list is empty.
+  // urlInfoRequiresPlayFirst() returns false when useBrowserSide is
+  // off OR the format isn't HLS/DASH OR the tile is already playing.
+  items = items.filter(it => !urlInfoRequiresPlayFirst(it));
   return items;
 }
 
@@ -733,6 +861,29 @@ function renderDetectedUrls(opts) {
     return;
   }
 
+  // total > 0 but `visible` is empty — most commonly because every
+  // detected HLS/DASH tile was filtered out by the play-first hide.
+  // Distinguish from search/quality-filter empties (which the user
+  // can recover from by clearing the chip / search box) by checking
+  // whether the pre-filter sorted list has any play-first hits.
+  if (visible.length === 0) {
+    const playFirstHidden = sortedDetectedUrls().some(urlInfoRequiresPlayFirst);
+    if (playFirstHidden) {
+      listElement.innerHTML = `
+        <div class="empty-state">
+          <p>${escapeHtml(t('empty.playFirst.title'))}</p>
+          <p class="hint">${escapeHtml(t('empty.playFirst.hint'))}</p>
+        </div>
+      `;
+      selected.clear();
+      updateBulkBar();
+      prevDetectedIds = new Set();
+      return;
+    }
+    // else: search/quality filter ate everything — leave the grid
+    // blank; the user-facing toolbar chip + search box show why.
+  }
+
   // Prune selected/sent entries that no longer exist
   const allIds = new Set(detectedUrls.map(d => d.url));
   for (const id of Array.from(selected)) {
@@ -761,6 +912,13 @@ function renderDetectedUrls(opts) {
     const tone = thumbColorForUrl(url);
     const top = topQualityLabel(url);
     const isNowPlaying = !!urlInfo.isNowPlaying || !!urlInfo.isLive;
+
+    // Defense-in-depth: if a play-first tile somehow made it past
+    // visibleDetectedUrls() (e.g., classifier mislabel or future
+    // refactor), the send button still locks instead of firing a
+    // doomed request. Hide-mode means this branch isn't normally
+    // reached — visibleDetectedUrls already filtered it out.
+    const requiresPlayFirst = urlInfoRequiresPlayFirst(urlInfo);
 
     const thumbnail = urlInfo.thumbnail || null;
     // Trust-CDN button state. Hide entirely when the URL host is an
@@ -799,15 +957,21 @@ function renderDetectedUrls(opts) {
               </svg>
             </span>
           ` : `
-            <button class="send-btn" type="button"
-                    title="${escapeHtml(isSent ? t('url.sentResend') : t('url.sendToNas'))}"
-                    data-action="send"
+            <button class="send-btn${requiresPlayFirst ? ' play-first-blocked' : ''}" type="button"
+                    title="${escapeHtml(requiresPlayFirst
+                      ? t('url.playFirst.tooltip')
+                      : (isSent ? t('url.sentResend') : t('url.sendToNas')))}"
+                    ${requiresPlayFirst ? 'disabled aria-disabled="true"' : 'data-action="send"'}
                     data-url="${escapeHtml(url)}"
                     data-page="${escapeHtml(urlInfo.pageUrl || '')}">
               <span class="send-icon icon-arrow" aria-hidden="true">
                 <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor"
                      stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M3 8h10M9 4l4 4-4 4"/>
+                  ${requiresPlayFirst
+                    /* Play-triangle icon when blocked, so the disabled state
+                       reads as "press play first" instead of a generic ban. */
+                    ? '<path d="M5 3l9 5-9 5V3z" fill="currentColor" stroke="none"/>'
+                    : '<path d="M3 8h10M9 4l4 4-4 4"/>'}
                 </svg>
               </span>
               <span class="send-icon icon-check" aria-hidden="true">
@@ -1049,8 +1213,27 @@ function flyToNAS(tileEl, url, pageUrl) {
 
 function bulkSend(items) {
   if (!items || items.length === 0) return;
+  // Filter out HLS / DASH items that haven't been played yet — same
+  // gate as the per-tile send button. Many-mode users can still
+  // SELECT them (so the count badge reflects everything), but the
+  // bulk send skips the not-ready ones and toasts how many were
+  // skipped so the user knows to press play and retry.
+  const ready = [];
+  let skipped = 0;
+  for (const it of items) {
+    if (urlInfoRequiresPlayFirst(it)) skipped += 1;
+    else ready.push(it);
+  }
+  if (skipped > 0) {
+    showToast(t('url.playFirst.bulkSkipped', { n: skipped }));
+  }
+  if (ready.length === 0) {
+    selected.clear();
+    setTimeout(updateBulkBar, 50);
+    return;
+  }
   // Stagger the visual sends so each tile gets its own flight; cap concurrency.
-  const list = items.slice();
+  const list = ready.slice();
   const step = Math.max(40, Math.min(120, Math.floor(800 / list.length)));
   list.forEach((it, i) => {
     setTimeout(() => {
@@ -1144,6 +1327,25 @@ async function loadRecentJobs() {
 
     if (response.ok) {
       jobs = await response.json();
+      // The API returns progress=0 for browser-side uploads (it doesn't
+      // track that phase). Re-apply the live counter we kept from
+      // BROWSER_JOB_PROGRESS pushes so the just-polled `jobs` doesn't
+      // visually snap back to 0% mid-upload. Drop entries for jobs no
+      // longer in the uploading state to bound the map.
+      const livePresentIds = new Set();
+      for (const job of jobs) {
+        const idStr = String(job.id);
+        if (job.status === 'browser_uploading') {
+          const live = liveBrowserProgress.get(idStr);
+          if (live) {
+            job.progress = live.percent;
+            livePresentIds.add(idStr);
+          }
+        }
+      }
+      for (const id of Array.from(liveBrowserProgress.keys())) {
+        if (!livePresentIds.has(id)) liveBrowserProgress.delete(id);
+      }
       renderJobs();
     }
   } catch (error) {
@@ -1404,12 +1606,17 @@ function jobStatusLabel(job) {
   const pct = Number(job.progress) || 0;
   if (job.status === 'downloading') return `${getStatusLabel(job.status)} ${pct.toFixed(2)}%`;
   if (job.status === 'processing' || job.status === 'merging') return `${getStatusLabel(job.status)} ${pct.toFixed(2)}%`;
-  // Browser-side: the API doesn't update `progress` during upload (the
-  // extension does its own in-memory tracking), so we just show the
-  // state label without a numeric percentage.
+  // Browser-side upload: the NAS API doesn't track upload-phase progress;
+  // the extension pushes per-segment progress via BROWSER_JOB_PROGRESS,
+  // which `handleBrowserJobProgress` writes onto job.progress. Show the
+  // percentage when we have a non-zero value; otherwise fall back to the
+  // bare state label (covers the brief gap before the first segment lands).
+  if (job.status === 'browser_uploading') {
+    if (pct > 0) return `${getStatusLabel(job.status)} ${pct.toFixed(2)}%`;
+    return getStatusLabel(job.status);
+  }
   if (
     job.status === 'browser_pending'
-    || job.status === 'browser_uploading'
     || job.status === 'browser_finalizing'
   ) {
     return getStatusLabel(job.status);
@@ -1439,6 +1646,17 @@ function updateJobElement(el, job) {
     const speedEl = meta.querySelector('[data-speed]');
     if (speedEl && job.speed != null) speedEl.textContent = `${job.speed} MB/s`;
   }
+  // Ring stroke color tracks status, so a transition between two
+  // ACTIVE statuses (e.g. browser_pending → browser_uploading,
+  // browser_uploading → browser_finalizing) needs an explicit
+  // attribute write here. shouldFullRender() returns false for
+  // active→active to preserve the smooth dasharray tween — without
+  // this, the SVG stroke attribute keeps whatever value the FIRST
+  // render baked in, leaving (e.g.) a job that started as
+  // browser_pending stuck on the warn (orange) ring color even after
+  // it's been uploading for a while.
+  const arc = el.querySelector('[data-ring-arc]');
+  if (arc) arc.setAttribute('stroke', ringStrokeForStatus(job.status));
 }
 
 function startTween(el, jobId, target) {

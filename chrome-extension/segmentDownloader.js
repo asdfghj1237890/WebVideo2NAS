@@ -694,7 +694,10 @@ async function runWithConcurrency(tasks, concurrency) {
  * @param {Object} opts.plan - server-returned plan (tracks, segments, etc.)
  * @param {Object} [opts.requestHeaders] - sent on segment fetches (Referer/UA/etc)
  * @param {AbortSignal} [opts.signal] - cancellation signal
- * @param {Function} [opts.onProgress] - called as ({track, seq}) per segment done
+ * @param {Function} [opts.onProgress] - called as ({track, seq, done, total})
+ *   after each MEDIA segment uploads. `done` and `total` count media
+ *   segments only (init segments are not counted — they finish before
+ *   the loop starts and would skew very early progress to nonzero).
  * @param {number} [opts.concurrency=6]
  */
 export async function runJob({
@@ -710,6 +713,19 @@ export async function runJob({
   const tracks = plan.tracks || {};
   const trackNames = Object.keys(tracks);
   if (trackNames.length === 0) throw new Error('runJob: plan has no tracks');
+
+  // Track segment-level progress for the caller. JS is single-threaded
+  // so the increment is race-free even under concurrent processOneSegment
+  // tasks. `total` is set just before the concurrency loop so it counts
+  // exactly the media segments scheduled below.
+  let _doneCount = 0;
+  let _totalCount = 0;
+  const wrappedOnProgress = onProgress ? (info) => {
+    _doneCount += 1;
+    try {
+      onProgress({ ...info, done: _doneCount, total: _totalCount });
+    } catch (_) { /* never let a callback bug abort the upload */ }
+  } : null;
 
   // Codex review #9: derive the trust base for credential scoping. The
   // resolved variant URL takes precedence (most specific), falling back
@@ -747,10 +763,11 @@ export async function runJob({
       for (const segment of segs) {
         tasks.push(() => processOneSegment({
           segment, track: trackName, jobId, nasEndpoint, apiKey,
-          requestHeaders, keyCache, signal, onProgress, trustedBase,
+          requestHeaders, keyCache, signal, onProgress: wrappedOnProgress, trustedBase,
         }));
       }
     }
+    _totalCount = tasks.length;
 
     await runWithConcurrency(tasks, concurrency);
 

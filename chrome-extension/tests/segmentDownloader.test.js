@@ -1744,3 +1744,161 @@ describe('runJob: redirect: error guard (Codex P1)', () => {
     expect(caught).not.toBeNull();
   }, 15000);
 });
+
+
+// runJob's onProgress callback feeds the offscreen → SW → sidepanel
+// progress pipeline. NAS API doesn't track upload-phase progress for
+// browser-side jobs; the extension is the source of truth. The hook
+// must:
+//   - fire exactly once per MEDIA segment (init segments excluded)
+//   - report monotonically-increasing `done` from 1..N
+//   - report `total` = number of media segments scheduled
+//   - tolerate callback exceptions (must never abort the upload)
+
+describe('runJob: onProgress callback (browser-side progress pipeline)', () => {
+  let originalFetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+
+  function ok(text, status = 200, type = 'text/plain') {
+    return {
+      ok: status < 400, status,
+      text: async () => text,
+      arrayBuffer: async () => new TextEncoder().encode(text).buffer,
+      headers: new Map([['content-type', type]]),
+    };
+  }
+  function setFetchRouter(handler) {
+    globalThis.fetch = vi.fn(async (url, opts) => {
+      const u = String(url);
+      const result = handler(u, opts);
+      if (result instanceof Error) throw result;
+      return result;
+    });
+  }
+
+  it('reports done=1..N, total=N for a single-track plan', async () => {
+    setFetchRouter(() => ok('OK'));
+    const events = [];
+    await runJob({
+      jobId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      nasEndpoint: 'http://nas/', apiKey: 'k',
+      plan: {
+        source_url: 'https://cdn.example.com/m.m3u8',
+        tracks: {
+          video: {
+            segments: [
+              { url: 'https://cdn.example.com/s0.ts' },
+              { url: 'https://cdn.example.com/s1.ts' },
+              { url: 'https://cdn.example.com/s2.ts' },
+            ],
+          },
+        },
+      },
+      onProgress: (info) => events.push(info),
+      concurrency: 1,  // serialize so order is deterministic
+    });
+    expect(events).toHaveLength(3);
+    expect(events.map(e => e.done)).toEqual([1, 2, 3]);
+    expect(events.every(e => e.total === 3)).toBe(true);
+    expect(events.map(e => e.track)).toEqual(['video', 'video', 'video']);
+  });
+
+  it('total counts MEDIA segments only (init segments excluded)', async () => {
+    setFetchRouter(() => ok('OK'));
+    const events = [];
+    await runJob({
+      jobId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+      nasEndpoint: 'http://nas/', apiKey: 'k',
+      plan: {
+        source_url: 'https://cdn.example.com/m.m3u8',
+        init_segment_url: 'https://cdn.example.com/init.mp4',
+        tracks: {
+          video: {
+            init_segment_url: 'https://cdn.example.com/init.mp4',
+            segments: [
+              { url: 'https://cdn.example.com/s0.ts' },
+              { url: 'https://cdn.example.com/s1.ts' },
+            ],
+          },
+        },
+      },
+      onProgress: (info) => events.push(info),
+      concurrency: 1,
+    });
+    // 2 media segments scheduled; init segment was processed but not counted.
+    expect(events.map(e => e.done)).toEqual([1, 2]);
+    expect(events.every(e => e.total === 2)).toBe(true);
+  });
+
+  it('counts segments across multiple tracks (video + audio)', async () => {
+    setFetchRouter(() => ok('OK'));
+    const events = [];
+    await runJob({
+      jobId: 'cccccccc-cccc-cccc-cccc-cccccccccccc',
+      nasEndpoint: 'http://nas/', apiKey: 'k',
+      plan: {
+        source_url: 'https://cdn.example.com/m.m3u8',
+        tracks: {
+          video: { segments: [
+            { url: 'https://cdn.example.com/v0.ts' },
+            { url: 'https://cdn.example.com/v1.ts' },
+          ] },
+          audio: { segments: [
+            { url: 'https://cdn.example.com/a0.ts' },
+          ] },
+        },
+      },
+      onProgress: (info) => events.push(info),
+      concurrency: 1,
+    });
+    expect(events).toHaveLength(3);
+    expect(events.every(e => e.total === 3)).toBe(true);
+    // done values across tracks form a contiguous 1..N sequence (some
+    // ordering of [1,2,3]) — total events match scheduled segments.
+    expect(new Set(events.map(e => e.done))).toEqual(new Set([1, 2, 3]));
+  });
+
+  it('callback exception does not abort upload (next segment still runs)', async () => {
+    setFetchRouter(() => ok('OK'));
+    let secondEventReceived = false;
+    await runJob({
+      jobId: 'dddddddd-dddd-dddd-dddd-dddddddddddd',
+      nasEndpoint: 'http://nas/', apiKey: 'k',
+      plan: {
+        source_url: 'https://cdn.example.com/m.m3u8',
+        tracks: {
+          video: {
+            segments: [
+              { url: 'https://cdn.example.com/s0.ts' },
+              { url: 'https://cdn.example.com/s1.ts' },
+            ],
+          },
+        },
+      },
+      onProgress: ({ done }) => {
+        if (done === 1) throw new Error('callback bug');
+        if (done === 2) secondEventReceived = true;
+      },
+      concurrency: 1,
+    });
+    expect(secondEventReceived).toBe(true);  // upload completed despite throw
+  });
+
+  it('omitting onProgress is fine — runJob runs to completion', async () => {
+    setFetchRouter(() => ok('OK'));
+    await expect(runJob({
+      jobId: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',
+      nasEndpoint: 'http://nas/', apiKey: 'k',
+      plan: {
+        source_url: 'https://cdn.example.com/m.m3u8',
+        tracks: {
+          video: {
+            segments: [{ url: 'https://cdn.example.com/s0.ts' }],
+          },
+        },
+      },
+      // no onProgress
+      concurrency: 1,
+    })).resolves.toBeDefined();
+  });
+});
