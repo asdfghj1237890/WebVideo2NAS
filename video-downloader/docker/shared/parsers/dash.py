@@ -64,6 +64,9 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
+from defusedxml import ElementTree as DefusedET
+from defusedxml.common import DefusedXmlException
+
 logger = logging.getLogger(__name__)
 
 # DASH MPD XML namespace. Most MPDs declare it as the default xmlns.
@@ -128,8 +131,8 @@ def extract_all_mpd_urls(mpd_xml: str, manifest_url: str) -> List[str]:
     """
     out: List[str] = []
     try:
-        root = ET.fromstring(mpd_xml)
-    except ET.ParseError:
+        root = DefusedET.fromstring(mpd_xml)
+    except (ET.ParseError, DefusedXmlException):
         return out
 
     url_attrs = ('media', 'initialization', 'sourceURL', 'index')
@@ -593,8 +596,8 @@ def parse_mpd(mpd_xml: str, manifest_url: str) -> Dict:
         MPDParseError: On unsupported structure or DRM detection.
     """
     try:
-        root = ET.fromstring(mpd_xml)
-    except ET.ParseError as e:
+        root = DefusedET.fromstring(mpd_xml)
+    except (ET.ParseError, DefusedXmlException) as e:
         raise MPDParseError(f"MPD is not valid XML: {e}") from e
 
     if _strip_ns(root.tag) != 'MPD':

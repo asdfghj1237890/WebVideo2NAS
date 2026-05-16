@@ -262,6 +262,15 @@ class FFmpegMerger:
                 except Exception:
                     pass
             return False
+        finally:
+            if process is not None:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is None:
+                        continue
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
     
     def merge_with_re_encode(self) -> bool:
         """

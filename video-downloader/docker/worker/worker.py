@@ -16,7 +16,7 @@ import shutil
 from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import List, Optional
 from urllib.parse import urlparse
 import signal
@@ -29,6 +29,11 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
 SSRF_GUARD_ENABLED = os.getenv("SSRF_GUARD", "false").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _utcnow_naive() -> datetime:
+    """Naive UTC timestamp for existing TIMESTAMP columns."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 # Setup logging
 logging.basicConfig(
@@ -528,10 +533,10 @@ class DownloadWorker:
                 updates["progress"] = progress
             
             if status == "downloading" and progress == 0:
-                updates["started_at"] = datetime.utcnow()
+                updates["started_at"] = _utcnow_naive()
             
             if status == "completed":
-                updates["completed_at"] = datetime.utcnow()
+                updates["completed_at"] = _utcnow_naive()
                 updates["progress"] = 100
             
             if error_message:
@@ -2241,7 +2246,7 @@ class DownloadWorker:
                 UPDATE jobs SET status = 'processing', started_at = :now
                 WHERE id = :job_id
                   AND status IN ('pending', 'browser_finalizing')
-            """), {"job_id": job_id, "now": datetime.utcnow()})
+            """), {"job_id": job_id, "now": _utcnow_naive()})
             self.db.commit()
         except Exception as e:
             self.db.rollback()
@@ -2596,9 +2601,7 @@ def _reap_zombie_jobs() -> None:
     failure mode. Defense-in-depth STAGING_DIR containment guard mirrors
     the stale-reaper.
     """
-    from datetime import timedelta
-
-    cutoff = datetime.utcnow() - timedelta(hours=2)
+    cutoff = _utcnow_naive() - timedelta(hours=2)
 
     # Codex adversarial-review: scan Redis for live worker heartbeats.
     # A long-running browser-mode finalize (slow NAS mux on a 50 GB
@@ -2751,9 +2754,7 @@ def _reap_stale_browser_jobs() -> None:
     comparison instead of Postgres INTERVAL syntax to keep this
     portable.
     """
-    from datetime import timedelta
-
-    cutoff = datetime.utcnow() - timedelta(hours=6)
+    cutoff = _utcnow_naive() - timedelta(hours=6)
 
     # Codex review #7: snapshot the redis queue BEFORE touching the DB.
     # Any browser_finalizing job_id present here is "still has work to
@@ -2792,7 +2793,7 @@ def _reap_stale_browser_jobs() -> None:
             # the queue. The exclusion lives in SQL now (NOT IN
             # :queued_ids) so it's part of the same atomic predicate.
             params: dict = {
-                "now": datetime.utcnow(),
+                "now": _utcnow_naive(),
                 "cutoff": cutoff,
             }
             queued_clause = ""

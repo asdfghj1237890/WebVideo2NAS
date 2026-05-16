@@ -8,6 +8,8 @@ sqlalchemy==2.0.49
 psycopg2-binary==2.9.12
 redis==7.4.0
 python-dotenv==1.2.2
+# Safe XML parsing for DASH MPD manifests
+defusedxml==0.7.1
 
 # --- API only ---
 # FastAPI and web server

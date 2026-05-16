@@ -8,11 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 from typing import Optional, List, Dict
+from contextlib import asynccontextmanager
 import errno
 import os
 import re
 import logging
-from datetime import datetime
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 import redis
 import json
@@ -67,11 +69,24 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
+
+def _utcnow_naive() -> datetime:
+    """Naive UTC timestamp for existing TIMESTAMP columns."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    _ensure_schema()
+    yield
+
+
 # Initialize FastAPI
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8, MP4, and MOV)",
-    version="1.11.0"
+    version="1.11.0",
+    lifespan=_lifespan,
 )
 
 # CORS middleware
@@ -137,12 +152,6 @@ def _ensure_schema() -> None:
     except Exception as e:
         logger.warning(f"Schema migration skipped: {e}")
 
-
-@app.on_event("startup")
-async def _on_startup():
-    _ensure_schema()
-
-
 # Redis setup
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -205,7 +214,7 @@ def _rate_limit(request: Request, bucket: str) -> None:
     multiplier = _RATE_LIMIT_MULTIPLIERS.get(bucket, 1)
     limit = RATE_LIMIT_PER_MINUTE * multiplier
     client_ip = _get_client_ip(request)
-    window = int(datetime.utcnow().timestamp() // 60)
+    window = int(time.time() // 60)
     key = f"rl:{bucket}:{client_ip}:{window}"
     try:
         count = redis_client.incr(key)
@@ -448,7 +457,7 @@ def submit_download(
     """
     try:
         job_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = _utcnow_naive()
         
         # Insert job into database
         db.execute(text("""
@@ -773,7 +782,17 @@ _VALID_INIT_LABELS = ("video", "audio")
 def _validate_job_id(job_id: str) -> None:
     """Reject anything not a strict UUID — defense against path traversal
     via the {job_id} path parameter (e.g. `..%2Fother-job`)."""
-    if not _UUID_RE.match(job_id):
+    _canonical_job_id(job_id)
+
+
+def _canonical_job_id(job_id: str) -> str:
+    """Return a normalized UUID string for filesystem use."""
+    raw = str(job_id or "")
+    if not _UUID_RE.fullmatch(raw):
+        raise HTTPException(status_code=400, detail="Invalid job_id format")
+    try:
+        return str(uuid.UUID(raw))
+    except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid job_id format")
 
 
@@ -781,14 +800,21 @@ def _staging_path_for(job_id: str) -> Path:
     """Return the staging root for a job, validating it stays under
     STAGING_DIR. realpath check guards against `STAGING_DIR/../something`
     if a future caller passes attacker-influenced job_id by mistake."""
-    _validate_job_id(job_id)
-    base = Path(STAGING_DIR).resolve()
-    candidate = (base / job_id).resolve()
+    safe_job_id = _canonical_job_id(job_id)
+    base = os.path.normpath(os.path.realpath(STAGING_DIR))
+    candidate = os.path.normpath(os.path.realpath(os.path.join(base, safe_job_id)))
     try:
-        candidate.relative_to(base)
+        if os.path.commonpath([base, candidate]) != base:
+            raise ValueError("candidate escaped staging root")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid staging path")
-    return candidate
+
+    # CodeQL's py/path-injection recognises normalised-prefix checks more
+    # reliably than pathlib's resolve()/relative_to() containment pattern.
+    base_prefix = base if base.endswith(os.sep) else base + os.sep
+    if not candidate.startswith(base_prefix):
+        raise HTTPException(status_code=400, detail="Invalid staging path")
+    return Path(candidate)
 
 
 def _metadata_staging_path_for_job(job_id: str, staging_dir: str, context: str) -> Optional[Path]:
@@ -1253,7 +1279,7 @@ def init_browser_job(
         logger.error(f"Failed to create staging dir for {job_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to allocate staging dir")
 
-    now = datetime.utcnow()
+    now = _utcnow_naive()
     source_url = (
         plan.get("selected_variant_url")
         or plan.get("source_url")
@@ -2181,7 +2207,7 @@ def finalize_browser_job(
     # `browser_finalizing` rows so a fresh CAS doesn't race the
     # reaper's age check (which used created_at — broken for jobs
     # that uploaded slowly for >stale-threshold then finalized).
-    finalize_now = datetime.utcnow()
+    finalize_now = _utcnow_naive()
     try:
         cas = db.execute(text("""
             UPDATE jobs SET status = 'browser_finalizing'
@@ -2351,7 +2377,7 @@ def abort_browser_job(
     # Truncate to fit the column (defense; AbortRequest already caps to
     # 500 chars — DB column is TEXT but we don't want runaway log spam).
     reason = reason[:500]
-    now = datetime.utcnow()
+    now = _utcnow_naive()
 
     aborted = False
     try:

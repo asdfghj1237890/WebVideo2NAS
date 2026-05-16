@@ -106,6 +106,25 @@ def test_parse_mpd_rejects_invalid_xml():
         parse_mpd("<not-actually-xml", "https://example.com/m.mpd")
 
 
+def test_parse_mpd_rejects_xml_entities():
+    xml = """<?xml version="1.0"?>
+    <!DOCTYPE MPD [
+      <!ENTITY payload "https://attacker.example/">
+    ]>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT1S">
+      <Period>
+        <BaseURL>&payload;</BaseURL>
+        <AdaptationSet mimeType="video/mp4">
+          <Representation id="v" bandwidth="100">
+            <SegmentTemplate media="seg-$Number$.m4s" duration="1" timescale="1" startNumber="1"/>
+          </Representation>
+        </AdaptationSet>
+      </Period>
+    </MPD>"""
+    with pytest.raises(MPDParseError, match="not valid XML"):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
 def test_parse_mpd_rejects_non_mpd_root():
     xml = '<?xml version="1.0"?><Manifest><X/></Manifest>'
     with pytest.raises(MPDParseError, match="expected 'MPD'"):
@@ -868,6 +887,17 @@ def test_extract_all_mpd_urls_returns_empty_on_malformed_xml():
     """Defensive: malformed XML returns empty list (caller should reject
     the manifest separately)."""
     assert extract_all_mpd_urls("<not-valid-xml", "https://example.com/m.mpd") == []
+
+
+def test_extract_all_mpd_urls_returns_empty_on_xml_entities():
+    xml = """<?xml version="1.0"?>
+    <!DOCTYPE MPD [
+      <!ENTITY payload "https://attacker.example/">
+    ]>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011">
+      <BaseURL>&payload;</BaseURL>
+    </MPD>"""
+    assert extract_all_mpd_urls(xml, "https://example.com/m.mpd") == []
 
 
 def test_ffmpeg_fallback_ssrf_pre_scan_rejects_internal_urls(monkeypatch):

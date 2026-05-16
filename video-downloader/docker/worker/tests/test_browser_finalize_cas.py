@@ -17,9 +17,8 @@ skips. These tests verify that contract.
 
 from __future__ import annotations
 
-import os
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -31,6 +30,10 @@ from sqlalchemy.pool import StaticPool
 
 WORKER_DIR = Path(__file__).resolve().parents[1]
 DOCKER_ROOT = WORKER_DIR.parent
+
+
+def _utcnow_naive():
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _setup_test_db():
@@ -70,7 +73,7 @@ def _plant_job(SessionLocal, *, job_id: str, status: str, staging_dir: str):
             "INSERT INTO jobs (id, url, title, status, progress, created_at) "
             "VALUES (:id, :url, :title, :status, 0, :now)"
         ), {"id": job_id, "url": "https://x", "title": "t",
-            "status": status, "now": datetime.utcnow()})
+            "status": status, "now": _utcnow_naive()})
         db.execute(sa_text(
             "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
             "VALUES (:id, 'browser', 1, :sd)"

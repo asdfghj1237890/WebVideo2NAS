@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -29,6 +29,10 @@ from sqlalchemy.pool import StaticPool
 
 WORKER_DIR = Path(__file__).resolve().parents[1]
 DOCKER_ROOT = WORKER_DIR.parent
+
+
+def _utcnow_naive():
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _build_test_engine():
@@ -135,7 +139,7 @@ def test_reaper_marks_old_browser_pending_failed(worker_module, tmp_path):
 
     _plant(engine,
            job_id=job_id, status="browser_pending", mode="browser",
-           created_at=datetime.utcnow() - timedelta(hours=24),
+           created_at=_utcnow_naive() - timedelta(hours=24),
            staging_dir=str(staging))
 
     mod._reap_stale_browser_jobs()
@@ -159,7 +163,7 @@ def test_reaper_skips_recent_browser_jobs(worker_module, tmp_path):
 
     _plant(engine,
            job_id=job_id, status="browser_uploading", mode="browser",
-           created_at=datetime.utcnow() - timedelta(minutes=30),
+           created_at=_utcnow_naive() - timedelta(minutes=30),
            staging_dir=str(staging))
 
     mod._reap_stale_browser_jobs()
@@ -177,7 +181,7 @@ def test_reaper_skips_non_browser_mode(worker_module, tmp_path):
 
     _plant(engine,
            job_id=job_id, status="pending", mode=None,
-           created_at=datetime.utcnow() - timedelta(hours=24),
+           created_at=_utcnow_naive() - timedelta(hours=24),
            staging_dir="/nonexistent")
 
     mod._reap_stale_browser_jobs()
@@ -198,7 +202,7 @@ def test_reaper_skips_finished_browser_jobs(worker_module, tmp_path):
         staging.mkdir()
         _plant(engine,
                job_id=job_id, status=terminal, mode="browser",
-               created_at=datetime.utcnow() - timedelta(hours=48),
+               created_at=_utcnow_naive() - timedelta(hours=48),
                staging_dir=str(staging))
 
     mod._reap_stale_browser_jobs()
@@ -224,7 +228,7 @@ def test_reaper_refuses_to_rmtree_outside_staging_root(worker_module, tmp_path):
     job_id = "11111111-eeee-eeee-eeee-111111111111"
     _plant(engine,
            job_id=job_id, status="browser_uploading", mode="browser",
-           created_at=datetime.utcnow() - timedelta(hours=24),
+           created_at=_utcnow_naive() - timedelta(hours=24),
            staging_dir=str(outside))
 
     mod._reap_stale_browser_jobs()
@@ -249,7 +253,7 @@ def test_reaper_handles_missing_staging_dir(worker_module, tmp_path):
 
     _plant(engine,
            job_id=job_id, status="browser_pending", mode="browser",
-           created_at=datetime.utcnow() - timedelta(hours=24),
+           created_at=_utcnow_naive() - timedelta(hours=24),
            staging_dir=str(fake_staging))
 
     mod._reap_stale_browser_jobs()
@@ -287,8 +291,8 @@ def test_reaper_preserves_browser_finalizing_with_recent_finalize_started_at(
 
     _plant(
         engine, job_id=job_id, status="browser_finalizing", mode="browser",
-        created_at=datetime.utcnow() - timedelta(hours=24),  # old
-        finalize_started_at=datetime.utcnow() - timedelta(seconds=30),  # fresh CAS
+        created_at=_utcnow_naive() - timedelta(hours=24),  # old
+        finalize_started_at=_utcnow_naive() - timedelta(seconds=30),  # fresh CAS
         staging_dir=str(staging),
     )
 
@@ -316,8 +320,8 @@ def test_reaper_reaps_browser_finalizing_with_old_finalize_started_at(
 
     _plant(
         engine, job_id=job_id, status="browser_finalizing", mode="browser",
-        created_at=datetime.utcnow() - timedelta(hours=24),
-        finalize_started_at=datetime.utcnow() - timedelta(hours=8),  # old
+        created_at=_utcnow_naive() - timedelta(hours=24),
+        finalize_started_at=_utcnow_naive() - timedelta(hours=8),  # old
         staging_dir=str(staging),
     )
 
@@ -343,7 +347,7 @@ def test_reaper_falls_back_to_created_at_for_legacy_browser_finalizing(
 
     _plant(
         engine, job_id=job_id, status="browser_finalizing", mode="browser",
-        created_at=datetime.utcnow() - timedelta(hours=24),
+        created_at=_utcnow_naive() - timedelta(hours=24),
         finalize_started_at=None,  # legacy — never set
         staging_dir=str(staging),
     )
@@ -369,7 +373,7 @@ def test_reaper_covers_browser_finalizing_state(worker_module, tmp_path):
 
     _plant(engine,
            job_id=job_id, status="browser_finalizing", mode="browser",
-           created_at=datetime.utcnow() - timedelta(hours=24),
+           created_at=_utcnow_naive() - timedelta(hours=24),
            staging_dir=str(staging))
 
     # Empty redis queue (default fixture) — job NOT queued, safe to reap.
@@ -406,7 +410,7 @@ def test_reaper_preserves_queued_browser_finalizing_job(worker_module, tmp_path)
 
     _plant(engine,
            job_id=job_id, status="browser_finalizing", mode="browser",
-           created_at=datetime.utcnow() - timedelta(hours=24),
+           created_at=_utcnow_naive() - timedelta(hours=24),
            staging_dir=str(staging))
 
     # Simulate redis still holding the queued finalize entry.
@@ -440,7 +444,7 @@ def test_reaper_only_preserves_queued_browser_finalizing_not_other_states(
 
     _plant(engine,
            job_id=job_id, status="browser_uploading", mode="browser",
-           created_at=datetime.utcnow() - timedelta(hours=24),
+           created_at=_utcnow_naive() - timedelta(hours=24),
            staging_dir=str(staging))
 
     # Simulate the (unusual) case of a stale browser_uploading id in
@@ -468,7 +472,7 @@ def test_reaper_defers_when_redis_unavailable(worker_module, tmp_path):
 
     _plant(engine,
            job_id=job_id, status="browser_finalizing", mode="browser",
-           created_at=datetime.utcnow() - timedelta(hours=24),
+           created_at=_utcnow_naive() - timedelta(hours=24),
            staging_dir=str(staging))
 
     # Redis raises on lrange.
@@ -552,9 +556,9 @@ def test_zombie_reaper_skips_job_that_completed_during_select_to_update_gap(
     try:
         for jid, status, started in (
             (completed_id, "downloading",
-             datetime.utcnow() - timedelta(hours=3)),
+             _utcnow_naive() - timedelta(hours=3)),
             (zombie_id, "downloading",
-             datetime.utcnow() - timedelta(hours=3)),
+             _utcnow_naive() - timedelta(hours=3)),
         ):
             db.execute(sa_text(
                 "INSERT INTO jobs (id, url, title, status, progress, started_at) "
@@ -615,14 +619,14 @@ def test_stale_browser_reaper_skips_finalizing_with_fresh_fsa_during_gap(
     # SELECT would have included this row.
     _plant(
         engine, job_id=job_id, status="browser_uploading", mode="browser",
-        created_at=datetime.utcnow() - timedelta(hours=24),
+        created_at=_utcnow_naive() - timedelta(hours=24),
         staging_dir=str(staging),
     )
 
     # Race: between the reaper's notional SELECT and its UPDATE, the
     # API's /finalize CAS commits — status flips to 'browser_finalizing'
     # and finalize_started_at is set to now-ish.
-    fresh_fsa = datetime.utcnow() - timedelta(seconds=10)
+    fresh_fsa = _utcnow_naive() - timedelta(seconds=10)
     remove = _flip_status_before_update(
         mod, job_id, new_status="browser_finalizing", fsa=fresh_fsa,
     )
@@ -660,7 +664,7 @@ def test_stale_browser_reaper_skips_completed_during_gap(
 
     _plant(
         engine, job_id=job_id, status="browser_uploading", mode="browser",
-        created_at=datetime.utcnow() - timedelta(hours=24),
+        created_at=_utcnow_naive() - timedelta(hours=24),
         staging_dir=str(staging),
     )
 
@@ -702,7 +706,7 @@ def test_zombie_reaper_reaps_qualified_row(worker_module, tmp_path):
         db.execute(sa_text(
             "INSERT INTO jobs (id, url, title, status, progress, started_at) "
             "VALUES (:id, 'https://x', 't', 'processing', 50, :sa)"
-        ), {"id": job_id, "sa": datetime.utcnow() - timedelta(hours=5)})
+        ), {"id": job_id, "sa": _utcnow_naive() - timedelta(hours=5)})
         db.execute(sa_text(
             "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
             "VALUES (:id, 'browser', 1, :sd)"
@@ -733,7 +737,7 @@ def test_zombie_reaper_skips_recent_in_flight(worker_module, tmp_path):
         db.execute(sa_text(
             "INSERT INTO jobs (id, url, title, status, progress, started_at) "
             "VALUES (:id, 'https://x', 't', 'downloading', 5, :sa)"
-        ), {"id": job_id, "sa": datetime.utcnow() - timedelta(minutes=30)})
+        ), {"id": job_id, "sa": _utcnow_naive() - timedelta(minutes=30)})
         db.commit()
     finally:
         db.close()
@@ -782,7 +786,7 @@ def test_zombie_reaper_skips_job_with_live_heartbeat(worker_module, tmp_path):
         db.execute(sa_text(
             "INSERT INTO jobs (id, url, title, status, progress, started_at) "
             "VALUES (:id, 'https://x', 't', 'processing', 50, :sa)"
-        ), {"id": alive_id, "sa": datetime.utcnow() - timedelta(hours=5)})
+        ), {"id": alive_id, "sa": _utcnow_naive() - timedelta(hours=5)})
         db.execute(sa_text(
             "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
             "VALUES (:id, 'browser', 1, :sd)"
@@ -834,7 +838,7 @@ def test_zombie_reaper_reaps_dead_worker_alongside_alive_one(
             db.execute(sa_text(
                 "INSERT INTO jobs (id, url, title, status, progress, started_at) "
                 "VALUES (:id, 'https://x', 't', 'processing', 50, :sa)"
-            ), {"id": jid, "sa": datetime.utcnow() - timedelta(hours=5)})
+            ), {"id": jid, "sa": _utcnow_naive() - timedelta(hours=5)})
             db.execute(sa_text(
                 "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
                 "VALUES (:id, 'browser', 1, :sd)"
@@ -887,7 +891,7 @@ def test_zombie_reaper_defers_browser_mode_when_redis_scan_fails(
         db.execute(sa_text(
             "INSERT INTO jobs (id, url, title, status, progress, started_at) "
             "VALUES (:id, 'https://x', 't', 'processing', 50, :sa)"
-        ), {"id": job_id, "sa": datetime.utcnow() - timedelta(hours=5)})
+        ), {"id": job_id, "sa": _utcnow_naive() - timedelta(hours=5)})
         db.execute(sa_text(
             "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
             "VALUES (:id, 'browser', 1, :sd)"
@@ -935,7 +939,7 @@ def test_zombie_reaper_still_reaps_non_browser_when_redis_scan_fails(
         db.execute(sa_text(
             "INSERT INTO jobs (id, url, title, status, progress, started_at) "
             "VALUES (:id, 'https://x', 't', 'processing', 50, :sa)"
-        ), {"id": legacy_id, "sa": datetime.utcnow() - timedelta(hours=5)})
+        ), {"id": legacy_id, "sa": _utcnow_naive() - timedelta(hours=5)})
         # mode != 'browser' (NULL or 'nas-direct' / legacy yt-dlp)
         db.execute(sa_text(
             "INSERT INTO job_metadata (job_id, mode, total_segments) "
@@ -983,7 +987,7 @@ def test_zombie_reaper_defers_browser_but_reaps_legacy_in_same_batch(
             db.execute(sa_text(
                 "INSERT INTO jobs (id, url, title, status, progress, started_at) "
                 "VALUES (:id, 'https://x', 't', 'processing', 50, :sa)"
-            ), {"id": jid, "sa": datetime.utcnow() - timedelta(hours=5)})
+            ), {"id": jid, "sa": _utcnow_naive() - timedelta(hours=5)})
             db.execute(sa_text(
                 "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
                 "VALUES (:id, :mode, 1, :sd)"
@@ -1024,7 +1028,7 @@ def test_zombie_reaper_scan_paginates(worker_module, tmp_path):
         db.execute(sa_text(
             "INSERT INTO jobs (id, url, title, status, progress, started_at) "
             "VALUES (:id, 'https://x', 't', 'processing', 50, :sa)"
-        ), {"id": alive_id, "sa": datetime.utcnow() - timedelta(hours=5)})
+        ), {"id": alive_id, "sa": _utcnow_naive() - timedelta(hours=5)})
         db.execute(sa_text(
             "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
             "VALUES (:id, 'browser', 1, :sd)"

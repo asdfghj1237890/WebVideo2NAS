@@ -7,6 +7,7 @@ schema, and helper functions that are independent of the storage layer.
 
 import importlib
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
@@ -44,6 +45,12 @@ def test_staging_path_for_keeps_under_root(monkeypatch, tmp_path):
     # Resolved path must be under STAGING_DIR
     assert str(p).startswith(str(tmp_path.resolve()))
     assert p.name == job_id
+
+
+def test_staging_path_for_canonicalizes_uuid_case(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    p = api_main._staging_path_for("11111111-2222-3333-4444-AAAAAAAAAAAA")
+    assert p.name == "11111111-2222-3333-4444-aaaaaaaaaaaa"
 
 
 def test_segment_path_rejects_invalid_track_or_seq(monkeypatch, tmp_path):
@@ -92,7 +99,9 @@ def test_job_init_request_accepts_url_and_text_forms(monkeypatch):
         manifest_text="#EXTM3U\n",
         base_url="https://example.com/v/playlist.m3u8",
     )
-    assert str(url_form.url).startswith("https://example.com")
+    parsed = urlparse(str(url_form.url))
+    assert parsed.scheme == "https"
+    assert parsed.hostname == "example.com"
     assert text_form.manifest_text.startswith("#EXTM3U")
 
 
@@ -327,10 +336,14 @@ def test_verify_staging_complete_dash_two_tracks(monkeypatch, tmp_path):
 # Result: completed staging stranded forever. Fix: push first, commit
 # second; rpush failure leaves DB unchanged so the user can retry.
 
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 from sqlalchemy import create_engine, text as sa_text
 from sqlalchemy.pool import StaticPool
+
+
+def _utcnow_naive():
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _build_finalize_test_env(monkeypatch, tmp_path, *, rpush_fails=False, db_commit_fails=False):
@@ -388,7 +401,7 @@ def _build_finalize_test_env(monkeypatch, tmp_path, *, rpush_fails=False, db_com
         db.execute(sa_text(
             "INSERT INTO jobs (id, url, title, status, progress, created_at) "
             "VALUES (:id, :url, :title, 'browser_uploading', 0, :now)"
-        ), {"id": job_id, "url": "https://x", "title": "t", "now": datetime.utcnow()})
+        ), {"id": job_id, "url": "https://x", "title": "t", "now": _utcnow_naive()})
         db.execute(sa_text(
             "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
             "VALUES (:id, 'browser', 1, :sd)"

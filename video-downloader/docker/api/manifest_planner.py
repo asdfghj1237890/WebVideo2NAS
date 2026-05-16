@@ -183,6 +183,10 @@ def _safe_fetch(
         # ran — a public endpoint without Content-Length could push
         # arbitrary bytes into the API process and OOM the container
         # before raising ManifestPlanError.
+        # CodeQL cannot model `_validate_url_safety`, but every hop is
+        # required to be HTTPS, resolved to public IPs, fetched with
+        # redirects disabled, and revalidated before the next request.
+        # codeql[py/full-ssrf]
         response = session.get(
             current_url,
             headers=_scoped_captured_headers(headers, current_url, trust_base),
