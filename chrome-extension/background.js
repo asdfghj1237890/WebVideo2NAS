@@ -387,7 +387,7 @@ function pruneOrphans() {
     .filter(x => x && typeof x.url === 'string' && x.url && (now - (Number(x.timestamp) || 0)) <= MAX_AGE_MS)
     .slice(-MAX);
 
-  orphanUrlKeys = new Set(orphanUrlInfos.map(x => x.url));
+  orphanUrlKeys = new Set(orphanUrlInfos.map(x => x.dedupeKey || x.url));
 }
 
 function getSortedUrlsForTabWithOrphans(tabId, tabUrl) {
@@ -579,6 +579,46 @@ function isCandidateVideoUrl(rawUrl) {
   return true;
 }
 
+function inferHlsManifestFromSegmentUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch (_) {
+    return null;
+  }
+
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+
+  const pathParts = u.pathname.split('/');
+  const last = pathParts[pathParts.length - 1] || '';
+  const match = /^seg-\d+-(v\d+)(?:-(a\d+))?\.ts$/i.exec(last);
+  if (!match) return null;
+
+  pathParts[pathParts.length - 1] = `index-${match[1]}${match[2] ? '-' + match[2] : ''}.m3u8`;
+  u.pathname = pathParts.join('/');
+  u.hash = '';
+
+  const stable = new URL(u.href);
+  stable.search = '';
+  stable.hash = '';
+  return {
+    url: u.href,
+    dedupeKey: stable.href,
+  };
+}
+
+function mergeDetectedUrlExtra(existing, extra) {
+  if (!existing || !extra) return;
+  if (extra.detectedFormat && !existing.detectedFormat) {
+    existing.detectedFormat = extra.detectedFormat;
+  }
+  if (extra.playbackObserved) {
+    existing.playbackObserved = true;
+  }
+}
+
 // Capture the tab's current title and stamp it onto the urlInfo. Async because
 // chrome.tabs.get is async — by the time we resolve, the urlInfo is already in
 // the store, so we mutate the live object. Best-effort; missing title is OK.
@@ -599,9 +639,11 @@ function attachTabTitle(urlInfo, tabId) {
 // `extra` may carry additional fields like `detectedFormat`.
 function registerDetectedUrl(details, extra) {
   const isRealTab = (details.tabId != null && typeof details.tabId === 'number' && details.tabId >= 0);
+  const detectionKey = (extra && extra.dedupeKey) || details.url;
 
   const urlInfo = {
     url: details.url,
+    dedupeKey: detectionKey,
     tabId: isRealTab ? details.tabId : -1,
     timestamp: Date.now(),
     pageUrl: details.initiator || details.documentUrl,
@@ -614,7 +656,7 @@ function registerDetectedUrl(details, extra) {
     ...(extra || {})
   };
 
-  detectedUrls.add(details.url);
+  detectedUrls.add(detectionKey);
 
   if (isRealTab) {
     if (!currentTabUrls[details.tabId]) {
@@ -624,8 +666,8 @@ function registerDetectedUrl(details, extra) {
       currentTabUrlKeys[details.tabId] = new Set();
     }
 
-    if (!currentTabUrlKeys[details.tabId].has(details.url)) {
-      currentTabUrlKeys[details.tabId].add(details.url);
+    if (!currentTabUrlKeys[details.tabId].has(detectionKey)) {
+      currentTabUrlKeys[details.tabId].add(detectionKey);
       currentTabUrls[details.tabId].push(urlInfo);
       attachTabTitle(urlInfo, details.tabId);
       // If this tab was opened by the hidden-mode AV-task pipeline, this
@@ -635,17 +677,17 @@ function registerDetectedUrl(details, extra) {
       maybeFireAvTaskAutoSend(details.tabId, details.url);
     } else {
       const list = currentTabUrls[details.tabId];
-      const existing = list.find(item => item && item.url === details.url);
+      const existing = list.find(item => item && ((item.dedupeKey || item.url) === detectionKey));
       if (existing) {
+        existing.url = urlInfo.url;
+        existing.dedupeKey = detectionKey;
         existing.timestamp = urlInfo.timestamp;
         existing.pageUrl = urlInfo.pageUrl;
         existing.requestType = urlInfo.requestType;
         existing.frameId = urlInfo.frameId;
         existing.method = urlInfo.method;
         existing.hitCount = (Number(existing.hitCount) || 0) + 1;
-        if (extra && extra.detectedFormat && !existing.detectedFormat) {
-          existing.detectedFormat = extra.detectedFormat;
-        }
+        mergeDetectedUrlExtra(existing, extra);
         // Refresh title in case the first capture raced with a transient
         // empty-title state (loading SPA, etc).
         if (!existing.pageTitle) attachTabTitle(existing, details.tabId);
@@ -653,22 +695,22 @@ function registerDetectedUrl(details, extra) {
       }
     }
   } else {
-    if (!orphanUrlKeys.has(details.url)) {
-      orphanUrlKeys.add(details.url);
+    if (!orphanUrlKeys.has(detectionKey)) {
+      orphanUrlKeys.add(detectionKey);
       orphanUrlInfos.push(urlInfo);
       pruneOrphans();
     } else {
-      const existing = orphanUrlInfos.find(item => item && item.url === details.url);
+      const existing = orphanUrlInfos.find(item => item && ((item.dedupeKey || item.url) === detectionKey));
       if (existing) {
+        existing.url = urlInfo.url;
+        existing.dedupeKey = detectionKey;
         existing.timestamp = urlInfo.timestamp;
         existing.pageUrl = urlInfo.pageUrl;
         existing.requestType = urlInfo.requestType;
         existing.frameId = urlInfo.frameId;
         existing.method = urlInfo.method;
         existing.hitCount = (Number(existing.hitCount) || 0) + 1;
-        if (extra && extra.detectedFormat && !existing.detectedFormat) {
-          existing.detectedFormat = extra.detectedFormat;
-        }
+        mergeDetectedUrlExtra(existing, extra);
         pruneOrphans();
       }
     }
@@ -686,6 +728,16 @@ chrome.webRequest.onBeforeRequest.addListener(
     if (isCandidateVideoUrl(details.url)) {
       console.log('Detected video URL:', details.url);
       registerDetectedUrl(details);
+      return;
+    }
+
+    const inferredManifest = inferHlsManifestFromSegmentUrl(details.url);
+    if (inferredManifest) {
+      console.log('Inferred HLS manifest from segment:', details.url, '->', inferredManifest.url);
+      registerDetectedUrl(
+        { ...details, url: inferredManifest.url },
+        { detectedFormat: 'm3u8', playbackObserved: true, dedupeKey: inferredManifest.dedupeKey }
+      );
     }
   },
   { urls: ["<all_urls>"] }

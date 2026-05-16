@@ -98,4 +98,31 @@ describe('sidepanel.js helper functions', () => {
     expect(ctx.deriveTrustedCdnSuffix('https://127.0.0.1/x.m3u8')).toBeNull();
     expect(ctx.deriveTrustedCdnSuffix('localhost')).toBeNull();
   });
+
+  it('keeps play-first-gated HLS candidates visible but locked', () => {
+    const ctx = loadScriptIntoContext('sidepanel.js', {
+      chrome: makeChromeStub(),
+      document: makeDocumentStub(),
+      window: {},
+    });
+
+    ctx.__eval(`
+      settings = { useBrowserSide: true };
+      qualityFilter = 'all';
+      searchQuery = '';
+      detectedUrls = [{
+        url: 'https://cdn.example.com/video/master.m3u8',
+        detectedFormat: 'm3u8',
+        isNowPlaying: false,
+        timestamp: 1000,
+      }];
+    `);
+
+    const [item] = ctx.visibleDetectedUrls();
+    expect(item.url).toBe('https://cdn.example.com/video/master.m3u8');
+    expect(ctx.urlInfoRequiresPlayFirst(item)).toBe(true);
+
+    item.playbackObserved = true;
+    expect(ctx.urlInfoRequiresPlayFirst(item)).toBe(false);
+  });
 });

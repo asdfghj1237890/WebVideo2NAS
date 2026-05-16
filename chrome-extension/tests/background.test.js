@@ -94,6 +94,68 @@ describe('background.js pure helpers', () => {
     expect(ctx.isCandidateVideoUrl('https://a/b/preview.mov.jpg')).toBe(false);
   });
 
+  it('infers an HLS variant playlist from segment URLs without treating segments as videos', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+
+    const segment = 'https://cdn.example.com/hls/videos/202402/15/448181161/720P_4000K_448181161.mp4/seg-13-v1-a1.ts?h=tok%2Bsig&e=1778524057&f=1';
+    expect(ctx.isCandidateVideoUrl(segment)).toBe(false);
+    expect(ctx.inferHlsManifestFromSegmentUrl(segment))
+      .toEqual({
+        url: 'https://cdn.example.com/hls/videos/202402/15/448181161/720P_4000K_448181161.mp4/index-v1-a1.m3u8?h=tok%2Bsig&e=1778524057&f=1',
+        dedupeKey: 'https://cdn.example.com/hls/videos/202402/15/448181161/720P_4000K_448181161.mp4/index-v1-a1.m3u8',
+      });
+
+    expect(ctx.inferHlsManifestFromSegmentUrl('https://cdn.example.com/hls/seg-9-v2.m4s?x=1'))
+      .toBeNull();
+    expect(ctx.inferHlsManifestFromSegmentUrl('https://cdn.example.com/hls/random.ts?x=1'))
+      .toBeNull();
+  });
+
+  it('dedupes inferred HLS manifests by stable playlist key while keeping the latest token', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+
+    const first = ctx.inferHlsManifestFromSegmentUrl('https://cdn.example.com/hls/seg-1-v1-a1.ts?token=one');
+    const second = ctx.inferHlsManifestFromSegmentUrl('https://cdn.example.com/hls/seg-2-v1-a1.ts?token=two');
+    expect(first.dedupeKey).toBe(second.dedupeKey);
+
+    const details = {
+      tabId: 7,
+      initiator: 'https://page.example/watch',
+      documentUrl: 'https://page.example/watch',
+      type: 'media',
+      frameId: 0,
+      method: 'GET',
+    };
+    ctx.registerDetectedUrl(
+      { ...details, url: first.url },
+      { detectedFormat: 'm3u8', playbackObserved: true, dedupeKey: first.dedupeKey },
+    );
+    ctx.registerDetectedUrl(
+      { ...details, url: second.url },
+      { detectedFormat: 'm3u8', playbackObserved: true, dedupeKey: second.dedupeKey },
+    );
+
+    const rows = ctx.__eval(`
+      currentTabUrls[7].map(({ url, dedupeKey, hitCount, playbackObserved }) => ({
+        url, dedupeKey, hitCount, playbackObserved
+      }))
+    `);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({
+      url: second.url,
+      dedupeKey: second.dedupeKey,
+      hitCount: 2,
+      playbackObserved: true,
+    });
+    expect(ctx.__eval('currentTabUrlKeys[7].size')).toBe(1);
+  });
+
   it('scoreUrlInfo prefers recent + range hits + media type', () => {
     const ctx = loadScriptIntoContext('background.js', {
       chrome: makeChromeStub(),

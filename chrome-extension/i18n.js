@@ -73,7 +73,7 @@
       'url.playFirst.tooltip': 'Press play on the page first — browser mode needs the player to issue the per-session token before the URL is fetchable.',
       'url.playFirst.bulkSkipped': 'Skipped {n} item(s) — press play on the video first.',
       'empty.playFirst.title': '▶ Press play on the video first',
-      'empty.playFirst.hint': 'Browser mode hides streams whose token is only issued after the page\'s player starts playback.',
+      'empty.playFirst.hint': 'Browser mode keeps streams locked until the page\'s player starts playback and issues a fresh token.',
       'url.copy': 'Copy',
 
       'job.duration': 'Duration: {duration}',
@@ -274,7 +274,7 @@
       'url.playFirst.tooltip': '請先在頁面上按播放 — 瀏覽器模式需要 player 觸發後才會發 session token,URL 才抓得動。',
       'url.playFirst.bulkSkipped': '已略過 {n} 個項目 — 請先在影片上按播放。',
       'empty.playFirst.title': '▶ 請先在影片上按播放',
-      'empty.playFirst.hint': '瀏覽器模式會隱藏「需要 player 觸發後才發 token」的串流,等你按下播放再回來看。',
+      'empty.playFirst.hint': '瀏覽器模式會先鎖住「需要 player 觸發後才發 token」的串流,等你按下播放再送出。',
       'url.copy': '複製',
 
       'job.duration': '片長：{duration}',
@@ -459,7 +459,7 @@
       'url.playFirst.tooltip': '请先在页面上按播放 — 浏览器模式需要 player 触发后才会发 session token,URL 才抓得动。',
       'url.playFirst.bulkSkipped': '已略过 {n} 个项目 — 请先在视频上按播放。',
       'empty.playFirst.title': '▶ 请先在视频上按播放',
-      'empty.playFirst.hint': '浏览器模式会隐藏「需要 player 触发后才发 token」的串流,等你按下播放再回来看。',
+      'empty.playFirst.hint': '浏览器模式会先锁住「需要 player 触发后才发 token」的串流,等你按下播放再送出。',
 
       'job.duration': '时长：{duration}',
       'job.cancel.title': '取消下载',

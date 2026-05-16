@@ -86,8 +86,8 @@ async function loadSettingsFromStorage() {
     'nasEndpoint', 'apiKey', 'uiLanguage', 'uiTheme', 'jobSort',
     'hiddenMode', 'hiddenModeUrlTemplate',
     'trustedCdnSuffixes',
-    // useBrowserSide drives the play-first hide, the bulk-skip
-    // filter, and the new mode-badge in the header. Was missing
+    // useBrowserSide drives the play-first lock, the bulk-skip
+    // filter, and the mode-badge in the header. Was missing
     // from this list — references treated it as undefined, which
     // happens to coincide with the default-on semantics, so the
     // bug stayed dormant unless the user turned the option off
@@ -774,6 +774,7 @@ function urlInfoRequiresPlayFirst(urlInfo) {
   if (!browserSideOn) return false;
   const fmt = (urlInfo.detectedFormat || classifyVideoType(urlInfo.url) || '').toUpperCase();
   if (fmt !== 'M3U8' && fmt !== 'MPD') return false;
+  if (urlInfo.playbackObserved) return false;
   const isNowPlaying = !!urlInfo.isNowPlaying || !!urlInfo.isLive;
   return !isNowPlaying;
 }
@@ -786,14 +787,9 @@ function visibleDetectedUrls() {
   if (searchQuery) {
     items = items.filter(it => String(it.url || '').toLowerCase().includes(searchQuery));
   }
-  // Browser-side play-first hide: HLS/DASH tiles whose page hasn't
-  // started playback yet are useless to the user (the IP-bound HMAC
-  // token isn't issued until play()), so we hide them rather than
-  // showing a disabled button. The corresponding empty-state message
-  // (in renderDetectedUrls) explains why the list is empty.
-  // urlInfoRequiresPlayFirst() returns false when useBrowserSide is
-  // off OR the format isn't HLS/DASH OR the tile is already playing.
-  items = items.filter(it => !urlInfoRequiresPlayFirst(it));
+  // Keep play-first-gated HLS/DASH candidates visible. The send action
+  // stays locked until playback starts, but hiding the tiles made the UI
+  // look contradictory ("4 on this page" while the section showed 0).
   return items;
 }
 
@@ -861,27 +857,11 @@ function renderDetectedUrls(opts) {
     return;
   }
 
-  // total > 0 but `visible` is empty — most commonly because every
-  // detected HLS/DASH tile was filtered out by the play-first hide.
-  // Distinguish from search/quality-filter empties (which the user
-  // can recover from by clearing the chip / search box) by checking
-  // whether the pre-filter sorted list has any play-first hits.
+  // total > 0 but `visible` is empty — search/quality filter ate
+  // everything. Leave the grid blank; the toolbar chip + search box
+  // show why.
   if (visible.length === 0) {
-    const playFirstHidden = sortedDetectedUrls().some(urlInfoRequiresPlayFirst);
-    if (playFirstHidden) {
-      listElement.innerHTML = `
-        <div class="empty-state">
-          <p>${escapeHtml(t('empty.playFirst.title'))}</p>
-          <p class="hint">${escapeHtml(t('empty.playFirst.hint'))}</p>
-        </div>
-      `;
-      selected.clear();
-      updateBulkBar();
-      prevDetectedIds = new Set();
-      return;
-    }
-    // else: search/quality filter ate everything — leave the grid
-    // blank; the user-facing toolbar chip + search box show why.
+    listElement.innerHTML = '';
   }
 
   // Prune selected/sent entries that no longer exist
@@ -913,12 +893,11 @@ function renderDetectedUrls(opts) {
     const top = topQualityLabel(url);
     const isNowPlaying = !!urlInfo.isNowPlaying || !!urlInfo.isLive;
 
-    // Defense-in-depth: if a play-first tile somehow made it past
-    // visibleDetectedUrls() (e.g., classifier mislabel or future
-    // refactor), the send button still locks instead of firing a
-    // doomed request. Hide-mode means this branch isn't normally
-    // reached — visibleDetectedUrls already filtered it out.
+    // Browser-side play-first gate: keep the candidate visible, but
+    // lock sending until the page's player has started and issued the
+    // fresh per-session token.
     const requiresPlayFirst = urlInfoRequiresPlayFirst(urlInfo);
+    const playFirstClass = requiresPlayFirst ? ' play-first-blocked' : '';
 
     const thumbnail = urlInfo.thumbnail || null;
     // Trust-CDN button state. Hide entirely when the URL host is an
@@ -933,7 +912,7 @@ function renderDetectedUrls(opts) {
       trustHostLower, settings && settings.trustedCdnSuffixes,
     );
     return `
-      <div class="tile${newClass}${selClass}${sentClass}${interactClass}"
+      <div class="tile${newClass}${selClass}${sentClass}${interactClass}${playFirstClass}"
            data-url="${escapeHtml(url)}"
            data-page="${escapeHtml(urlInfo.pageUrl || '')}"
            style="--idx:${index}">
@@ -946,6 +925,15 @@ function renderDetectedUrls(opts) {
               <span class="thumb-live">
                 <span class="live-dot"></span>
                 <span class="live-text">LIVE</span>
+              </span>
+            ` : ''}
+            ${isMany && requiresPlayFirst ? `
+              <span class="thumb-play-first"
+                    title="${escapeHtml(t('url.playFirst.tooltip'))}"
+                    aria-label="${escapeHtml(t('url.playFirst.tooltip'))}">
+                <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M5 3l9 5-9 5V3z" fill="currentColor"/>
+                </svg>
               </span>
             ` : ''}
           </div>
