@@ -147,4 +147,43 @@ describe('sidepanel.js helper functions', () => {
     expect(item.url).toBe('https://hls.example.com/videos/hash/hash.m3u8?auth_key=abc&v=3&time=0');
     expect(ctx.__eval('qualityFilter')).toBe('all');
   });
+
+  it('updates the progress bar colour when browser upload leaves pending', () => {
+    const ctx = loadScriptIntoContext('sidepanel.js', {
+      chrome: makeChromeStub(),
+      document: makeDocumentStub(),
+      window: {},
+    });
+
+    const statusText = { textContent: '' };
+    const meta = {
+      className: '',
+      querySelector: (selector) => (
+        selector === '[data-status-text]' ? statusText : null
+      ),
+    };
+    const arc = {
+      attrs: {},
+      setAttribute(name, value) { this.attrs[name] = value; },
+    };
+    const fill = { style: { background: 'var(--warn)' } };
+    const el = {
+      querySelector: (selector) => {
+        if (selector === '.job-meta') return meta;
+        if (selector === '[data-ring-arc]') return arc;
+        if (selector === '[data-bar-fill]') return fill;
+        return null;
+      },
+    };
+
+    ctx.updateJobElement(el, {
+      id: 1,
+      title: 'Example',
+      status: 'browser_uploading',
+      progress: 42,
+    });
+
+    expect(arc.attrs.stroke).toBe('var(--accent)');
+    expect(fill.style.background).toBe('var(--accent)');
+  });
 });

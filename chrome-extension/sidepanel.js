@@ -1643,7 +1643,7 @@ function updateJobElement(el, job) {
     const speedEl = meta.querySelector('[data-speed]');
     if (speedEl && job.speed != null) speedEl.textContent = `${job.speed} MB/s`;
   }
-  // Ring stroke color tracks status, so a transition between two
+  // Progress color tracks status, so a transition between two
   // ACTIVE statuses (e.g. browser_pending → browser_uploading,
   // browser_uploading → browser_finalizing) needs an explicit
   // attribute write here. shouldFullRender() returns false for
@@ -1652,8 +1652,11 @@ function updateJobElement(el, job) {
   // render baked in, leaving (e.g.) a job that started as
   // browser_pending stuck on the warn (orange) ring color even after
   // it's been uploading for a while.
+  const progressColor = ringStrokeForStatus(job.status);
   const arc = el.querySelector('[data-ring-arc]');
-  if (arc) arc.setAttribute('stroke', ringStrokeForStatus(job.status));
+  if (arc) arc.setAttribute('stroke', progressColor);
+  const fill = el.querySelector('[data-bar-fill]');
+  if (fill) fill.style.background = progressColor;
 }
 
 function startTween(el, jobId, target) {
