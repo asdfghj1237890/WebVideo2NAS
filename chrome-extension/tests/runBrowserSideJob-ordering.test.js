@@ -733,6 +733,7 @@ describe('runBrowserSideJob: init failure fallback policy (Codex adversarial-rev
 describe('sendToNAS: routes URLs that would 422 directly to NAS-direct', () => {
   let ctx;
   let fetchCalls;
+  let fetchRequests;
   // For sendToNAS we need a more complete chrome stub — storage.sync
   // returns the user's NAS config via Promise (await form).
 
@@ -799,9 +800,11 @@ describe('sendToNAS: routes URLs that would 422 directly to NAS-direct', () => {
 
   function setupCtx(settings) {
     fetchCalls = [];
+    fetchRequests = [];
     const fetchStub = vi.fn(async (url, _opts) => {
       const u = String(url);
       fetchCalls.push(u);
+      fetchRequests.push({ url: u, opts: _opts || {} });
       if (u.endsWith('/api/download')) {
         return {
           ok: true, status: 200,
@@ -1011,5 +1014,53 @@ describe('sendToNAS: routes URLs that would 422 directly to NAS-direct', () => {
 
     expect(fetchCalls.some((u) => u.endsWith('/api/download'))).toBe(true);
     expect(fetchCalls.some((u) => u.endsWith('/api/jobs/init'))).toBe(false);
+  });
+
+  it('content-type detected signed manifest keeps the clicked fresh URL over stale capture', async () => {
+    setupCtx({
+      nasEndpoint: 'http://nas.local:52052',
+      apiKey: 'test-key',
+      useBrowserSide: false,
+    });
+
+    const pageUrl = 'https://example.com/watch/neutral-code';
+    const tabId = 7;
+    const oldUrl = 'https://cdn.example.com/hls/video-404/index.jpg?v=6&exp=1779411600&auth=old';
+    const freshUrl = 'https://cdn.example.com/hls/video-404/index.jpg?v=6&exp=1779498000&auth=fresh';
+    const now = Date.now();
+
+    ctx.__eval(`
+      currentTabUrls[${tabId}] = ${JSON.stringify([
+        {
+          url: oldUrl,
+          detectedFormat: 'm3u8',
+          timestamp: now - 86_400_000,
+          tabId,
+          pageUrl,
+        },
+        {
+          url: freshUrl,
+          detectedFormat: 'm3u8',
+          timestamp: now - 1_000,
+          tabId,
+          pageUrl,
+        },
+      ])};
+      capturedHeaders = ${JSON.stringify({
+        [oldUrl]: {
+          headers: { Referer: pageUrl, 'User-Agent': 'UA-old' },
+          timestamp: now - 86_400_000,
+          initiator: pageUrl,
+          tabId,
+        },
+      })};
+    `);
+
+    await ctx.sendToNAS(freshUrl, 'Signed', pageUrl, tabId);
+
+    const downloadReq = fetchRequests.find((req) => req.url.endsWith('/api/download'));
+    expect(downloadReq).toBeTruthy();
+    const body = JSON.parse(downloadReq.opts.body);
+    expect(body.url).toBe(freshUrl);
   });
 });

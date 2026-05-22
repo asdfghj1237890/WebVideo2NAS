@@ -1399,3 +1399,60 @@ describe('_wv2nasPlanSegmentUrls — AES key URI inclusion', () => {
     }
   });
 });
+
+describe('_wv2nasRefreshSignedPlanUrls', () => {
+  it('refreshes stale signed query params on same-directory plan URLs', () => {
+    const freshAnchor = 'https://edge-a.example.net/hls/asset-404/index.jpg?v=6&exp=1779584400&auth=fresh';
+    const staleSource = 'https://edge-b.example.net/hls/asset-404/index.jpg?v=6&exp=1779411600&auth=old';
+    const staleSegment = 'https://edge-b.example.net/hls/asset-404/CLS-018.jpg?v=6&exp=1779411600&auth=old';
+    const staleKey = 'https://edge-b.example.net/hls/asset-404/key.bin?v=6&exp=1779411600&auth=old';
+    const plan = {
+      source_url: staleSource,
+      selected_variant_url: staleSource,
+      init_segment_url: staleSegment,
+      tracks: {
+        video: {
+          init_segment_url: staleSegment,
+          segments: [{
+            url: staleSegment,
+            key: { uri: staleKey },
+          }],
+        },
+      },
+    };
+
+    const refreshed = ctx._wv2nasRefreshSignedPlanUrls(plan, [freshAnchor]);
+
+    expect(refreshed).toBe(plan);
+    expect(plan.source_url).toBe(
+      'https://edge-b.example.net/hls/asset-404/index.jpg?v=6&exp=1779584400&auth=fresh'
+    );
+    expect(plan.tracks.video.segments[0].url).toBe(
+      'https://edge-b.example.net/hls/asset-404/CLS-018.jpg?v=6&exp=1779584400&auth=fresh'
+    );
+    expect(plan.tracks.video.segments[0].key.uri).toBe(
+      'https://edge-b.example.net/hls/asset-404/key.bin?v=6&exp=1779584400&auth=fresh'
+    );
+  });
+
+  it('does not rewrite unrelated paths or newer signed URLs', () => {
+    const freshAnchor = 'https://edge.example.net/hls/asset-404/index.jpg?v=6&exp=1779584400&auth=fresh';
+    const unrelated = 'https://edge.example.net/hls/other-404/seg.jpg?v=6&exp=1779411600&auth=old';
+    const newer = 'https://edge.example.net/hls/asset-404/seg.jpg?v=6&exp=1779999999&auth=newer';
+    const plan = {
+      tracks: {
+        video: {
+          segments: [
+            { url: unrelated },
+            { url: newer },
+          ],
+        },
+      },
+    };
+
+    ctx._wv2nasRefreshSignedPlanUrls(plan, [freshAnchor]);
+
+    expect(plan.tracks.video.segments[0].url).toBe(unrelated);
+    expect(plan.tracks.video.segments[1].url).toBe(newer);
+  });
+});

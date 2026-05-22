@@ -178,6 +178,104 @@ function hasCookieHeader(headers) {
   return false;
 }
 
+function hasQueryString(url) {
+  const u = tryGetUrl(url);
+  return !!(u && u.search && u.search.length > 1);
+}
+
+function shouldKeepClickedDetectedSignedUrl(targetUrl, targetInfo, best) {
+  if (!targetInfo || !targetInfo.detectedFormat || !best || best.url === targetUrl) return false;
+  if (!hasQueryString(targetUrl)) return false;
+
+  const targetTs = Number(targetInfo.timestamp) || 0;
+  const bestTs = Number(best.entry && best.entry.timestamp) || 0;
+  if (!targetTs) return false;
+
+  return !bestTs || targetTs >= bestTs;
+}
+
+const _WV2NAS_SIGNED_REFRESH_QUERY_KEYS = [
+  'v', 'exp', 'expires', 'auth', 'token', 'signature', 'sig',
+];
+const _WV2NAS_SIGNED_EXP_QUERY_KEYS = ['exp', 'expires'];
+const _WV2NAS_SIGNED_AUTH_QUERY_KEYS = ['auth', 'token', 'signature', 'sig'];
+
+function _wv2nasUrlDir(u) {
+  return u.pathname.replace(/[^/]*$/, '');
+}
+
+function _wv2nasQueryNumber(u, keys) {
+  for (const key of keys) {
+    if (!u.searchParams.has(key)) continue;
+    const n = Number(u.searchParams.get(key));
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function _wv2nasHasAnyQueryKey(u, keys) {
+  return keys.some((key) => u.searchParams.has(key));
+}
+
+function _wv2nasRefreshSignedUrlFromAnchor(url, anchorUrl) {
+  const target = tryGetUrl(url);
+  const anchor = tryGetUrl(anchorUrl);
+  if (!target || !anchor) return url;
+  if (!_wv2nasHasAnyQueryKey(target, _WV2NAS_SIGNED_EXP_QUERY_KEYS)) return url;
+  if (!_wv2nasHasAnyQueryKey(target, _WV2NAS_SIGNED_AUTH_QUERY_KEYS)) return url;
+  if (!_wv2nasHasAnyQueryKey(anchor, _WV2NAS_SIGNED_EXP_QUERY_KEYS)) return url;
+  if (!_wv2nasHasAnyQueryKey(anchor, _WV2NAS_SIGNED_AUTH_QUERY_KEYS)) return url;
+  if (_wv2nasUrlDir(target) !== _wv2nasUrlDir(anchor)) return url;
+
+  const targetExp = _wv2nasQueryNumber(target, _WV2NAS_SIGNED_EXP_QUERY_KEYS);
+  const anchorExp = _wv2nasQueryNumber(anchor, _WV2NAS_SIGNED_EXP_QUERY_KEYS);
+  if (targetExp == null || anchorExp == null || targetExp >= anchorExp) return url;
+
+  let changed = false;
+  for (const key of _WV2NAS_SIGNED_REFRESH_QUERY_KEYS) {
+    if (!target.searchParams.has(key) || !anchor.searchParams.has(key)) continue;
+    const nextValue = anchor.searchParams.get(key);
+    if (target.searchParams.get(key) !== nextValue) {
+      target.searchParams.set(key, nextValue);
+      changed = true;
+    }
+  }
+  return changed ? target.href : url;
+}
+
+function _wv2nasRefreshSignedUrlFromAnchors(url, anchors) {
+  let out = url;
+  for (const anchor of anchors || []) {
+    out = _wv2nasRefreshSignedUrlFromAnchor(out, anchor);
+  }
+  return out;
+}
+
+function _wv2nasRefreshSignedPlanUrls(plan, anchors) {
+  if (!plan || !anchors || anchors.length === 0) return plan;
+  const refresh = (url) => (
+    typeof url === 'string' ? _wv2nasRefreshSignedUrlFromAnchors(url, anchors) : url
+  );
+
+  plan.source_url = refresh(plan.source_url);
+  plan.selected_variant_url = refresh(plan.selected_variant_url);
+  plan.init_segment_url = refresh(plan.init_segment_url);
+
+  for (const track of Object.values(plan.tracks || {})) {
+    if (!track) continue;
+    track.init_segment_url = refresh(track.init_segment_url);
+    for (const segment of track.segments || []) {
+      if (!segment) continue;
+      segment.url = refresh(segment.url);
+      if (segment.key && segment.key.uri) {
+        segment.key.uri = refresh(segment.key.uri);
+      }
+    }
+  }
+
+  return plan;
+}
+
 // Pick the best captured-headers entry to substitute in for `targetUrl`
 // when sending to NAS. The substitute lets us re-key from a "clean" URL the
 // user clicked to the tokenized URL the player actually fetched (with the
@@ -928,18 +1026,23 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
-// Check if a URL was detected via Content-Type (stored in per-tab or orphan lists)
-function getDetectedFormat(url) {
+function getDetectedUrlInfo(url) {
   for (const tabId of Object.keys(currentTabUrls)) {
     const list = currentTabUrls[tabId];
     if (!Array.isArray(list)) continue;
     const item = list.find(x => x && x.url === url);
-    if (item && item.detectedFormat) return item.detectedFormat;
+    if (item) return item;
   }
   for (const item of orphanUrlInfos) {
-    if (item && item.url === url && item.detectedFormat) return item.detectedFormat;
+    if (item && item.url === url) return item;
   }
   return null;
+}
+
+// Check if a URL was detected via Content-Type (stored in per-tab or orphan lists)
+function getDetectedFormat(url) {
+  const item = getDetectedUrlInfo(url);
+  return (item && item.detectedFormat) ? item.detectedFormat : null;
 }
 
 // Find the page title that was captured when a URL was first detected.
@@ -1339,8 +1442,10 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     let finalHeaders = {};
     let urlToSend = url;
 
+    const targetInfo = getDetectedUrlInfo(url);
     let captured = capturedHeaders[url];
     const best = findBestCapturedEntry(url, pageUrl, sourceTabId);
+    const keepClickedDetectedSignedUrl = shouldKeepClickedDetectedSignedUrl(url, targetInfo, best);
 
     // Use the best captured m3u8 when it's a strong match, even if we have
     // an exact key hit. Exact matches are often "clean" URLs (no token)
@@ -1350,12 +1455,15 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     // substitution is possible at this point.
     const shouldUseBest =
       !!best &&
+      !keepClickedDetectedSignedUrl &&
       (captured == null || best.score >= 15 || (best.entry && best.entry.timestamp && captured.timestamp && best.entry.timestamp > captured.timestamp));
 
     if (shouldUseBest) {
       captured = best.entry;
       urlToSend = best.url;
       console.log('Using best captured manifest for this URL\'s source tab:', urlToSend);
+    } else if (keepClickedDetectedSignedUrl) {
+      console.log('Keeping clicked detected signed manifest over older captured entry:', urlToSend);
     }
     
     if (captured && captured.headers) {
@@ -3393,6 +3501,15 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     const initJson = await initResp.json();
     jobId = initJson.job_id;
     const plan = initJson.plan;
+    _wv2nasRefreshSignedPlanUrls(
+      plan,
+      [
+        requestBody.url,
+        browserFetched && browserFetched.base_url,
+        plan && plan.source_url,
+        plan && plan.selected_variant_url,
+      ].filter(Boolean),
+    );
 
     // Register active job BEFORE further side effects so the offscreen
     // ref-count guard sees this job in the map.
