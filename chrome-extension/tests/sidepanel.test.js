@@ -125,4 +125,26 @@ describe('sidepanel.js helper functions', () => {
     item.playbackObserved = true;
     expect(ctx.urlInfoRequiresPlayFirst(item)).toBe(false);
   });
+
+  it('resets stale quality filters so detected URLs do not disappear behind hidden toolbar state', () => {
+    const ctx = loadScriptIntoContext('sidepanel.js', {
+      chrome: makeChromeStub(),
+      document: makeDocumentStub(),
+      window: {},
+    });
+
+    ctx.__eval(`
+      qualityFilter = '720p';
+      searchQuery = '';
+      detectedUrls = [{
+        url: 'https://hls.example.com/videos/hash/hash.m3u8?auth_key=abc&v=3&time=0',
+        detectedFormat: 'm3u8',
+        timestamp: 1000,
+      }];
+    `);
+
+    const [item] = ctx.visibleDetectedUrls();
+    expect(item.url).toBe('https://hls.example.com/videos/hash/hash.m3u8?auth_key=abc&v=3&time=0');
+    expect(ctx.__eval('qualityFilter')).toBe('all');
+  });
 });

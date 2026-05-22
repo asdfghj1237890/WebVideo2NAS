@@ -156,6 +156,47 @@ describe('background.js pure helpers', () => {
     expect(ctx.__eval('currentTabUrlKeys[7].size')).toBe(1);
   });
 
+  it('merges direct and inferred detections for the same manifest URL', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+
+    const manifestUrl = 'https://cdn.example.com/hls/videos/202402/15/448181161/720P_4000K_448181161.mp4/index-v1-a1.m3u8?token=one';
+    const inferred = ctx.inferHlsManifestFromSegmentUrl(
+      'https://cdn.example.com/hls/videos/202402/15/448181161/720P_4000K_448181161.mp4/seg-1-v1-a1.ts?token=one',
+    );
+    expect(inferred.url).toBe(manifestUrl);
+
+    const details = {
+      tabId: 7,
+      initiator: 'https://page.example/watch',
+      documentUrl: 'https://page.example/watch',
+      type: 'media',
+      frameId: 0,
+      method: 'GET',
+    };
+    ctx.registerDetectedUrl({ ...details, url: manifestUrl }, { detectedFormat: 'm3u8' });
+    ctx.registerDetectedUrl(
+      { ...details, url: inferred.url },
+      { detectedFormat: 'm3u8', playbackObserved: true, dedupeKey: inferred.dedupeKey },
+    );
+
+    const rows = ctx.__eval(`
+      currentTabUrls[7].map(({ url, dedupeKey, hitCount, playbackObserved }) => ({
+        url, dedupeKey, hitCount, playbackObserved
+      }))
+    `);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({
+      url: manifestUrl,
+      dedupeKey: inferred.dedupeKey,
+      hitCount: 2,
+      playbackObserved: true,
+    });
+    expect(ctx.__eval('currentTabUrlKeys[7].size')).toBe(2);
+  });
+
   it('scoreUrlInfo prefers recent + range hits + media type', () => {
     const ctx = loadScriptIntoContext('background.js', {
       chrome: makeChromeStub(),

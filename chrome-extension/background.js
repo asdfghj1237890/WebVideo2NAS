@@ -717,6 +717,35 @@ function mergeDetectedUrlExtra(existing, extra) {
   }
 }
 
+function findExistingDetectedUrlInfo(list, detectionKey, url) {
+  if (!Array.isArray(list)) return null;
+  return list.find(item => item && (
+    ((item.dedupeKey || item.url) === detectionKey) || item.url === url
+  )) || null;
+}
+
+function chooseMergedDedupeKey(existing, incoming) {
+  const incomingKey = incoming && incoming.dedupeKey;
+  if (incomingKey && incomingKey !== incoming.url) return incomingKey;
+  if (existing && existing.dedupeKey && existing.dedupeKey !== existing.url) {
+    return existing.dedupeKey;
+  }
+  return incomingKey || (existing && existing.dedupeKey) || (incoming && incoming.url);
+}
+
+function updateDetectedUrlInfo(existing, urlInfo, extra) {
+  if (!existing || !urlInfo) return;
+  existing.url = urlInfo.url;
+  existing.dedupeKey = chooseMergedDedupeKey(existing, urlInfo);
+  existing.timestamp = urlInfo.timestamp;
+  existing.pageUrl = urlInfo.pageUrl;
+  existing.requestType = urlInfo.requestType;
+  existing.frameId = urlInfo.frameId;
+  existing.method = urlInfo.method;
+  existing.hitCount = (Number(existing.hitCount) || 0) + 1;
+  mergeDetectedUrlExtra(existing, extra);
+}
+
 // Capture the tab's current title and stamp it onto the urlInfo. Async because
 // chrome.tabs.get is async — by the time we resolve, the urlInfo is already in
 // the store, so we mutate the live object. Best-effort; missing title is OK.
@@ -764,7 +793,13 @@ function registerDetectedUrl(details, extra) {
       currentTabUrlKeys[details.tabId] = new Set();
     }
 
-    if (!currentTabUrlKeys[details.tabId].has(detectionKey)) {
+    const existing = findExistingDetectedUrlInfo(
+      currentTabUrls[details.tabId],
+      detectionKey,
+      details.url
+    );
+
+    if (!existing) {
       currentTabUrlKeys[details.tabId].add(detectionKey);
       currentTabUrls[details.tabId].push(urlInfo);
       attachTabTitle(urlInfo, details.tabId);
@@ -774,43 +809,23 @@ function registerDetectedUrl(details, extra) {
       // variant the player probes).
       maybeFireAvTaskAutoSend(details.tabId, details.url);
     } else {
-      const list = currentTabUrls[details.tabId];
-      const existing = list.find(item => item && ((item.dedupeKey || item.url) === detectionKey));
-      if (existing) {
-        existing.url = urlInfo.url;
-        existing.dedupeKey = detectionKey;
-        existing.timestamp = urlInfo.timestamp;
-        existing.pageUrl = urlInfo.pageUrl;
-        existing.requestType = urlInfo.requestType;
-        existing.frameId = urlInfo.frameId;
-        existing.method = urlInfo.method;
-        existing.hitCount = (Number(existing.hitCount) || 0) + 1;
-        mergeDetectedUrlExtra(existing, extra);
-        // Refresh title in case the first capture raced with a transient
-        // empty-title state (loading SPA, etc).
-        if (!existing.pageTitle) attachTabTitle(existing, details.tabId);
-        notifyDetectedUrlsUpdated(details.tabId);
-      }
+      currentTabUrlKeys[details.tabId].add(detectionKey);
+      updateDetectedUrlInfo(existing, urlInfo, extra);
+      // Refresh title in case the first capture raced with a transient
+      // empty-title state (loading SPA, etc).
+      if (!existing.pageTitle) attachTabTitle(existing, details.tabId);
+      notifyDetectedUrlsUpdated(details.tabId);
     }
   } else {
-    if (!orphanUrlKeys.has(detectionKey)) {
+    const existing = findExistingDetectedUrlInfo(orphanUrlInfos, detectionKey, details.url);
+    if (!existing) {
       orphanUrlKeys.add(detectionKey);
       orphanUrlInfos.push(urlInfo);
       pruneOrphans();
     } else {
-      const existing = orphanUrlInfos.find(item => item && ((item.dedupeKey || item.url) === detectionKey));
-      if (existing) {
-        existing.url = urlInfo.url;
-        existing.dedupeKey = detectionKey;
-        existing.timestamp = urlInfo.timestamp;
-        existing.pageUrl = urlInfo.pageUrl;
-        existing.requestType = urlInfo.requestType;
-        existing.frameId = urlInfo.frameId;
-        existing.method = urlInfo.method;
-        existing.hitCount = (Number(existing.hitCount) || 0) + 1;
-        mergeDetectedUrlExtra(existing, extra);
-        pruneOrphans();
-      }
+      orphanUrlKeys.add(detectionKey);
+      updateDetectedUrlInfo(existing, urlInfo, extra);
+      pruneOrphans();
     }
   }
 

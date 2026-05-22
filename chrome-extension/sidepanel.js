@@ -761,6 +761,14 @@ function uniqueQualityLabels(items) {
   return order.filter(q => set.has(q));
 }
 
+function normalizeQualityFilter() {
+  if (qualityFilter === 'all') return;
+  const qualities = uniqueQualityLabels(detectedUrls);
+  if (!qualities.includes(qualityFilter)) {
+    qualityFilter = 'all';
+  }
+}
+
 // Browser-side play-first gate. HLS / DASH downloads need the
 // browser session's just-issued (often IP-bound, expiring-in-
 // minutes) token; the page's player typically only requests it
@@ -780,6 +788,7 @@ function urlInfoRequiresPlayFirst(urlInfo) {
 }
 
 function visibleDetectedUrls() {
+  normalizeQualityFilter();
   let items = sortedDetectedUrls();
   if (qualityFilter !== 'all') {
     items = items.filter(it => topQualityLabel(it.url) === qualityFilter);
