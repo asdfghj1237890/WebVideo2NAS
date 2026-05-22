@@ -359,6 +359,36 @@ describe('buildHeaderRules', () => {
       expect(r.condition.initiatorDomains).toEqual(['extid']);
     }
   });
+
+  it('packs more than 50 trusted URL prefixes into collision-free rules', () => {
+    const urls = Array.from(
+      { length: 56 },
+      (_v, i) => `https://cdn.example.com/media/shard-${i}/seg.m4s`
+    );
+
+    const { rules, ruleIds } = buildHeaderRules({
+      segmentUrls: urls,
+      trustedSegmentUrls: urls,
+      referer: 'https://example.com/watch',
+      origin: 'https://example.com',
+      userAgent: 'UA',
+      idBase: 10000,
+      initiatorDomain: 'extid',
+    });
+
+    const requestRules = rules.filter((r) => r.action.requestHeaders);
+    const responseRules = rules.filter((r) => r.action.responseHeaders);
+
+    expect(requestRules.length).toBeGreaterThan(0);
+    expect(requestRules.length).toBeLessThanOrEqual(_internals.RESPONSE_RULE_ID_OFFSET);
+    expect(responseRules.length).toBe(requestRules.length);
+    expect(new Set(ruleIds).size).toBe(ruleIds.length);
+
+    for (const url of urls) {
+      expect(requestRules.some((r) => new RegExp(r.condition.regexFilter).test(url))).toBe(true);
+      expect(responseRules.some((r) => new RegExp(r.condition.regexFilter).test(url))).toBe(true);
+    }
+  });
 });
 
 describe('install/cleanup wiring', () => {

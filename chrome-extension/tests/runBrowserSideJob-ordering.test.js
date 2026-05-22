@@ -343,6 +343,37 @@ describe('runBrowserSideJob: DNR install precedes manifest fetch', () => {
     promise.catch(() => {});
   });
 
+  it('background DNR builder packs more than 50 trusted URL prefixes into one slot', () => {
+    ctx.__testSegmentUrls = Array.from(
+      { length: 56 },
+      (_v, i) => `https://protected.example.com/media/shard-${i}/seg.m4s`
+    );
+
+    const rules = ctx.__eval(`_wv2nasBuildDnrRules({
+      segmentUrls: __testSegmentUrls,
+      trustedSegmentUrls: __testSegmentUrls,
+      referer: 'https://protected.example.com/watch',
+      origin: 'https://protected.example.com',
+      userAgent: 'UA',
+      idBase: 10000,
+      initiatorDomain: 'extid',
+    })`);
+
+    const requestRules = rules.filter((r) => r.action.requestHeaders);
+    const responseRules = rules.filter((r) => r.action.responseHeaders);
+    const ruleIds = rules.map((r) => r.id);
+
+    expect(requestRules.length).toBeGreaterThan(0);
+    expect(requestRules.length).toBeLessThanOrEqual(50);
+    expect(responseRules.length).toBe(requestRules.length);
+    expect(new Set(ruleIds).size).toBe(ruleIds.length);
+
+    for (const url of ctx.__testSegmentUrls) {
+      expect(requestRules.some((r) => new RegExp(r.condition.regexFilter).test(url))).toBe(true);
+      expect(responseRules.some((r) => new RegExp(r.condition.regexFilter).test(url))).toBe(true);
+    }
+  });
+
   it('persists phase-2 DNR ids before installing phase-2 rules', async () => {
     callOrder = [];
     const fetchStub = vi.fn(async (url, _opts) => {

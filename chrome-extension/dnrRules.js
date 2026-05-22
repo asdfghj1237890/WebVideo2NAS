@@ -22,6 +22,7 @@
 export const RULE_ID_BASE = 10_000;
 
 const RESPONSE_RULE_ID_OFFSET = 50;
+const MAX_PACKED_REGEX_FILTER_LENGTH = 1800;
 
 // Headers we'll *override on the request* (so the spoof is what reaches CDN).
 // Cookie is intentionally NOT in this list — Cookie is auto-attached by
@@ -65,6 +66,43 @@ export function urlsToRegexFilters(urls) {
   return filters;
 }
 
+function regexFilterToPackedTerm(regexFilter) {
+  if (regexFilter.startsWith('^') && regexFilter.endsWith('.*')) {
+    return `${regexFilter.slice(1, -2)}.*`;
+  }
+  return regexFilter.startsWith('^') ? regexFilter.slice(1) : regexFilter;
+}
+
+function packedRegexLength(terms) {
+  if (terms.length === 1) return 1 + terms[0].length;
+  return '^(?:'.length + terms.join('|').length + ')'.length;
+}
+
+function packRegexFilters(regexFilters) {
+  const packed = [];
+  let current = [];
+
+  function flush() {
+    if (current.length === 0) return;
+    packed.push(current.length === 1 ? `^${current[0]}` : `^(?:${current.join('|')})`);
+    current = [];
+  }
+
+  for (const regexFilter of Array.from(new Set(regexFilters))) {
+    const term = regexFilterToPackedTerm(regexFilter);
+    if (
+      current.length > 0
+      && packedRegexLength([...current, term]) > MAX_PACKED_REGEX_FILTER_LENGTH
+    ) {
+      flush();
+    }
+    current.push(term);
+  }
+  flush();
+
+  return packed;
+}
+
 /**
  * Build DNR session rules to spoof Referer / Origin / User-Agent on segment
  * fetches AND relax CORS on the responses (so opaque-mode-fetch isn't
@@ -79,9 +117,9 @@ export function urlsToRegexFilters(urls) {
  * receives an unreadable cross-origin response.
  *
  * @param {Object} opts
- * @param {string[]} opts.segmentUrls - URLs that get header-spoof rules
+ * @param {string[]} opts.segmentUrls - candidate URLs for DNR coverage
  * @param {string[]} [opts.trustedSegmentUrls] - subset of segmentUrls
- *   whose origins are trusted (same registrable-domain as manifest);
+ *   whose origins are inside the manifest's trusted host boundary;
  *   only these get CORS-relax. Default: all of segmentUrls (back-compat
  *   for single-trust-level callers; tests rely on this default).
  * @param {string} [opts.referer]
@@ -112,6 +150,23 @@ export function buildHeaderRules({
       .map((f) => f.regexFilter)
   );
 
+  const trustedFilters = allFilters
+    .map((f) => f.regexFilter)
+    .filter((regexFilter) => trustedSet.has(regexFilter));
+  if (trustedFilters.length === 0) return { rules: [], ruleIds: [] };
+
+  let ruleFilters = trustedFilters;
+  if (ruleFilters.length > RESPONSE_RULE_ID_OFFSET) {
+    const originalFilterCount = ruleFilters.length;
+    ruleFilters = packRegexFilters(ruleFilters);
+    if (ruleFilters.length > RESPONSE_RULE_ID_OFFSET) {
+      throw new Error(
+        `Too many trusted segment URL groups (${originalFilterCount}) for DNR slot; `
+        + `packed to ${ruleFilters.length}, max ${RESPONSE_RULE_ID_OFFSET}`
+      );
+    }
+  }
+
   const requestHeaderActions = [];
   if (referer) {
     requestHeaderActions.push({ header: 'referer', operation: 'set', value: referer });
@@ -141,8 +196,7 @@ export function buildHeaderRules({
 
   const rules = [];
   let ruleId = idBase;
-  for (const { regexFilter } of allFilters) {
-    const trusted = trustedSet.has(regexFilter);
+  for (const regexFilter of ruleFilters) {
     // Request header-spoof rule: ONLY for trusted origin groups.
     //
     // Codex adversarial-review: a malicious public HTTPS segment URL
@@ -158,7 +212,7 @@ export function buildHeaderRules({
     // Hotlink-protected legitimate cross-CDN streams are a niche
     // pattern; same-or-sub-origin CDNs are the common case and they
     // STILL get the spoof.
-    if (requestHeaderActions.length > 0 && trusted) {
+    if (requestHeaderActions.length > 0) {
       rules.push({
         id: ruleId,
         priority: 1,
@@ -172,20 +226,18 @@ export function buildHeaderRules({
     // Response CORS-relax: ONLY when this origin group is trusted.
     // Codex review #10: trusting all origins here is what lets a DNS-
     // rebinding manifest exfiltrate intranet content via the browser.
-    if (trusted) {
-      rules.push({
-        id: ruleId + RESPONSE_RULE_ID_OFFSET,
-        priority: 1,
-        action: {
-          type: 'modifyHeaders',
-          responseHeaders: [
-            { header: 'access-control-allow-origin', operation: 'set', value: '*' },
-            { header: 'access-control-allow-credentials', operation: 'remove' },
-          ],
-        },
-        condition: makeCondition(regexFilter),
-      });
-    }
+    rules.push({
+      id: ruleId + RESPONSE_RULE_ID_OFFSET,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        responseHeaders: [
+          { header: 'access-control-allow-origin', operation: 'set', value: '*' },
+          { header: 'access-control-allow-credentials', operation: 'remove' },
+        ],
+      },
+      condition: makeCondition(regexFilter),
+    });
     ruleId += 1;
   }
 

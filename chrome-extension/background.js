@@ -1895,6 +1895,7 @@ const _BROWSER_DNR_BASE_ID = 10000;
 const _BROWSER_DNR_PER_JOB_RANGE = 100;
 const _BROWSER_DNR_RESPONSE_OFFSET = 50; // within a slot, response rules at base+50
 const _BROWSER_DNR_MAX_SLOTS = 50;
+const _BROWSER_DNR_MAX_PACKED_REGEX_FILTER_LENGTH = 1800;
 const _wv2nasUsedDnrSlots = new Set();
 
 // Per-job runtime state (Codex review #2): registered when a job starts,
@@ -1937,14 +1938,52 @@ function _wv2nasUrlsToFilters(urls) {
   return filters;
 }
 
+function _wv2nasRegexFilterToPackedTerm(regexFilter) {
+  if (regexFilter.startsWith('^') && regexFilter.endsWith('.*')) {
+    return `${regexFilter.slice(1, -2)}.*`;
+  }
+  return regexFilter.startsWith('^') ? regexFilter.slice(1) : regexFilter;
+}
+
+function _wv2nasPackedRegexLength(terms) {
+  if (terms.length === 1) return 1 + terms[0].length;
+  return '^(?:'.length + terms.join('|').length + ')'.length;
+}
+
+function _wv2nasPackDnrFilters(filters) {
+  const packed = [];
+  let current = [];
+
+  function flush() {
+    if (current.length === 0) return;
+    packed.push(current.length === 1 ? `^${current[0]}` : `^(?:${current.join('|')})`);
+    current = [];
+  }
+
+  for (const filter of Array.from(new Set(filters))) {
+    const term = _wv2nasRegexFilterToPackedTerm(filter);
+    if (
+      current.length > 0
+      && _wv2nasPackedRegexLength([...current, term]) > _BROWSER_DNR_MAX_PACKED_REGEX_FILTER_LENGTH
+    ) {
+      flush();
+    }
+    current.push(term);
+  }
+  flush();
+
+  return packed;
+}
+
 // `idBase` is the starting rule ID for THIS job's slot — the caller
 // allocates it via _wv2nasAllocateDnrSlot. Within each slot we have
 // _BROWSER_DNR_RESPONSE_OFFSET (50) request-rule slots and 50 paired
-// response-rule slots. Hard-cap origin groups at 50 to fit the slot.
+// response-rule slots. Trusted URL prefixes above that count are packed
+// into anchored alternation filters before we spend rule IDs.
 //
 // Codex review #10: CORS-relax response rules ONLY apply to
-// `trustedSegmentUrls` (subset of `segmentUrls` whose origins share
-// the manifest's registrable-domain). Foreign origins get neither
+// `trustedSegmentUrls` (subset of `segmentUrls` inside the manifest's
+// trusted host boundary). Foreign origins get neither
 // header-spoof nor CORS-relax; fetch uses default browser headers and
 // the response remains unreadable cross-origin, defeating credential
 // leakage and DNS-rebinding exfil.
@@ -1952,20 +1991,24 @@ function _wv2nasBuildDnrRules({
   segmentUrls, trustedSegmentUrls, referer, origin, userAgent, idBase,
   initiatorDomain,
 }) {
-  const filters = _wv2nasUrlsToFilters(segmentUrls);
-  if (filters.length === 0) return [];
-  if (filters.length > _BROWSER_DNR_RESPONSE_OFFSET) {
-    // Don't silently truncate — fail loudly so the caller knows something
-    // about the segment URL distribution is unusual (>50 origin groups).
-    throw new Error(
-      `Too many segment URL origin groups (${filters.length}) for DNR slot; max ${_BROWSER_DNR_RESPONSE_OFFSET}`
-    );
-  }
-  // Build trust set from per-URL trust filtering. Default = all
-  // trusted (single-trust-level back-compat).
   const trustedFilters = new Set(_wv2nasUrlsToFilters(
     trustedSegmentUrls === undefined ? segmentUrls : trustedSegmentUrls
   ));
+  let filters = _wv2nasUrlsToFilters(segmentUrls)
+    .filter((filter) => trustedFilters.has(filter));
+  if (filters.length === 0) return [];
+  if (filters.length > _BROWSER_DNR_RESPONSE_OFFSET) {
+    const originalFilterCount = filters.length;
+    filters = _wv2nasPackDnrFilters(filters);
+    if (filters.length > _BROWSER_DNR_RESPONSE_OFFSET) {
+      // Don't silently truncate — fail loudly so the caller knows something
+      // about the segment URL distribution is unusual.
+      throw new Error(
+        `Too many trusted segment URL groups (${originalFilterCount}) for DNR slot; `
+        + `packed to ${filters.length}, max ${_BROWSER_DNR_RESPONSE_OFFSET}`
+      );
+    }
+  }
 
   const reqHeaders = [];
   if (referer) reqHeaders.push({ header: 'referer', operation: 'set', value: referer });
@@ -1991,13 +2034,12 @@ function _wv2nasBuildDnrRules({
   const rules = [];
   let id = idBase;
   for (const regexFilter of filters) {
-    const trusted = trustedFilters.has(regexFilter);
     // Request header-spoof: ONLY for trusted origin groups.
     // Codex adversarial-review: foreign hosts no longer receive the
     // captured Referer/Origin/User-Agent — Referers for player pages
     // can carry signed URLs / session tokens. Must stay in lockstep
     // with dnrRules.js::buildHeaderRules.
-    if (reqHeaders.length > 0 && trusted) {
+    if (reqHeaders.length > 0) {
       rules.push({
         id,
         priority: 1,
@@ -2006,20 +2048,18 @@ function _wv2nasBuildDnrRules({
       });
     }
     // Response CORS-relax: ONLY for trusted origin groups. Codex #10.
-    if (trusted) {
-      rules.push({
-        id: id + _BROWSER_DNR_RESPONSE_OFFSET,
-        priority: 1,
-        action: {
-          type: 'modifyHeaders',
-          responseHeaders: [
-            { header: 'access-control-allow-origin', operation: 'set', value: '*' },
-            { header: 'access-control-allow-credentials', operation: 'remove' },
-          ],
-        },
-        condition: makeCondition(regexFilter),
-      });
-    }
+    rules.push({
+      id: id + _BROWSER_DNR_RESPONSE_OFFSET,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        responseHeaders: [
+          { header: 'access-control-allow-origin', operation: 'set', value: '*' },
+          { header: 'access-control-allow-credentials', operation: 'remove' },
+        ],
+      },
+      condition: makeCondition(regexFilter),
+    });
     id += 1;
   }
   return rules;
@@ -3376,9 +3416,9 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     //
     // Codex review #10: filter URLs by trust to feed the new
     // trustedSegmentUrls parameter. CORS-relax only applies to URLs
-    // sharing the manifest's registrable-domain. Foreign origins still
-    // get header-spoof rules (hotlink protection) but their responses
-    // come back opaque — unread by the extension, can't be exfil'd.
+    // sharing the manifest's trusted host boundary. Foreign origins get
+    // no DNR rule, so they don't receive captured Referer/Origin/UA and
+    // their responses stay unreadable to the extension.
     const segmentUrls = _wv2nasPlanSegmentUrls(plan);
     const trustedBaseForDnr = plan.selected_variant_url || plan.source_url || requestBody.url;
     const trustedSegmentUrls = segmentUrls.filter(
