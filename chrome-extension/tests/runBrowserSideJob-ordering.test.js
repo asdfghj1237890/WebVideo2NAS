@@ -461,6 +461,81 @@ describe('runBrowserSideJob: DNR install precedes manifest fetch', () => {
     promise.catch(() => {});
   });
 
+  it('phase-2 DNR trusts segment hosts covered by trustedCdnSuffixes', async () => {
+    callOrder = [];
+    const segmentUrl = 'https://segments.cdn.example/video/0.ts';
+    const fetchStub = vi.fn(async (url, _opts) => {
+      callOrder.push({ kind: 'fetch', url: String(url) });
+      const u = String(url);
+      if (u.includes('master.m3u8')) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => '#EXTM3U\n#EXTINF:10\nvideo/0.ts\n',
+          headers: new Map(),
+        };
+      }
+      if (u.endsWith('/api/jobs/init')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            job_id: 'allowlisted-cdn-segments-job',
+            plan: {
+              container: 'hls',
+              source_url: 'https://manifest.cdn.example/path/master.m3u8',
+              selected_variant_url: 'https://manifest.cdn.example/path/master.m3u8',
+              total_segments: 1,
+              tracks: {
+                video: {
+                  segment_count: 1,
+                  segments: [{ seq: 0, url: segmentUrl }],
+                },
+              },
+            },
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
+    });
+    const chrome = makeChromeStub(callOrder);
+    ctx = loadScriptIntoContext(BACKGROUND_SCRIPT, {
+      chrome,
+      fetch: fetchStub,
+      AbortController, AbortSignal,
+      Promise, Map, Set, Error, JSON, RegExp, Math,
+    });
+    ctx.userSettings = { showNotifications: false };
+
+    const promise = ctx.runBrowserSideJob({
+      nasEndpoint: 'http://nas.local:52052',
+      apiKey: 'test-key',
+      requestBody: {
+        url: 'https://manifest.cdn.example/path/master.m3u8',
+        title: 'Cross CDN',
+        referer: 'https://site.example/watch',
+        headers: { 'User-Agent': 'Mozilla/5.0 player' },
+        source_page: 'https://site.example/watch',
+      },
+      title: 'Cross CDN',
+      pageUrl: 'https://site.example/watch',
+      formatHint: 'm3u8',
+      trustedCdnSuffixes: ['cdn.example'],
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    const phase2Dnr = callOrder.find((c) =>
+      c.kind === 'dnr.updateSessionRules'
+      && (c.addRulesUrlPatterns || []).some((p) =>
+        p && new RegExp(p).test(segmentUrl)
+      )
+    );
+    expect(phase2Dnr).toBeDefined();
+
+    promise.catch(() => {});
+  });
+
   it('manifest fetch uses credentials:include (cookies + session ride along)', async () => {
     // Independent assertion — even with DNR rules active, the fetch
     // call needs credentials:'include' for the session cookies that

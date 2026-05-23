@@ -2219,6 +2219,18 @@ function _wv2nasIsTrustedDnrUrl(segmentUrl, trustedBase) {
   return false;
 }
 
+function _wv2nasIsTrustedSegmentDnrUrl(segmentUrl, trustedBase, trustedCdnSuffixes) {
+  if (_wv2nasIsTrustedDnrUrl(segmentUrl, trustedBase)) return true;
+  try {
+    return _wv2nasMatchesTrustedCdnSuffix(
+      new URL(segmentUrl).hostname.toLowerCase(),
+      trustedCdnSuffixes,
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
 // Collect every URL DNR rules need to cover for a job: init segments,
 // media segments, AND AES-128 key URIs (Codex review #3 — without keys
 // in the DNR scope, segment fetches succeed but the subsequent key
@@ -3548,13 +3560,14 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     //
     // Codex review #10: filter URLs by trust to feed the new
     // trustedSegmentUrls parameter. CORS-relax only applies to URLs
-    // sharing the manifest's trusted host boundary. Foreign origins get
-    // no DNR rule, so they don't receive captured Referer/Origin/UA and
-    // their responses stay unreadable to the extension.
+    // sharing the manifest's trusted host boundary, or to hosts covered
+    // by the user's explicit Trusted cross-site CDN suffixes. Foreign
+    // origins get no DNR rule, so they don't receive captured Referer/
+    // Origin/UA and their responses stay unreadable to the extension.
     const segmentUrls = _wv2nasPlanSegmentUrls(plan);
     const trustedBaseForDnr = plan.selected_variant_url || plan.source_url || requestBody.url;
     const trustedSegmentUrls = segmentUrls.filter(
-      (u) => _wv2nasIsTrustedDnrUrl(u, trustedBaseForDnr)
+      (u) => _wv2nasIsTrustedSegmentDnrUrl(u, trustedBaseForDnr, trustedCdnSuffixes)
     );
     const rules = _wv2nasBuildDnrRules({
       segmentUrls,

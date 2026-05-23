@@ -1714,7 +1714,7 @@ describe('runJob: redirect: error guard (Codex P1)', () => {
     expect(keyFetch.opts.redirect).toBe('error');
   });
 
-  it('segment fetch with redirect rejection surfaces as job failure', async () => {
+  it('segment fetch with redirect rejection surfaces sanitized URL context', async () => {
     // Simulate Chrome behavior: fetch throws TypeError when the
     // server returns 30x with redirect:'error'.
     globalThis.fetch = vi.fn(async (url) => {
@@ -1735,13 +1735,15 @@ describe('runJob: redirect: error guard (Codex P1)', () => {
           source_url: 'https://cdn.example.com/master.m3u8',
           tracks: {
             video: {
-              segments: [{ url: 'https://cdn.example.com/seg0.ts' }],
+              segments: [{ seq: 0, url: 'https://cdn.example.com/seg0.ts?token=secret' }],
             },
           },
         },
       });
     } catch (err) { caught = err; }
     expect(caught).not.toBeNull();
+    expect(caught.message).toContain('https://cdn.example.com/seg0.ts');
+    expect(caught.message).not.toContain('token=secret');
   }, 15000);
 });
 

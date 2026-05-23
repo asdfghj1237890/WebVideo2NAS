@@ -230,6 +230,18 @@ function maxBytesForRange(byteRange) {
 }
 
 
+function sanitizedUrlForError(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.href;
+  } catch (_) {
+    return String(url || '');
+  }
+}
+
+
 function assertRangeHonored(resp, bytes, byteRange, label) {
   if (!byteRange) return;
   if (resp.status !== 206) {
@@ -613,7 +625,7 @@ async function processOneSegment({
     await uploadSegment({
       nasEndpoint, apiKey, jobId, track, seq: segment.seq, bytes, signal,
     });
-  }, `segment ${track}/${segment.seq}`, signal);
+  }, `segment ${track}/${segment.seq} ${sanitizedUrlForError(segment.url)}`, signal);
 
   if (onProgress) onProgress({ track, seq: segment.seq });
 }
