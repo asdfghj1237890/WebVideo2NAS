@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "description": "Unit tests for WebVideo2NAS Chrome extension",
   "devDependencies": {
-    "vitest": "^2.1.8",
+    "vitest": "^4.1.8",
     "jsdom": "^25.0.1"
   },
   "scripts": {

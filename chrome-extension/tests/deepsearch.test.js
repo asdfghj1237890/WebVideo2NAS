@@ -138,7 +138,7 @@ describe('Worker postMessage hook', () => {
     // parse HTML as m3u8 and fail. Now: deep-hit only.
     const innerPostMessage = vi.fn();
     const fakeWorkerInstance = { postMessage: innerPostMessage };
-    const FakeWorker = vi.fn(() => fakeWorkerInstance);
+    const FakeWorker = vi.fn(function () { return fakeWorkerInstance; });
     const origWorker = window.Worker;
     window.Worker = FakeWorker;
 
@@ -172,7 +172,7 @@ describe('Worker postMessage hook', () => {
 
   it('detects manifest text inside object property as deep-hit (NOT manifest URL)', async () => {
     const fakeWorkerInstance = { postMessage: vi.fn() };
-    const FakeWorker = vi.fn(() => fakeWorkerInstance);
+    const FakeWorker = vi.fn(function () { return fakeWorkerInstance; });
     const origWorker = window.Worker;
     window.Worker = FakeWorker;
 
@@ -199,7 +199,7 @@ describe('Worker postMessage hook', () => {
 
   it('does not crash on a non-string non-object postMessage payload', () => {
     const fakeWorkerInstance = { postMessage: vi.fn() };
-    const FakeWorker = vi.fn(() => fakeWorkerInstance);
+    const FakeWorker = vi.fn(function () { return fakeWorkerInstance; });
     const origWorker = window.Worker;
     window.Worker = FakeWorker;
 
@@ -220,7 +220,7 @@ describe('Worker postMessage hook', () => {
         listeners[type] = listener;
       }),
     };
-    const FakeWorker = vi.fn(() => fakeWorkerInstance);
+    const FakeWorker = vi.fn(function () { return fakeWorkerInstance; });
     const origWorker = window.Worker;
     window.Worker = FakeWorker;
 
@@ -259,7 +259,7 @@ describe('Worker postMessage hook', () => {
         listeners[type] = listener;
       }),
     };
-    const FakeWorker = vi.fn(() => fakeWorkerInstance);
+    const FakeWorker = vi.fn(function () { return fakeWorkerInstance; });
     const origWorker = window.Worker;
     window.Worker = FakeWorker;
 
@@ -290,7 +290,7 @@ describe('Worker postMessage hook', () => {
         listeners[type] = listener;
       }),
     };
-    const FakeWorker = vi.fn(() => fakeWorkerInstance);
+    const FakeWorker = vi.fn(function () { return fakeWorkerInstance; });
     const origWorker = window.Worker;
     window.Worker = FakeWorker;
 
@@ -345,7 +345,7 @@ describe('Worker postMessage hook', () => {
 
   it('continues scanning after nested segment hits to find a later manifest URL', async () => {
     const fakeWorkerInstance = { postMessage: vi.fn() };
-    const FakeWorker = vi.fn(() => fakeWorkerInstance);
+    const FakeWorker = vi.fn(function () { return fakeWorkerInstance; });
     const origWorker = window.Worker;
     window.Worker = FakeWorker;
 
