@@ -6,6 +6,13 @@
 # Per-role hardening trade-off: the API container ends up with worker-only
 # packages (curl_cffi, m3u8, pycryptodome) and ffmpeg installed but unused.
 
+# Pull ffmpeg/ffprobe from an upstream-pinned static build instead of apt.
+# Debian trixie ships 7.1.x and historically postpones backports for several
+# 2026 CVEs (e.g. CVE-2026-30997 / 30999 / 6385 in libavcodec & demuxers);
+# 8.1.1 covers them upstream. Static PIE binary = no shared-lib drift across
+# rebuilds. Multi-arch tag supports linux/amd64 + linux/arm64.
+FROM mwader/static-ffmpeg:8.1.1 AS ffmpeg
+
 FROM python:3.11-slim
 
 LABEL org.opencontainers.image.source="https://github.com/asdfghj1237890/chrome2nas-m3u8"
@@ -14,10 +21,13 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 
-# System dependencies. ffmpeg is for the worker (HLS/DASH segment merging);
-# curl is used by the API healthcheck.
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
+
+# curl is used by the API healthcheck. ffmpeg/ffprobe come from the static
+# stage above; do NOT apt-install them here or the static binary on PATH
+# could shadow / be shadowed depending on layer ordering.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
