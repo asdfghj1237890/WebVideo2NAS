@@ -5,6 +5,7 @@ import vm from 'node:vm';
 export function loadScriptIntoContext(scriptPath, context = {}) {
   const abs = path.isAbsolute(scriptPath) ? scriptPath : path.resolve(process.cwd(), scriptPath);
   const code = fs.readFileSync(abs, 'utf-8');
+  const loadedScripts = new Set();
 
   const ctx = vm.createContext({
     console,
@@ -16,6 +17,18 @@ export function loadScriptIntoContext(scriptPath, context = {}) {
     clearInterval: () => {},
     ...context,
   });
+
+  ctx.importScripts = (...scriptUrls) => {
+    for (const scriptUrl of scriptUrls) {
+      const childAbs = path.isAbsolute(scriptUrl)
+        ? scriptUrl
+        : path.resolve(path.dirname(abs), scriptUrl);
+      if (loadedScripts.has(childAbs)) continue;
+      loadedScripts.add(childAbs);
+      const childCode = fs.readFileSync(childAbs, 'utf-8');
+      vm.runInContext(childCode, ctx, { filename: childAbs });
+    }
+  };
 
   // Execute as a script in the provided context.
   vm.runInContext(code, ctx, { filename: abs });

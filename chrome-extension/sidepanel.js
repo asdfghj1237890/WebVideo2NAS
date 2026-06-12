@@ -3,6 +3,18 @@
 // UX animations: tile enter (staggered), pulse on new detection, hover lift,
 // flight ghost on send, checkbox bounce, bulk bar slide, smooth ring tween.
 
+if (typeof importScripts === 'function') {
+  importScripts('sidepanelCore.js');
+}
+const _sidepanelGlobalRoot = (typeof globalThis !== 'undefined' && globalThis)
+  || (typeof window !== 'undefined' && window)
+  || this;
+const sidepanelCore = _sidepanelGlobalRoot.WV2NSidepanelCore
+  || (typeof window !== 'undefined' && window.WV2NSidepanelCore);
+if (!sidepanelCore) {
+  throw new Error('WV2NSidepanelCore failed to load');
+}
+
 let settings = {};
 let detectedUrls = [];
 let deepHits = [];
@@ -112,18 +124,7 @@ async function loadSettingsFromStorage() {
 // mainly for storage hygiene + dedup, plus pulling the hostname out
 // when the user pastes a full URL.
 function parseTrustedCdnSuffixesInput(raw) {
-  if (typeof raw !== 'string') return [];
-  const seen = new Set();
-  for (const part of raw.split(/[,\n]+/)) {
-    let s = part.trim();
-    if (!s) continue;
-    if (s.includes('://')) {
-      try { s = new URL(s).hostname; } catch (_) { /* keep raw on parse fail */ }
-    }
-    s = s.replace(/^\.+/, '').toLowerCase();
-    if (s) seen.add(s);
-  }
-  return Array.from(seen);
+  return sidepanelCore.parseTrustedCdnSuffixesInput(raw);
 }
 
 function applyModeBadge() {
@@ -179,31 +180,7 @@ async function saveTrustedCdnInput() {
 // IP literal (gate rejects regardless of trust list), single-label
 // host (e.g. localhost — also rejected by gate).
 function deriveTrustedCdnSuffix(urlOrHost) {
-  if (typeof urlOrHost !== 'string' || !urlOrHost) return null;
-  const raw = urlOrHost.trim();
-  if (!raw) return null;
-  let host = raw;
-  try {
-    if (raw.includes('://')) {
-      host = new URL(raw).hostname;
-    } else if (raw.includes('/') || raw.includes(':')) {
-      host = new URL(`https://${raw}`).hostname;
-    }
-  } catch (_) {
-    return null;
-  }
-  if (!host) return null;
-  host = host.toLowerCase().replace(/^\.+|\.+$/g, '');
-  // IP literal (v4 or bracketed v6) — gate rejects at IP-classification
-  // step, no trust list change can unblock these.
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return null;
-  if (host.startsWith('[')) return null;
-  const parts = host.split('.').filter(Boolean);
-  if (parts.length < 2) return null;
-  // Conservative DNS-ish shape check. URL.hostname already punycodes
-  // IDNs, so xn-- labels are fine here.
-  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host)) return null;
-  return host;
+  return sidepanelCore.deriveTrustedCdnSuffix(urlOrHost);
 }
 
 // Pure JS twin of background.js's `_wv2nasMatchesTrustedCdnSuffix`.
@@ -212,16 +189,7 @@ function deriveTrustedCdnSuffix(urlOrHost) {
 // rendering decisions. Both helpers MUST stay in lockstep — same
 // rules (exact-or-dotted-suffix, lowercase, leading-dot tolerant).
 function hostMatchesAnyTrustedSuffix(host, suffixes) {
-  if (!Array.isArray(suffixes) || suffixes.length === 0) return false;
-  if (typeof host !== 'string' || !host) return false;
-  const h = host.toLowerCase();
-  for (const raw of suffixes) {
-    if (typeof raw !== 'string') continue;
-    const s = raw.trim().toLowerCase().replace(/^\.+/, '');
-    if (!s) continue;
-    if (h === s || h.endsWith('.' + s)) return true;
-  }
-  return false;
+  return sidepanelCore.hostMatchesAnyTrustedSuffix(host, suffixes);
 }
 
 async function trustCdnFromUrl(url) {
@@ -1932,37 +1900,11 @@ function buildMetaLine(urlInfo) {
 }
 
 function extractQualitiesFromUrl(url) {
-  const raw = String(url || '');
-  const lower = raw.toLowerCase();
-  if (!lower) return [];
-
-  const allowed = new Set([2160, 1440, 1080, 720, 540, 480, 360, 240]);
-  const found = new Set();
-
-  const pMatches = lower.matchAll(/(?<![0-9])([0-9]{3,4})p(?![a-z0-9])/g);
-  for (const m of pMatches) {
-    const n = Number(m[1]);
-    if (allowed.has(n)) found.add(n);
-  }
-
-  const qMatches = lower.matchAll(/[?&](?:res|resolution|quality|q|height|h)=([0-9]{3,4})\b/g);
-  for (const m of qMatches) {
-    const n = Number(m[1]);
-    if (allowed.has(n)) found.add(n);
-  }
-
-  return Array.from(found).sort((a, b) => b - a).map(n => `${n}p`);
+  return sidepanelCore.extractQualitiesFromUrl(url);
 }
 
 function getMaxQualityNumber(url) {
-  const qualities = extractQualitiesFromUrl(url);
-  if (!qualities.length) return -1;
-  let max = -1;
-  for (const q of qualities) {
-    const n = parseInt(String(q).replace(/[^0-9]/g, ''), 10);
-    if (Number.isFinite(n) && n > max) max = n;
-  }
-  return max;
+  return sidepanelCore.getMaxQualityNumber(url);
 }
 
 function getStatusLabel(status) {
@@ -2026,28 +1968,15 @@ function getErrorInfo(errorMessage) {
 }
 
 function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text == null ? '' : String(text);
-  return div.innerHTML;
+  return sidepanelCore.escapeHtml(text);
 }
 
 function formatDuration(totalSeconds) {
-  const s = Math.max(0, Math.floor(Number(totalSeconds) || 0));
-  const hours = Math.floor(s / 3600);
-  const minutes = Math.floor((s % 3600) / 60);
-  const seconds = s % 60;
-  const mm = String(minutes).padStart(2, '0');
-  const ss = String(seconds).padStart(2, '0');
-  if (hours > 0) {
-    const hh = String(hours).padStart(2, '0');
-    return `${hh}:${mm}:${ss}`;
-  }
-  return `${mm}:${ss}`;
+  return sidepanelCore.formatDuration(totalSeconds);
 }
 
 function containsIpAddress(url) {
-  const ipv4QueryPattern = /[?&]ip=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/;
-  return ipv4QueryPattern.test(url);
+  return sidepanelCore.containsIpAddress(url);
 }
 
 // Auto-refresh jobs every 2 seconds

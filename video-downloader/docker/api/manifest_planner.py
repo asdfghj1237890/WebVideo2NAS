@@ -11,9 +11,7 @@ verbatim. Bytes (only AES IV) → hex strings; everything else is plain.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
-import socket
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -21,6 +19,8 @@ import m3u8 as _m3u8_lib
 
 from shared.parsers.m3u8 import M3U8Parser
 from shared.parsers.dash import parse_mpd, MPDParseError, extract_all_mpd_urls
+from shared.security import is_ip_public as _shared_is_ip_public
+from shared.security import resolve_host_ips as _shared_resolve_host_ips
 from shared.ssl import create_legacy_session
 
 logger = logging.getLogger(__name__)
@@ -119,20 +119,14 @@ def _validate_url_safety(url: str) -> None:
         raise ManifestPlanError(f"URL host {hostname!r} not allowed (localhost): {url[:120]}")
 
     try:
-        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        ips = _shared_resolve_host_ips(hostname)
     except Exception:
         raise ManifestPlanError(f"URL host {hostname!r} could not be resolved: {url[:120]}")
-    if not infos:
+    if not ips:
         raise ManifestPlanError(f"URL host {hostname!r} could not be resolved: {url[:120]}")
 
-    for info in infos:
-        ip_str = info[4][0]
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            continue
-        if (ip.is_loopback or ip.is_private or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+    for ip in ips:
+        if not _shared_is_ip_public(ip):
             raise ManifestPlanError(
                 f"URL host {hostname!r} resolves to non-public IP {ip}: {url[:120]}"
             )

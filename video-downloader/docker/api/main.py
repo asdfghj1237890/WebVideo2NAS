@@ -22,7 +22,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 import uuid
 import ipaddress
-import socket
+
+from browser_jobs import (
+    BrowserJobPaths,
+    enforce_plan_url_safety as _browser_enforce_plan_url_safety,
+    staged_segment_seq_from_name as _browser_staged_segment_seq_from_name,
+)
+from shared.security import is_ip_public as _shared_is_ip_public
+from shared.security import resolve_host_ips as _shared_resolve_host_ips
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/m3u8_db")
@@ -237,21 +244,11 @@ def _rate_limit(request: Request, bucket: str) -> None:
 
 
 def _resolve_host_ips(hostname: str) -> list[ipaddress._BaseAddress]:
-    # Resolve A/AAAA records; if it fails, we treat as invalid for SSRF protection.
-    infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-    ips: list[ipaddress._BaseAddress] = []
-    for info in infos:
-        sockaddr = info[4]
-        ip_str = sockaddr[0]
-        ips.append(ipaddress.ip_address(ip_str))
-    return ips
+    return _shared_resolve_host_ips(hostname)
 
 
 def _is_ip_public(ip: ipaddress._BaseAddress) -> bool:
-    # Block common SSRF targets: loopback, link-local, RFC1918/ULA, multicast, reserved, etc.
-    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
-        return False
-    return True
+    return _shared_is_ip_public(ip)
 
 
 def _enforce_ssrf_guard(url: HttpUrl) -> None:
@@ -773,48 +770,27 @@ async def get_status(
 # / session-cookie URLs that nas-direct fails on.
 # ---------------------------------------------------------------------------
 
-_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _VALID_TRACKS = ("video", "audio")
 _VALID_INIT_LABELS = ("video", "audio")
+_browser_job_paths = BrowserJobPaths(STAGING_DIR, MAX_BROWSER_SEGMENTS)
 
 
 def _validate_job_id(job_id: str) -> None:
     """Reject anything not a strict UUID — defense against path traversal
     via the {job_id} path parameter (e.g. `..%2Fother-job`)."""
-    _canonical_job_id(job_id)
+    _browser_job_paths.validate_job_id(job_id)
 
 
 def _canonical_job_id(job_id: str) -> str:
     """Return a normalized UUID string for filesystem use."""
-    raw = str(job_id or "")
-    if not _UUID_RE.fullmatch(raw):
-        raise HTTPException(status_code=400, detail="Invalid job_id format")
-    try:
-        return str(uuid.UUID(raw))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid job_id format")
+    return _browser_job_paths.canonical_job_id(job_id)
 
 
 def _staging_path_for(job_id: str) -> Path:
     """Return the staging root for a job, validating it stays under
     STAGING_DIR. realpath check guards against `STAGING_DIR/../something`
     if a future caller passes attacker-influenced job_id by mistake."""
-    safe_job_id = _canonical_job_id(job_id)
-    base = os.path.normpath(os.path.realpath(STAGING_DIR))
-    candidate = os.path.normpath(os.path.realpath(os.path.join(base, safe_job_id)))
-    try:
-        if os.path.commonpath([base, candidate]) != base:
-            raise ValueError("candidate escaped staging root")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid staging path")
-
-    # CodeQL's py/path-injection recognises normalised-prefix checks more
-    # reliably than pathlib's resolve()/relative_to() containment pattern.
-    base_prefix = base if base.endswith(os.sep) else base + os.sep
-    if not candidate.startswith(base_prefix):
-        raise HTTPException(status_code=400, detail="Invalid staging path")
-    return Path(candidate)
+    return _browser_job_paths.staging_path_for(job_id)
 
 
 def _metadata_staging_path_for_job(job_id: str, staging_dir: str, context: str) -> Optional[Path]:
@@ -826,8 +802,7 @@ def _metadata_staging_path_for_job(job_id: str, staging_dir: str, context: str) 
     STAGING_DIR but would let one job's cancel path delete another job's files.
     """
     try:
-        expected = _staging_path_for(job_id).resolve()
-        actual = Path(staging_dir or "").resolve()
+        actual = _browser_job_paths.metadata_staging_path_for_job(job_id, staging_dir)
     except Exception as e:
         logger.warning(
             f"{context} {job_id}: staging_dir {staging_dir!r} could not be "
@@ -835,37 +810,27 @@ def _metadata_staging_path_for_job(job_id: str, staging_dir: str, context: str) 
             f"({e})"
         )
         return None
-    if actual != expected:
+    if actual is None:
+        expected = _staging_path_for(job_id).resolve()
+        resolved = Path(staging_dir or "").resolve()
         logger.warning(
             f"{context} {job_id}: staging_dir {str(staging_dir)!r} resolves "
-            f"to {actual}, expected {expected}; refusing rmtree"
+            f"to {resolved}, expected {expected}; refusing rmtree"
         )
         return None
     return actual
 
 
 def _segment_path(job_id: str, track: str, seq: int) -> Path:
-    if track not in _VALID_TRACKS:
-        raise HTTPException(status_code=400, detail=f"Invalid track: must be one of {_VALID_TRACKS}")
-    if seq < 0 or seq >= MAX_BROWSER_SEGMENTS:
-        raise HTTPException(status_code=400, detail="seq out of range")
-    return _staging_path_for(job_id) / track / f"seg_{seq:08d}.bin"
-
-
-_STAGED_SEGMENT_FILE_RE = re.compile(r"^seg_(\d{8})\.bin$")
+    return _browser_job_paths.segment_path(job_id, track, seq)
 
 
 def _staged_segment_seq_from_name(name: str) -> Optional[int]:
-    match = _STAGED_SEGMENT_FILE_RE.fullmatch(name)
-    if not match:
-        return None
-    return int(match.group(1))
+    return _browser_staged_segment_seq_from_name(name)
 
 
 def _init_segment_path(job_id: str, label: str) -> Path:
-    if label not in _VALID_INIT_LABELS:
-        raise HTTPException(status_code=400, detail=f"Invalid init label: must be one of {_VALID_INIT_LABELS}")
-    return _staging_path_for(job_id) / "init" / f"{label}.bin"
+    return _browser_job_paths.init_segment_path(job_id, label)
 
 
 def _published_target_has_bytes(target: Path) -> bool:
@@ -894,92 +859,11 @@ def _enforce_plan_url_safety(plan: Dict) -> None:
     1000 lookups. Failure raises HTTPException(422) so init rejects
     the whole job before any staging dir is created.
     """
-    urls: set = set()
-    if plan.get("init_segment_url"):
-        urls.add(plan["init_segment_url"])
-    for track in (plan.get("tracks") or {}).values():
-        if track.get("init_segment_url"):
-            urls.add(track["init_segment_url"])
-        for seg in (track.get("segments") or []):
-            if seg.get("url"):
-                urls.add(seg["url"])
-            key = seg.get("key") or {}
-            if key.get("uri"):
-                urls.add(key["uri"])
-
-    # Dedup by origin so DNS resolution is bounded.
-    origins: dict = {}
-    for url in urls:
-        try:
-            from urllib.parse import urlparse as _urlparse
-            parsed = _urlparse(url)
-        except Exception:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Plan URL parse failed: {url[:120]}",
-            )
-        if parsed.scheme not in ("http", "https"):
-            raise HTTPException(
-                status_code=422,
-                detail=f"Plan URL scheme {parsed.scheme!r} not allowed: {url[:120]}",
-            )
-        # Codex adversarial-review: reject plain HTTP for browser-side
-        # plans. The server-side IP check below resolves the host once
-        # at /jobs/init time; the browser later does its OWN DNS lookup
-        # when fetching the segment, key, or init URL. A malicious DNS
-        # answer that returns a public IP for the validation lookup
-        # and a private/intranet IP for the browser's lookup
-        # (DNS rebinding) defeats the public-IP gate. TLS would
-        # detect rebinding via certificate-name mismatch; HTTP cannot.
-        # Browser-side mode also installs CORS-relaxing DNR rules and
-        # uploads the response body to NAS, so a successful rebinding
-        # turns the extension into an authenticated intranet reader.
-        # Fail closed: HTTP is unsafe here. Server-side download
-        # (/api/download) remains available for HTTP-only sources.
-        if parsed.scheme == "http":
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"Plan URL must use HTTPS for browser-side mode "
-                    f"(plain HTTP is rejected because DNS rebinding "
-                    f"between server-side validation and browser-side "
-                    f"fetch is unmitigatable): {url[:120]}"
-                ),
-            )
-        if not parsed.hostname:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Plan URL has no host: {url[:120]}",
-            )
-        origins.setdefault(parsed.hostname.lower(), url)
-
-    for host, sample_url in origins.items():
-        if host in ("localhost", "ip6-localhost", "ip6-loopback"):
-            raise HTTPException(
-                status_code=422,
-                detail=f"Plan URL host {host!r} not allowed (localhost): {sample_url[:120]}",
-            )
-        try:
-            ips = _resolve_host_ips(host)
-        except Exception:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Plan URL host {host!r} could not be resolved: {sample_url[:120]}",
-            )
-        if not ips:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Plan URL host {host!r} could not be resolved: {sample_url[:120]}",
-            )
-        for ip in ips:
-            if not _is_ip_public(ip):
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"Plan URL host {host!r} resolves to non-public IP "
-                        f"{ip}; refusing browser-side plan: {sample_url[:120]}"
-                    ),
-                )
+    _browser_enforce_plan_url_safety(
+        plan,
+        resolve_host_ips=_resolve_host_ips,
+        is_ip_public=_is_ip_public,
+    )
 
 
 def _expected_segment_count_for_track(staging_root: Path, track: str) -> Optional[int]:

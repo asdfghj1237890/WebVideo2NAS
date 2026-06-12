@@ -344,6 +344,11 @@ describe('runBrowserSideJob: DNR install precedes manifest fetch', () => {
   });
 
   it('background DNR builder packs more than 50 trusted URL prefixes into one slot', () => {
+    expect(ctx.__eval(`
+      typeof _wv2nasBrowserPipelineCore !== 'undefined'
+        && _wv2nasBuildDnrRules === _wv2nasBrowserPipelineCore.buildDnrRules
+    `)).toBe(true);
+
     ctx.__testSegmentUrls = Array.from(
       { length: 56 },
       (_v, i) => `https://protected.example.com/media/shard-${i}/seg.m4s`

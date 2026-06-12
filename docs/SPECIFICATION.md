@@ -105,7 +105,7 @@ This document specifies a complete system for capturing web video URLs (M3U8, MP
 {
   "manifest_version": 3,
   "name": "WebVideo2NAS",
-  "version": "3.1.0",
+  "version": "3.1.9",
   "description": "Send web videos (m3u8, mpd, mp4, mov) to your NAS for download",
   "permissions": [
     "storage",

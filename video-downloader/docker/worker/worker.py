@@ -21,7 +21,11 @@ from typing import List, Optional
 from urllib.parse import urlparse
 import signal
 import ipaddress
-import socket
+
+from job_strategy import JobKind, classify_job_kind
+from shared.security import is_ip_public as _shared_is_ip_public
+from shared.security import redacted_headers_for_log as _shared_redacted_headers_for_log
+from shared.security import resolve_host_ips as _shared_resolve_host_ips
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/m3u8_db")
@@ -128,19 +132,11 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 def _resolve_host_ips(hostname: str) -> list[ipaddress._BaseAddress]:
-    infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-    ips: list[ipaddress._BaseAddress] = []
-    for info in infos:
-        sockaddr = info[4]
-        ip_str = sockaddr[0]
-        ips.append(ipaddress.ip_address(ip_str))
-    return ips
+    return _shared_resolve_host_ips(hostname)
 
 
 def _is_ip_public(ip: ipaddress._BaseAddress) -> bool:
-    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
-        return False
-    return True
+    return _shared_is_ip_public(ip)
 
 
 def _enforce_ssrf_guard(url: str) -> None:
@@ -161,6 +157,10 @@ def _enforce_ssrf_guard(url: str) -> None:
     for ip in ips:
         if not _is_ip_public(ip):
             raise Exception("URL host not allowed")
+
+
+def _redacted_headers_for_log(headers: dict) -> dict:
+    return _shared_redacted_headers_for_log(headers)
 
 
 # Defense-in-depth path validation. Even though the API normalizes/validates
@@ -640,32 +640,15 @@ class DownloadWorker:
             logger.error(f"Job {job_id} not found")
             return
         
-        # Determine download type: check format hint first, then URL pattern
-        from urllib.parse import unquote
-        url_lower = job['url'].lower()
-        url_decoded = unquote(url_lower)
+        # Determine download type through a small strategy helper so the
+        # routing contract can be tested without instantiating the worker.
         format_hint = (job.get('headers') or {}).get('X-WV2NAS-Format', '').lower()
+        job_kind = classify_job_kind(job["url"], format_hint)
 
-        is_mpd = format_hint == 'mpd' or '.mpd' in url_lower or '.mpd' in url_decoded
-        is_m3u8 = format_hint == 'm3u8' or ('.m3u8' in url_lower and not is_mpd)
-
-        def _matches_direct_ext(ext: str) -> bool:
-            return (
-                url_lower.endswith(ext) or
-                f'{ext}?' in url_lower or
-                f'{ext}&' in url_lower or
-                url_decoded.endswith(ext) or
-                f'{ext}?' in url_decoded or
-                f'{ext}&' in url_decoded or
-                ('file=' in url_lower and ext in url_decoded)
-            )
-
-        is_direct_download = _matches_direct_ext('.mp4') or _matches_direct_ext('.mov')
-
-        if is_direct_download and not is_mpd and not is_m3u8:
+        if job_kind is JobKind.DIRECT:
             logger.info(f"Detected as direct download: {job['url'][:100]}...")
             self._process_direct_download(job_id, job)
-        elif is_mpd:
+        elif job_kind is JobKind.MPD:
             logger.info(f"Detected as DASH stream (MPD){' (via format hint)' if format_hint == 'mpd' else ''}: {job['url'][:100]}...")
             self._process_mpd_download(job_id, job)
         else:
@@ -1166,7 +1149,7 @@ class DownloadWorker:
             if 'User-Agent' not in headers:
                 headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
             
-            logger.info(f"Request headers: {headers}")
+            logger.info(f"Request headers: {_redacted_headers_for_log(headers)}")
             
             # Prepare output path
             safe_title = _make_safe_filename_stem(job.get('title') or '', fallback=f"video_{job_id[:8]}")
@@ -1854,11 +1837,11 @@ class DownloadWorker:
             if 'Sec-Fetch-Site' not in headers:
                 headers['Sec-Fetch-Site'] = 'cross-site'
             
-            # Debug: Log headers to verify
-            logger.info(f"Request headers: {headers}")
+            # Debug: log header names without leaking Cookie/Authorization values.
+            logger.info(f"Request headers: {_redacted_headers_for_log(headers)}")
             cookie_preview = _get_header_ci(headers, "Cookie")
             if cookie_preview:
-                logger.info(f"Cookie present: {str(cookie_preview)[:100]}...")
+                logger.info(f"Cookie present: {len(str(cookie_preview))} bytes")
             else:
                 logger.warning("No Cookie in headers!")
 

@@ -71,7 +71,7 @@ curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/hea
 # → {"status":"healthy"}
 ```
 
-> 想鎖版本：`.env` 裡設 `IMAGE_TAG=3.1.0`（或任一 [release tag](https://github.com/asdfghj1237890/WebVideo2NAS/releases)；預設 `latest`）。
+> 想鎖版本：`.env` 裡設 `IMAGE_TAG=3.1.9`（或任一 [release tag](https://github.com/asdfghj1237890/WebVideo2NAS/releases)；預設 `latest`）。
 
 <details>
 <summary><strong>用 Synology Container Manager（DSM UI）取代 SSH</strong></summary>
@@ -165,6 +165,7 @@ Synology UI：在 Project 點 **Action → Pull**，再 **Restart**。
 - **不要把服務直接公開到網際網路**
 - **API_KEY 不要外洩**
 - 建議只在 LAN 使用或透過 VPN（例如 Tailscale）
+- 隱私與安全揭露請看 [`docs/PRIVACY_SECURITY.md`](docs/PRIVACY_SECURITY.md)
 
 ## 需要更完整的內容？
 - 英文完整版（含更多範例、進階設定與完整疑難排解）：請看 `README.md`

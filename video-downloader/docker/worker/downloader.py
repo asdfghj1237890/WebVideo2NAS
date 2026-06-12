@@ -17,6 +17,7 @@ import urllib3
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from ssl_adapter import create_legacy_session, create_impersonated_session, tls_verify_enabled
+from shared.security import redacted_headers_for_log as _redacted_headers_for_log
 
 # Cross-process per-host concurrency throttle. Optional — no-op when
 # HOST_CONCURRENCY_CAP env is unset. See host_throttle.py for rationale.
@@ -1063,7 +1064,9 @@ class SegmentDownloader:
 
                 # Log response cookies for debugging
                 if response.cookies and index == 0:
-                    logger.info(f"Response set cookies: {dict(response.cookies)}")
+                    logger.info(
+                        f"Response set cookie names: {sorted(response.cookies.keys())}"
+                    )
 
                 if response.status_code == 474:
                     logger.debug(f"Segment {index} got 474 error with current headers")
@@ -1175,7 +1178,7 @@ class SegmentDownloader:
             
             # Log headers for first segment
             if index == 0 and retry_count == 0:
-                logger.info(f"Segment download headers: {self.headers}")
+                logger.info(f"Segment download headers: {_redacted_headers_for_log(self.headers)}")
                 logger.info(f"First segment URL: {url}")
             
             content = None

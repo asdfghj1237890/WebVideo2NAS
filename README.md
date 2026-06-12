@@ -64,7 +64,7 @@ Chrome Extension → NAS Docker API → Worker mux/download → Video Storage
 - **[🚀 Installation Guide](#installation)** - Complete setup instructions
 - **[📋 Technical Documentation](docs/)** - Architecture & specifications
 - **[🛠️ Developer Docs](docs/development/)** - Internal developer guide (8 chapters: getting started, architecture, chrome ext, worker pipeline, API, testing, CI/release, bug case studies)
-- **[🔒 Security Policy](#security)** - Security guidelines
+- **[🔒 Security & Privacy](docs/PRIVACY_SECURITY.md)** - Data handling and security disclosure
 - **[🤝 Contributing](#contributing)** - How to contribute
 
 
@@ -185,7 +185,7 @@ curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/hea
 # → {"status":"healthy"}
 ```
 
-> Pin a specific image version: set `IMAGE_TAG=3.1.0` in `.env` (defaults to `latest`).
+> Pin a specific image version: set `IMAGE_TAG=3.1.9` in `.env` (defaults to `latest`).
 
 <details>
 <summary><strong>Synology Container Manager (DSM UI alternative to CLI)</strong></summary>
@@ -257,11 +257,11 @@ The full list with inline comments lives in [`.env.example`](video-downloader/do
 
 | Variable | Default | Effect |
 |---|---|---|
-| `IMAGE_TAG` | `latest` | Pin to a specific release (e.g. `3.1.0`) instead of tracking latest |
+| `IMAGE_TAG` | `latest` | Pin to a specific release (e.g. `3.1.9`) instead of tracking latest |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose troubleshooting; `WARNING` to quiet down |
 | `MAX_DOWNLOAD_WORKERS` | `20` | Per-worker thread pool for HLS segment downloads |
 | `FFMPEG_THREADS` | `2` | Threads ffmpeg uses during merge |
-| `RATE_LIMIT_PER_MINUTE` | `10` | Per-IP API rate limit (0 disables) |
+| `RATE_LIMIT_PER_MINUTE` | `60` | Per-IP API rate limit (0 disables) |
 | `ALLOWED_CLIENT_CIDRS` | _(empty)_ | Comma-separated CIDRs permitted to call the API; empty = no restriction |
 | `SSRF_GUARD` | `false` | `true` blocks downloads targeting private/loopback/link-local hosts |
 | `CLEANUP_INTERVAL_SECONDS` | `3600` | How often `db_cleanup` prunes finished jobs (keeps latest 100 per status: completed/failed/cancelled). Partial files for failed/cancelled are also rm'd. |
@@ -286,6 +286,7 @@ In `chrome://extensions/` → **WebVideo2NAS** → **Settings**:
 - For tighter access control, set `ALLOWED_CLIENT_CIDRS` to your LAN range and `SSRF_GUARD=true`.
 - Pin `IMAGE_TAG` to a specific version and review the changelog before upgrading.
 - Out of scope: DRM bypass, public-internet hosting, multi-tenant deployments.
+- Privacy/security details: see [docs/PRIVACY_SECURITY.md](docs/PRIVACY_SECURITY.md).
 
 ### Reporting a Vulnerability
 
@@ -352,6 +353,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
+
+### [3.1.9] - 2026-06-08
+
+#### Changed
+- Bumped Starlette to 1.0.1 and Vitest to 4.1.8 for security maintenance.
+
+### [3.1.8] - 2026-06-08
+
+#### Changed
+- Switched the image to a pinned static ffmpeg 8.1.1 build for current CVE coverage.
+- Bumped `idna` to 3.15.
+
+### [3.1.7] - 2026-05-23
+
+#### Fixed
+- Tightened browser-side CDN segment trust so cross-site segment hosts only receive DNR header/CORS handling when covered by the same trust boundary or an explicit trusted CDN suffix.
+
+### [3.1.6] - 2026-05-23
+
+#### Fixed
+- Updated browser upload progress colors when jobs move out of pending upload state.
+
+### [3.1.5] - 2026-05-23
+
+#### Fixed
+- Reduced duplicate detections and reset stale quality filters so detected URLs do not disappear behind old UI state.
+
+### [3.1.4] - 2026-05-23
+
+#### Fixed
+- Kept fresh signed browser-side URLs when newer detected anchors carry updated query tokens.
+
+### [3.1.3] - 2026-05-22
+
+#### Fixed
+- Packed browser-side DNR filters so jobs with many trusted URL prefixes stay within the per-slot rule budget.
+
+### [3.1.2] - 2026-05-16
+
+#### Security
+- Addressed code-scanning findings and consolidated Python dependency updates.
+
+### [3.1.1] - 2026-05-16
+
+#### Fixed
+- Improved HLS segment detection for disguised or indirect playlist flows.
 
 ### [3.1.0] - 2026-05-08
 
@@ -907,8 +954,8 @@ Both added via the existing idempotent `_ensure_schema()` migration in API + wor
 
 ---
 
-**Version**: 3.1.0
-**Last Updated**: 2026-05-08
+**Version**: 3.1.9
+**Last Updated**: 2026-06-13
 **Port**: 52052 (NAS host port → API container :8000)
 
 ## Star History

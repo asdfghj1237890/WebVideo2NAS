@@ -1,5 +1,14 @@
 // Background Service Worker for Video Detection and Download Management
 
+if (typeof importScripts === 'function') {
+  importScripts('browserPipelineCore.js');
+}
+const _wv2nasGlobalRoot = (typeof globalThis !== 'undefined' && globalThis) || this;
+const _wv2nasBrowserPipelineCore = _wv2nasGlobalRoot.WV2NASBrowserPipeline;
+if (!_wv2nasBrowserPipelineCore) {
+  throw new Error('WV2NASBrowserPipeline core failed to load');
+}
+
 // Store detected video URLs (m3u8, mpd, mp4)
 let detectedUrls = new Set();
 let currentTabUrls = {};
@@ -958,10 +967,16 @@ chrome.webRequest.onSendHeaders.addListener(
       };
       
       console.log('Captured headers for:', details.url);
-      console.log('Headers:', headersObj);
+      const loggedHeaders = { ...headersObj };
+      for (const key of Object.keys(loggedHeaders)) {
+        if (['cookie', 'authorization'].includes(String(key).toLowerCase())) {
+          loggedHeaders[key] = `[redacted ${String(loggedHeaders[key]).length} bytes]`;
+        }
+      }
+      console.log('Headers:', loggedHeaders);
       console.log('Has Cookie header:', !!headersObj['Cookie']);
       if (headersObj['Cookie']) {
-        console.log('Cookie value:', headersObj['Cookie']);
+        console.log('Cookie header length:', String(headersObj['Cookie']).length);
       }
       
       // Clean up old entries (keep only last 100)
@@ -1585,7 +1600,7 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     console.log('  Headers keys:', Object.keys(requestBody.headers));
     console.log('  Has Cookie:', !!requestBody.headers.Cookie);
     if (requestBody.headers.Cookie) {
-      console.log('  Cookie preview:', requestBody.headers.Cookie.substring(0, 200));
+      console.log('  Cookie header length:', String(requestBody.headers.Cookie).length);
     }
     
     // v2.5: route HLS/DASH through browser-side path when the user has it
@@ -2008,17 +2023,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // ---------------------------------------------------------------------------
 
 // DNR ID allocation strategy (post-Codex review): each concurrent
-// browser-side job claims a unique slot in the rule ID space. Without
-// this, two parallel jobs would build rules at the same constant base
-// and either silently overwrite each other's spoof rules (via
-// updateSessionRules) or have one job's cleanup remove the other's
-// active rules. MV3 caps session rules at 5000; we cap at 50 slots ×
-// 100 IDs/slot = 5000.
-const _BROWSER_DNR_BASE_ID = 10000;
-const _BROWSER_DNR_PER_JOB_RANGE = 100;
-const _BROWSER_DNR_RESPONSE_OFFSET = 50; // within a slot, response rules at base+50
-const _BROWSER_DNR_MAX_SLOTS = 50;
-const _BROWSER_DNR_MAX_PACKED_REGEX_FILTER_LENGTH = 1800;
+// browser-side job claims a unique slot in the rule ID space. The pure
+// rule/trust helpers live in browserPipelineCore.js so background.js and
+// dnrRules.js cannot drift apart.
+const _BROWSER_DNR_BASE_ID = _wv2nasBrowserPipelineCore.RULE_ID_BASE;
+const _BROWSER_DNR_PER_JOB_RANGE = _wv2nasBrowserPipelineCore.DNR_PER_JOB_RANGE;
+const _BROWSER_DNR_MAX_SLOTS = _wv2nasBrowserPipelineCore.DNR_MAX_SLOTS;
 const _wv2nasUsedDnrSlots = new Set();
 
 // Per-job runtime state (Codex review #2): registered when a job starts,
@@ -2028,233 +2038,20 @@ const _wv2nasUsedDnrSlots = new Set();
 const _wv2nasActiveBrowserJobs = new Map(); // jobId -> { dnrSlot, ruleIds }
 
 function _wv2nasAllocateDnrSlot() {
-  for (let slot = 0; slot < _BROWSER_DNR_MAX_SLOTS; slot++) {
-    if (!_wv2nasUsedDnrSlots.has(slot)) {
-      _wv2nasUsedDnrSlots.add(slot);
-      return slot;
-    }
-  }
-  throw new Error(
-    `Browser-side DNR slots exhausted (max ${_BROWSER_DNR_MAX_SLOTS} concurrent jobs).`
+  return _wv2nasBrowserPipelineCore.allocateDnrSlot(
+    _wv2nasUsedDnrSlots,
+    _BROWSER_DNR_MAX_SLOTS,
   );
 }
 
 function _wv2nasReleaseDnrSlot(slot) {
-  _wv2nasUsedDnrSlots.delete(slot);
+  _wv2nasBrowserPipelineCore.releaseDnrSlot(_wv2nasUsedDnrSlots, slot);
 }
 
-function _wv2nasUrlsToFilters(urls) {
-  const groups = new Map();
-  for (const u of urls) {
-    let parsed;
-    try { parsed = new URL(u); } catch (_) { continue; }
-    const origin = `${parsed.protocol}//${parsed.host}`;
-    const dir = parsed.pathname.replace(/[^/]*$/, '');
-    const key = origin + dir;
-    if (!groups.has(key)) groups.set(key, { origin, dir });
-  }
-  const filters = [];
-  for (const { origin, dir } of groups.values()) {
-    const escaped = (origin + dir).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    filters.push(`^${escaped}.*`);
-  }
-  return filters;
-}
-
-function _wv2nasRegexFilterToPackedTerm(regexFilter) {
-  if (regexFilter.startsWith('^') && regexFilter.endsWith('.*')) {
-    return `${regexFilter.slice(1, -2)}.*`;
-  }
-  return regexFilter.startsWith('^') ? regexFilter.slice(1) : regexFilter;
-}
-
-function _wv2nasPackedRegexLength(terms) {
-  if (terms.length === 1) return 1 + terms[0].length;
-  return '^(?:'.length + terms.join('|').length + ')'.length;
-}
-
-function _wv2nasPackDnrFilters(filters) {
-  const packed = [];
-  let current = [];
-
-  function flush() {
-    if (current.length === 0) return;
-    packed.push(current.length === 1 ? `^${current[0]}` : `^(?:${current.join('|')})`);
-    current = [];
-  }
-
-  for (const filter of Array.from(new Set(filters))) {
-    const term = _wv2nasRegexFilterToPackedTerm(filter);
-    if (
-      current.length > 0
-      && _wv2nasPackedRegexLength([...current, term]) > _BROWSER_DNR_MAX_PACKED_REGEX_FILTER_LENGTH
-    ) {
-      flush();
-    }
-    current.push(term);
-  }
-  flush();
-
-  return packed;
-}
-
-// `idBase` is the starting rule ID for THIS job's slot — the caller
-// allocates it via _wv2nasAllocateDnrSlot. Within each slot we have
-// _BROWSER_DNR_RESPONSE_OFFSET (50) request-rule slots and 50 paired
-// response-rule slots. Trusted URL prefixes above that count are packed
-// into anchored alternation filters before we spend rule IDs.
-//
-// Codex review #10: CORS-relax response rules ONLY apply to
-// `trustedSegmentUrls` (subset of `segmentUrls` inside the manifest's
-// trusted host boundary). Foreign origins get neither
-// header-spoof nor CORS-relax; fetch uses default browser headers and
-// the response remains unreadable cross-origin, defeating credential
-// leakage and DNS-rebinding exfil.
-function _wv2nasBuildDnrRules({
-  segmentUrls, trustedSegmentUrls, referer, origin, userAgent, idBase,
-  initiatorDomain,
-}) {
-  const trustedFilters = new Set(_wv2nasUrlsToFilters(
-    trustedSegmentUrls === undefined ? segmentUrls : trustedSegmentUrls
-  ));
-  let filters = _wv2nasUrlsToFilters(segmentUrls)
-    .filter((filter) => trustedFilters.has(filter));
-  if (filters.length === 0) return [];
-  if (filters.length > _BROWSER_DNR_RESPONSE_OFFSET) {
-    const originalFilterCount = filters.length;
-    filters = _wv2nasPackDnrFilters(filters);
-    if (filters.length > _BROWSER_DNR_RESPONSE_OFFSET) {
-      // Don't silently truncate — fail loudly so the caller knows something
-      // about the segment URL distribution is unusual.
-      throw new Error(
-        `Too many trusted segment URL groups (${originalFilterCount}) for DNR slot; `
-        + `packed to ${filters.length}, max ${_BROWSER_DNR_RESPONSE_OFFSET}`
-      );
-    }
-  }
-
-  const reqHeaders = [];
-  if (referer) reqHeaders.push({ header: 'referer', operation: 'set', value: referer });
-  if (origin) reqHeaders.push({ header: 'origin', operation: 'set', value: origin });
-  if (userAgent) reqHeaders.push({ header: 'user-agent', operation: 'set', value: userAgent });
-
-  // Codex review #11: scope conditions to the extension's own initiator
-  // (chrome.runtime.id) so unrelated tabs that fetch a matching URL
-  // during the download window do NOT benefit from the CORS rewrite.
-  // Without this, a malicious page that learns or guesses a CDN segment
-  // URL while a job is active could read responses cross-origin.
-  function makeCondition(regexFilter) {
-    const cond = {
-      regexFilter,
-      resourceTypes: ['xmlhttprequest', 'media', 'other'],
-    };
-    if (initiatorDomain) {
-      cond.initiatorDomains = [initiatorDomain];
-    }
-    return cond;
-  }
-
-  const rules = [];
-  let id = idBase;
-  for (const regexFilter of filters) {
-    // Request header-spoof: ONLY for trusted origin groups.
-    // Codex adversarial-review: foreign hosts no longer receive the
-    // captured Referer/Origin/User-Agent — Referers for player pages
-    // can carry signed URLs / session tokens. Must stay in lockstep
-    // with dnrRules.js::buildHeaderRules.
-    if (reqHeaders.length > 0) {
-      rules.push({
-        id,
-        priority: 1,
-        action: { type: 'modifyHeaders', requestHeaders: reqHeaders },
-        condition: makeCondition(regexFilter),
-      });
-    }
-    // Response CORS-relax: ONLY for trusted origin groups. Codex #10.
-    rules.push({
-      id: id + _BROWSER_DNR_RESPONSE_OFFSET,
-      priority: 1,
-      action: {
-        type: 'modifyHeaders',
-        responseHeaders: [
-          { header: 'access-control-allow-origin', operation: 'set', value: '*' },
-          { header: 'access-control-allow-credentials', operation: 'remove' },
-        ],
-      },
-      condition: makeCondition(regexFilter),
-    });
-    id += 1;
-  }
-  return rules;
-}
-
-
-// Codex review #10: per-segment trust check matching segmentDownloader's
-// isTrustedForCredentials. Same protection boundary applied at
-// DNR-rule-building time so foreign origins don't receive CORS-relax
-// response rewrites.
-//
-// Codex adversarial-review: the predicate must not trust upward —
-// rejecting the case where a manifest on a subdomain (e.g.
-// attacker.example.com) claims trust over its parent host
-// (example.com). See segmentDownloader.isTrustedForCredentials for
-// the threat-model rationale. Both predicates MUST stay in lockstep,
-// otherwise DNR rules diverge from fetch-time behavior.
-function _wv2nasIsTrustedDnrUrl(segmentUrl, trustedBase) {
-  if (!trustedBase) return false;
-  let segHost, baseHost, segOrigin, baseOrigin;
-  try {
-    const seg = new URL(segmentUrl);
-    const base = new URL(trustedBase);
-    if (seg.protocol !== 'https:' && seg.protocol !== 'http:') return false;
-    segHost = seg.hostname.toLowerCase();
-    baseHost = base.hostname.toLowerCase();
-    segOrigin = seg.origin;
-    baseOrigin = base.origin;
-  } catch (_) {
-    return false;
-  }
-  if (segOrigin === baseOrigin) return true;
-  if (segHost.endsWith('.' + baseHost)) return true;
-  return false;
-}
-
-function _wv2nasIsTrustedSegmentDnrUrl(segmentUrl, trustedBase, trustedCdnSuffixes) {
-  if (_wv2nasIsTrustedDnrUrl(segmentUrl, trustedBase)) return true;
-  try {
-    return _wv2nasMatchesTrustedCdnSuffix(
-      new URL(segmentUrl).hostname.toLowerCase(),
-      trustedCdnSuffixes,
-    );
-  } catch (_) {
-    return false;
-  }
-}
-
-// Collect every URL DNR rules need to cover for a job: init segments,
-// media segments, AND AES-128 key URIs (Codex review #3 — without keys
-// in the DNR scope, segment fetches succeed but the subsequent key
-// fetch hits the protected origin without our Referer/Origin/UA spoof
-// or CORS relaxation, and decryption fails). Use a Set to dedup —
-// keys typically rotate per-segment with the SAME URI, but this also
-// guards against duplicates from rare per-segment-key streams.
-function _wv2nasPlanSegmentUrls(plan) {
-  const out = new Set();
-  if (plan.init_segment_url) out.add(plan.init_segment_url);
-  for (const trackName of Object.keys(plan.tracks || {})) {
-    const t = plan.tracks[trackName];
-    if (t.init_segment_url) out.add(t.init_segment_url);
-    for (const s of t.segments || []) {
-      if (s.url) out.add(s.url);
-      // AES key URI (HLS EXT-X-KEY URI=...) — extension's offscreen
-      // segmentDownloader fetches this in browser context too. Some
-      // streams put keys on a different origin (CDN auth gateway)
-      // making this critical.
-      if (s.key && s.key.uri) out.add(s.key.uri);
-    }
-  }
-  return Array.from(out);
-}
+var _wv2nasBuildDnrRules = _wv2nasBrowserPipelineCore.buildDnrRules;
+var _wv2nasIsTrustedDnrUrl = _wv2nasBrowserPipelineCore.isTrustedDnrUrl;
+var _wv2nasIsTrustedSegmentDnrUrl = _wv2nasBrowserPipelineCore.isTrustedSegmentDnrUrl;
+var _wv2nasPlanSegmentUrls = _wv2nasBrowserPipelineCore.planSegmentUrls;
 
 let _browserOffscreenCreating = null;
 // Codex adversarial-review (high): the offscreen document's
@@ -2347,29 +2144,7 @@ async function _closeOffscreenDocument() {
 // and server agree on which media playlist gets used. Returns null when no
 // parsable variants are found.
 function _wv2nasPickBestHlsVariant(masterText, masterUrl) {
-  const lines = masterText.split(/\r?\n/);
-  let bestBw = -1;
-  let bestUrl = null;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (line.startsWith('#EXT-X-STREAM-INF:')) {
-      const bwMatch = line.match(/BANDWIDTH=(\d+)/);
-      const bw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
-      // The very next non-comment line is the variant URI per RFC 8216.
-      let j = i + 1;
-      while (j < lines.length && (lines[j].trim() === '' || lines[j].trim().startsWith('#'))) j++;
-      if (j < lines.length) {
-        try {
-          const u = new URL(lines[j].trim(), masterUrl).href;
-          if (bw > bestBw) {
-            bestBw = bw;
-            bestUrl = u;
-          }
-        } catch (_) {}
-      }
-    }
-  }
-  return bestUrl;
+  return _wv2nasBrowserPipelineCore.pickBestHlsVariant(masterText, masterUrl);
 }
 
 // Fetch the manifest in browser context (with credentials, so cookies +
@@ -2389,46 +2164,7 @@ function _wv2nasPickBestHlsVariant(masterText, masterUrl) {
 // streams that need a header token, even though the legacy NAS-direct
 // path passes the same headers via the requestBody.
 function _wv2nasFilterFetchHeaders(rawHeaders) {
-  const out = {};
-  if (!rawHeaders || typeof rawHeaders !== 'object') return out;
-  const skip = new Set([
-    'accept-charset',
-    'accept-encoding',// fetch sets this automatically
-    'access-control-request-headers',
-    'access-control-request-method',
-    'connection',     // forbidden
-    'content-length', // forbidden
-    'cookie',         // forbidden — credentials: 'include' carries cookies
-    'date',
-    'dnt',
-    'expect',
-    'host',           // forbidden
-    'keep-alive',
-    'origin',         // forbidden — set via DNR
-    'permissions-policy',
-    'range',          // set explicitly only for byte-range media fetches
-    'referer',        // forbidden — set via DNR
-    'te',
-    'trailer',
-    'transfer-encoding',
-    'upgrade',
-    'user-agent',     // forbidden in some browsers — set via DNR
-    'via',
-    'x-http-method',
-    'x-http-method-override',
-    'x-method-override',
-    'sec-ch-ua',      // forbidden (UA client hints)
-    'sec-ch-ua-mobile',
-    'sec-ch-ua-platform',
-  ]);
-  for (const [k, v] of Object.entries(rawHeaders)) {
-    const lower = k.toLowerCase();
-    if (!skip.has(lower) && !lower.startsWith('sec-')
-        && !lower.startsWith('proxy-') && v != null) {
-      out[k] = String(v);
-    }
-  }
-  return out;
+  return _wv2nasBrowserPipelineCore.filterFetchHeaders(rawHeaders);
 }
 
 
@@ -2505,140 +2241,22 @@ async function _wv2nasReadManifestText(response, maxBytes, label) {
 
 
 function _wv2nasClassifyIpv4Literal(host) {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (!m) return null;
-  const octets = [1, 2, 3, 4].map((i) => parseInt(m[i], 10));
-  if (octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
-    return { safe: false, reason: 'invalid IPv4 literal' };
-  }
-  const [a, b, c] = octets;
-  if (a === 0) return { safe: false, reason: 'unspecified (0/8)' };
-  if (a === 10) return { safe: false, reason: 'RFC 1918 (10/8)' };
-  if (a === 127) return { safe: false, reason: 'IPv4 loopback (127/8)' };
-  if (a === 169 && b === 254) {
-    return { safe: false, reason: 'link-local (169.254/16) - incl. AWS metadata' };
-  }
-  if (a === 172 && b >= 16 && b <= 31) {
-    return { safe: false, reason: 'RFC 1918 (172.16/12)' };
-  }
-  if (a === 192 && b === 168) {
-    return { safe: false, reason: 'RFC 1918 (192.168/16)' };
-  }
-  if (a === 100 && b >= 64 && b <= 127) {
-    return { safe: false, reason: 'shared CGN (100.64/10)' };
-  }
-  if (a === 192 && b === 0 && c === 0) {
-    return { safe: false, reason: 'IETF special-use (192.0.0/24)' };
-  }
-  if (a === 192 && b === 0 && c === 2) return { safe: false, reason: 'TEST-NET-1' };
-  if (a === 198 && (b === 18 || b === 19)) {
-    return { safe: false, reason: 'benchmarking (198.18/15)' };
-  }
-  if (a === 198 && b === 51 && c === 100) return { safe: false, reason: 'TEST-NET-2' };
-  if (a === 203 && b === 0 && c === 113) return { safe: false, reason: 'TEST-NET-3' };
-  if (a >= 224) return { safe: false, reason: 'multicast/reserved (>=224)' };
-  return { safe: true };
+  return _wv2nasBrowserPipelineCore.classifyIpv4Literal(host);
 }
 
 
 function _wv2nasParseIpv4Octets(raw) {
-  const classified = _wv2nasClassifyIpv4Literal(raw);
-  if (!classified) return null;
-  if (!classified.safe && classified.reason === 'invalid IPv4 literal') return null;
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(raw);
-  if (!m) return null;
-  return [1, 2, 3, 4].map((i) => parseInt(m[i], 10));
+  return _wv2nasBrowserPipelineCore.parseIpv4Octets(raw);
 }
 
 
 function _wv2nasExpandIpv6Literal(inner) {
-  if (!inner || inner.includes('%')) return null;
-  let text = inner.toLowerCase();
-  const lastColon = text.lastIndexOf(':');
-  const maybeIpv4Tail = lastColon >= 0 ? text.slice(lastColon + 1) : '';
-  if (maybeIpv4Tail.includes('.')) {
-    const octets = _wv2nasParseIpv4Octets(maybeIpv4Tail);
-    if (!octets) return null;
-    const high = ((octets[0] << 8) | octets[1]).toString(16);
-    const low = ((octets[2] << 8) | octets[3]).toString(16);
-    text = `${text.slice(0, lastColon)}:${high}:${low}`;
-  }
-
-  const compressed = text.includes('::');
-  if ((text.match(/::/g) || []).length > 1) return null;
-  const sides = text.split('::');
-  const left = sides[0] ? sides[0].split(':') : [];
-  const right = compressed && sides[1] ? sides[1].split(':') : [];
-  if (left.some((g) => !g) || right.some((g) => !g)) return null;
-
-  let groups;
-  if (compressed) {
-    const fill = 8 - left.length - right.length;
-    if (fill < 1) return null;
-    groups = [...left, ...Array(fill).fill('0'), ...right];
-  } else {
-    groups = left;
-    if (groups.length !== 8) return null;
-  }
-
-  if (groups.length !== 8) return null;
-  const parsed = [];
-  for (const group of groups) {
-    if (!/^[0-9a-f]{1,4}$/.test(group)) return null;
-    parsed.push(parseInt(group, 16));
-  }
-  return parsed;
+  return _wv2nasBrowserPipelineCore.expandIpv6Literal(inner);
 }
 
 
 function _wv2nasClassifyIpv6Literal(inner) {
-  const groups = _wv2nasExpandIpv6Literal(inner);
-  if (!groups) return { safe: false, reason: 'invalid IPv6 literal' };
-
-  // IPv4-mapped IPv6 (::ffff:a.b.c.d / ::ffff:hhhh:hhhh) should follow
-  // the exact IPv4 literal policy, not a separate IPv6 shortcut.
-  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
-    const ip4 = [
-      (groups[6] >> 8) & 0xff, groups[6] & 0xff,
-      (groups[7] >> 8) & 0xff, groups[7] & 0xff,
-    ].join('.');
-    return _wv2nasClassifyIpv4Literal(ip4) || {
-      safe: false,
-      reason: 'invalid IPv4-mapped IPv6 literal',
-    };
-  }
-
-  if (groups.every((g) => g === 0)) {
-    return { safe: false, reason: 'IPv6 unspecified' };
-  }
-  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) {
-    return { safe: false, reason: 'IPv6 loopback' };
-  }
-  if ((groups[0] & 0xfe00) === 0xfc00) {
-    return { safe: false, reason: 'IPv6 unique-local' };
-  }
-  if ((groups[0] & 0xffc0) === 0xfe80) {
-    return { safe: false, reason: 'IPv6 link-local' };
-  }
-  if ((groups[0] & 0xffc0) === 0xfec0) {
-    return { safe: false, reason: 'IPv6 site-local' };
-  }
-  if ((groups[0] & 0xff00) === 0xff00) {
-    return { safe: false, reason: 'IPv6 multicast' };
-  }
-  if (groups[0] === 0x2001 && groups[1] === 0x0db8) {
-    return { safe: false, reason: 'IPv6 documentation range (2001:db8/32)' };
-  }
-  if (groups[0] === 0x2001 && groups[1] <= 0x01ff) {
-    return { safe: false, reason: 'IPv6 IETF special-use (2001::/23)' };
-  }
-  if (groups[0] === 0x3ffe) {
-    return { safe: false, reason: 'IPv6 6bone documentation/deprecated range' };
-  }
-  if ((groups[0] & 0xe000) !== 0x2000) {
-    return { safe: false, reason: 'IPv6 literal is not global unicast' };
-  }
-  return { safe: true };
+  return _wv2nasBrowserPipelineCore.classifyIpv6Literal(inner);
 }
 
 
@@ -2648,18 +2266,7 @@ function _wv2nasClassifyIpv6Literal(inner) {
 // would expose typosquats). Empty / missing list → no host matches,
 // behavior unchanged from the strict same-site policy.
 function _wv2nasMatchesTrustedCdnSuffix(host, suffixes) {
-  if (!Array.isArray(suffixes) || suffixes.length === 0) return false;
-  if (typeof host !== 'string' || !host) return false;
-  const h = host.toLowerCase();
-  for (const raw of suffixes) {
-    if (typeof raw !== 'string') continue;
-    // Trim whitespace and any leading dots so users writing
-    // ".phncdn.com" still get the intuitive match.
-    const s = raw.trim().toLowerCase().replace(/^\.+/, '');
-    if (!s) continue;
-    if (h === s || h.endsWith('.' + s)) return true;
-  }
-  return false;
+  return _wv2nasBrowserPipelineCore.matchesTrustedCdnSuffix(host, suffixes);
 }
 
 
@@ -2676,102 +2283,21 @@ function _wv2nasMatchesTrustedCdnSuffix(host, suffixes) {
 //   - DNS-resolvable hostnames are accepted (we can't do DNS lookups
 //     client-side; the HTTPS gate is the safety net)
 function _wv2nasIsManifestUrlSafeForBrowser(url, pageUrl, trustedCdnSuffixes) {
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch (_) {
-    return { safe: false, reason: 'malformed URL' };
-  }
-  if (parsed.protocol !== 'https:') {
-    return {
-      safe: false,
-      reason: `plain ${parsed.protocol} rejected (HTTPS-only — DNS rebinding mitigation)`,
-    };
-  }
-  const host = parsed.hostname.toLowerCase();
-  if (!host) return { safe: false, reason: 'no host' };
-  if (host === 'localhost' || host === '0.0.0.0'
-      || host === 'broadcasthost' || host.endsWith('.localhost')) {
-    return { safe: false, reason: `local hostname ${host}` };
-  }
-  // IPv6 literal — URL.hostname returns it WITH the brackets.
-  if (host.startsWith('[') && host.endsWith(']')) {
-    return _wv2nasClassifyIpv6Literal(host.slice(1, -1));
-  }
-  // IPv4 literal.
-  const ipv4Safety = _wv2nasClassifyIpv4Literal(host);
-  if (ipv4Safety) return ipv4Safety;
-  // DNS name — needs a trust anchor. The HTTPS-only requirement
-  // catches DNS-rebinding to a public-cert-bound private IP, but
-  // CANNOT defeat split-horizon DNS where a public hostname has an
-  // internal-CA cert that the corporate machine trusts (e.g.
-  // `https://internal.corp.example/`). Without DNS resolution we
-  // can't distinguish that from a real public host.
-  //
-  // Codex adversarial-review: require same-site relationship to
-  // the page that surfaced this URL. Legitimate cookie-bound
-  // streams (Vimeo private videos, paid streaming sites) are
-  // typically same-site by design — that's where the cookies live.
-  //
-  // Cross-site CDN streams (page on brand domain, manifest/segments
-  // on a separate CDN eTLD+1) with IP-bound HMAC tokens that NAS-side
-  // can't reach are the exception — they need browser-side AND require
-  // the user to explicitly pre-declare the CDN host suffix as trusted
-  // via `trustedCdnSuffixes`. The user shoulders the split-horizon-DNS
-  // / internal-CA risk for those specific suffixes. Empty list →
-  // strict same-site policy (default).
-  //
-  // When pageUrl is not provided (back-compat for unit tests of
-  // this helper), we fall back to the prior behavior — accept any
-  // public-resolving DNS name. Production runBrowserSideJob always
-  // passes pageUrl through dnrContext.
-  if (pageUrl) {
-    if (!_wv2nasIsTrustedDnrUrl(url, pageUrl)
-        && !_wv2nasMatchesTrustedCdnSuffix(host, trustedCdnSuffixes)) {
-      return {
-        safe: false,
-        reason: (
-          `host ${host} is not same-site with page (${pageUrl}); `
-          + `refusing browser fetch — split-horizon DNS / internal-CA `
-          + `hosts cannot be distinguished client-side from public hosts. `
-          + `If this is a known cross-site CDN, add its host suffix to `
-          + `'Trusted cross-site CDN suffixes' in extension options.`
-        ),
-      };
-    }
-  }
-  return { safe: true };
+  return _wv2nasBrowserPipelineCore.isManifestUrlSafeForBrowser(
+    url,
+    pageUrl,
+    trustedCdnSuffixes,
+  );
 }
 
 
 function _wv2nasHttpsEquivalent(rawUrl) {
-  try {
-    const parsed = new URL(rawUrl);
-    parsed.protocol = 'https:';
-    return parsed.href;
-  } catch (_) {
-    return null;
-  }
+  return _wv2nasBrowserPipelineCore.httpsEquivalent(rawUrl);
 }
 
 
 function _wv2nasCanUseNasDirectForBrowserUnsafeUrl(url, pageUrl) {
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch (_) {
-    return false;
-  }
-  if (parsed.protocol !== 'http:') return false;
-
-  const httpsUrl = _wv2nasHttpsEquivalent(url);
-  if (!httpsUrl) return false;
-  const httpsPageUrl = pageUrl ? _wv2nasHttpsEquivalent(pageUrl) : null;
-  const hostSafety = _wv2nasIsManifestUrlSafeForBrowser(
-    httpsUrl,
-    httpsPageUrl,
-  );
-  return !!hostSafety.safe;
+  return _wv2nasBrowserPipelineCore.canUseNasDirectForBrowserUnsafeUrl(url, pageUrl);
 }
 
 
