@@ -185,7 +185,7 @@ curl -fsS -H "Authorization: Bearer YOUR_API_KEY" http://localhost:52052/api/hea
 # → {"status":"healthy"}
 ```
 
-> Pin a specific image version: set `IMAGE_TAG=3.1.9` in `.env` (defaults to `latest`).
+> Pin a specific image version: set `IMAGE_TAG=3.1.10` in `.env` (defaults to `latest`).
 
 <details>
 <summary><strong>Synology Container Manager (DSM UI alternative to CLI)</strong></summary>
@@ -257,7 +257,7 @@ The full list with inline comments lives in [`.env.example`](video-downloader/do
 
 | Variable | Default | Effect |
 |---|---|---|
-| `IMAGE_TAG` | `latest` | Pin to a specific release (e.g. `3.1.9`) instead of tracking latest |
+| `IMAGE_TAG` | `latest` | Pin to a specific release (e.g. `3.1.10`) instead of tracking latest |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose troubleshooting; `WARNING` to quiet down |
 | `MAX_DOWNLOAD_WORKERS` | `20` | Per-worker thread pool for HLS segment downloads |
 | `FFMPEG_THREADS` | `2` | Threads ffmpeg uses during merge |
@@ -353,6 +353,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
+
+### [3.1.10] - 2026-06-13
+
+#### Changed
+- Refactored the extension browser-side pipeline, API browser staging/finalize helpers, and worker job classification into smaller shared modules.
+- Added a formal privacy and security disclosure.
+
+#### Security
+- Centralized shared network safety helpers and redacted sensitive request headers from worker/downloader logs.
 
 ### [3.1.9] - 2026-06-08
 
@@ -954,7 +963,7 @@ Both added via the existing idempotent `_ensure_schema()` migration in API + wor
 
 ---
 
-**Version**: 3.1.9
+**Version**: 3.1.10
 **Last Updated**: 2026-06-13
 **Port**: 52052 (NAS host port → API container :8000)
 
