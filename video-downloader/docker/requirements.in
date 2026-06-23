@@ -20,7 +20,7 @@ python-multipart==0.0.27
 alembic==1.18.4
 # Data validation
 pydantic==2.13.3
-pydantic-settings==2.14.0
+pydantic-settings==2.14.2
 # HTTP client
 httpx==0.28.1
 # Pin transitive dependency to pick up security fixes
