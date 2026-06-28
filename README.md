@@ -45,12 +45,7 @@ This system enables you to:
 
 ## System Architecture
 
-```
-Chrome Extension → NAS Docker API → Worker mux/download → Video Storage
-        └──── browser-side HLS/DASH segment upload ────┘
-```
-
-![Overall System Architecture](pics/overall_system_architecture.png)
+![Animated System Architecture](pics/system_architecture_animated.svg)
 
 ### Backend Architecture
 

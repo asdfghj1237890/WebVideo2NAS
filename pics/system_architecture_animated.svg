@@ -1,0 +1,424 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="720" viewBox="0 0 1440 720" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">WebVideo2NAS current animated architecture diagram</title>
+  <desc id="desc">Current WebVideo2NAS v3 architecture with browser-side HLS and DASH staging, NAS-direct fallback, FastAPI, Redis, PostgreSQL, workers, FFmpeg, and NAS storage.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="52%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#121212"/>
+    </linearGradient>
+    <linearGradient id="browserGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#0f766e"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="apiGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="stageGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#0e7490"/>
+      <stop offset="100%" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="queueGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#7c2d12"/>
+      <stop offset="100%" stop-color="#c2410c"/>
+    </linearGradient>
+    <linearGradient id="workerGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#365314"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <linearGradient id="storageGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#064e3b"/>
+      <stop offset="100%" stop-color="#166534"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#020617" flood-opacity="0.32"/>
+    </filter>
+    <marker id="arrow-cyan" markerWidth="20" markerHeight="20" refX="17" refY="10" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M2 2 L18 10 L2 18 Z" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="20" markerHeight="20" refX="17" refY="10" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M2 2 L18 10 L2 18 Z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="20" markerHeight="20" refX="17" refY="10" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M2 2 L18 10 L2 18 Z" fill="#22c55e"/>
+    </marker>
+    <marker id="arrow-slate" markerWidth="18" markerHeight="18" refX="15" refY="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M2 2 L16 9 L2 16 Z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+
+      text {
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        fill: #e5e7eb;
+      }
+
+      .heading {
+        font-size: 34px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .subheading {
+        font-size: 18px;
+        fill: #cbd5e1;
+      }
+
+      .section-title {
+        font-size: 17px;
+        font-weight: 800;
+      }
+
+      .label {
+        font-size: 21px;
+        font-weight: 760;
+      }
+
+      .small {
+        font-size: 15px;
+      }
+
+      .tiny {
+        font-size: 13px;
+      }
+
+      .muted {
+        fill: #94a3b8;
+      }
+
+      .boundary {
+        fill: rgba(15, 23, 42, 0.68);
+        stroke: rgba(148, 163, 184, 0.34);
+        stroke-width: 1.8;
+      }
+
+      .lane {
+        fill: rgba(2, 6, 23, 0.32);
+        stroke-width: 1.7;
+      }
+
+      .card {
+        filter: url(#shadow);
+        stroke-width: 2.2;
+      }
+
+      .mini {
+        fill: rgba(15, 23, 42, 0.55);
+        stroke: rgba(226, 232, 240, 0.36);
+        stroke-width: 1.2;
+      }
+
+      .icon-line {
+        fill: none;
+        stroke: #e5e7eb;
+        stroke-width: 3;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        opacity: 0.92;
+      }
+
+      .flow-base {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 7;
+        opacity: 0.16;
+      }
+
+      .flow-hot {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 5.5;
+        stroke-dasharray: 22 24;
+        animation: flow 2.35s linear infinite;
+      }
+
+      .flow-meta {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 4.2;
+        stroke-dasharray: 14 18;
+        opacity: 0.52;
+        animation: flow 3s linear infinite;
+      }
+
+      .state-link {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 3.8;
+        stroke-dasharray: 10 12;
+        opacity: 0.48;
+      }
+
+      .node-enter {
+        opacity: 1;
+        transform-box: fill-box;
+        transform-origin: center;
+        animation: enter 0.6s ease-out forwards;
+      }
+
+      .delay-1 { animation-delay: 0.06s; }
+      .delay-2 { animation-delay: 0.16s; }
+      .delay-3 { animation-delay: 0.26s; }
+      .delay-4 { animation-delay: 0.36s; }
+      .delay-5 { animation-delay: 0.46s; }
+
+      .pulse {
+        animation: pulse 2.6s ease-in-out infinite;
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+
+      .worker-active {
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+
+      @keyframes enter {
+        from {
+          opacity: 0.88;
+          transform: translateY(4px) scale(0.996);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0) scale(1);
+        }
+      }
+
+      @keyframes flow {
+        to {
+          stroke-dashoffset: -92;
+        }
+      }
+
+      @keyframes pulse {
+        0%, 100% {
+          opacity: 0.9;
+          transform: scale(1);
+        }
+        50% {
+          opacity: 1;
+          transform: scale(1.03);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .flow-hot,
+        .flow-meta,
+        .node-enter,
+        .pulse,
+        .worker-active {
+          animation: none;
+          opacity: 1;
+          transform: none;
+        }
+      }
+    </style>
+  </defs>
+
+  <rect width="1440" height="720" fill="url(#bg)"/>
+  <path d="M0 586 C220 526 314 678 532 630 C776 577 818 430 1062 500 C1224 548 1300 528 1440 470 L1440 720 L0 720 Z" fill="#020617" opacity="0.36"/>
+  <circle cx="128" cy="106" r="148" fill="#0ea5e9" opacity="0.08"/>
+  <circle cx="1242" cy="138" r="178" fill="#22c55e" opacity="0.07"/>
+  <circle cx="786" cy="610" r="142" fill="#f97316" opacity="0.055"/>
+
+  <g class="node-enter">
+    <text x="62" y="63" class="heading">WebVideo2NAS Current Architecture</text>
+    <text x="64" y="95" class="subheading">v3 browser-side HLS/DASH staging by default, with NAS-direct download as the fallback path.</text>
+  </g>
+
+  <g class="node-enter delay-1">
+    <rect x="60" y="116" width="322" height="482" rx="30" class="boundary"/>
+    <text x="88" y="153" class="section-title" fill="#bae6fd">BROWSER SESSION</text>
+    <text x="88" y="179" class="tiny muted">Cookies and signed CDN URLs stay in Chrome.</text>
+  </g>
+
+  <g class="node-enter delay-2">
+    <rect x="414" y="116" width="966" height="520" rx="30" class="boundary"/>
+    <text x="442" y="153" class="section-title" fill="#bbf7d0">NAS DOCKER STACK</text>
+    <text x="442" y="179" class="tiny muted">FastAPI, staging files, Redis queue, PostgreSQL, worker containers, FFmpeg, and mounted downloads.</text>
+  </g>
+
+  <g class="node node-enter delay-1">
+    <rect x="92" y="274" width="256" height="296" rx="26" fill="url(#browserGrad)" stroke="#67e8f9" class="card"/>
+    <text x="220" y="313" text-anchor="middle" class="label">Chrome Extension</text>
+    <text x="220" y="339" text-anchor="middle" class="small">MV3 side panel + service worker</text>
+
+    <rect x="120" y="370" width="200" height="46" rx="14" class="mini"/>
+    <text x="220" y="390" text-anchor="middle" class="tiny">Deep detection</text>
+    <text x="220" y="408" text-anchor="middle" class="tiny muted">webRequest, fetch, XHR</text>
+
+    <rect x="120" y="432" width="200" height="46" rx="14" class="mini"/>
+    <text x="220" y="452" text-anchor="middle" class="tiny">Browser-side worker</text>
+    <text x="220" y="470" text-anchor="middle" class="tiny muted">offscreen segment loop</text>
+
+    <rect x="120" y="494" width="200" height="46" rx="14" class="mini"/>
+    <text x="220" y="514" text-anchor="middle" class="tiny">DNR + safety gate</text>
+    <text x="220" y="532" text-anchor="middle" class="tiny muted">same-site or trusted CDN</text>
+  </g>
+
+  <g class="node node-enter delay-1">
+    <rect x="92" y="194" width="256" height="54" rx="20" fill="#0f172a" stroke="#334155" stroke-width="1.6"/>
+    <text x="220" y="216" text-anchor="middle" class="small" font-weight="800">Source Website / CDN</text>
+    <text x="220" y="236" text-anchor="middle" class="tiny muted">manifests, segments, MP4/MOV</text>
+  </g>
+
+  <g class="node-enter delay-2">
+    <rect x="440" y="206" width="566" height="176" rx="24" class="lane" stroke="#22d3ee"/>
+    <text x="468" y="237" class="section-title" fill="#67e8f9">Browser-side HLS/DASH path (default)</text>
+    <text x="468" y="262" class="tiny muted">Browser fetches and uploads staged bytes; API validates the plan.</text>
+  </g>
+
+  <g class="node-enter delay-3">
+    <rect x="440" y="410" width="566" height="140" rx="24" class="lane" stroke="#f59e0b"/>
+    <text x="468" y="441" class="section-title" fill="#fbbf24">NAS-direct path</text>
+    <text x="468" y="466" class="tiny muted">MP4/MOV fallback.</text>
+  </g>
+
+  <g aria-hidden="true">
+    <path d="M220 248 C220 256 220 264 220 272" class="flow-base" stroke="#22d3ee"/>
+    <path d="M220 248 C220 256 220 264 220 272" class="flow-hot" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+
+    <path d="M348 322 H440" class="flow-base" stroke="#22d3ee"/>
+    <path d="M348 322 H440" class="flow-hot" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+
+    <path d="M348 518 H440" class="flow-base" stroke="#f59e0b"/>
+    <path d="M348 518 H440" class="flow-hot" stroke="#f59e0b" marker-end="url(#arrow-amber)"/>
+
+    <path d="M904 451 H996 V317 H1028" class="flow-base" stroke="#22d3ee"/>
+    <path d="M904 451 H996 V317 H1028" class="flow-hot" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+
+    <path d="M1208 491 C1222 491 1234 488 1248 488" class="flow-base" stroke="#22c55e"/>
+    <path d="M1208 491 C1222 491 1234 488 1248 488" class="flow-hot" stroke="#22c55e" marker-end="url(#arrow-green)"/>
+  </g>
+
+  <g class="node node-enter delay-2">
+    <rect x="468" y="286" width="166" height="72" rx="20" fill="url(#stageGrad)" stroke="#67e8f9" class="card"/>
+    <text x="551" y="314" text-anchor="middle" class="small" font-weight="800">Manifest Plan</text>
+    <text x="551" y="336" text-anchor="middle" class="tiny">/api/jobs/init</text>
+    <text x="551" y="352" text-anchor="middle" class="tiny muted">manifest text</text>
+  </g>
+
+  <g class="node node-enter delay-2">
+    <rect x="670" y="286" width="150" height="72" rx="20" fill="#164e63" stroke="#67e8f9" class="card"/>
+    <text x="745" y="314" text-anchor="middle" class="small" font-weight="800">Plan Safety</text>
+    <text x="745" y="336" text-anchor="middle" class="tiny">public http(s)</text>
+    <text x="745" y="352" text-anchor="middle" class="tiny muted">reject private IPs</text>
+  </g>
+
+  <g class="node node-enter delay-3">
+    <rect x="858" y="286" width="120" height="72" rx="20" fill="#0f766e" stroke="#5eead4" class="card"/>
+    <text x="918" y="314" text-anchor="middle" class="small" font-weight="800">Staging</text>
+    <text x="918" y="336" text-anchor="middle" class="tiny">PUT segments</text>
+    <text x="918" y="352" text-anchor="middle" class="tiny muted">.staging/job</text>
+  </g>
+
+  <g aria-hidden="true">
+    <path d="M634 322 H670" class="flow-base" stroke="#22d3ee"/>
+    <path d="M634 322 H670" class="flow-hot" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+    <path d="M820 322 H858" class="flow-base" stroke="#22d3ee"/>
+    <path d="M820 322 H858" class="flow-hot" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+  </g>
+
+  <g class="node node-enter delay-3">
+    <rect x="468" y="494" width="166" height="46" rx="16" fill="url(#apiGrad)" stroke="#93c5fd" class="card"/>
+    <text x="551" y="522" text-anchor="middle" class="small" font-weight="800">/api/download</text>
+  </g>
+
+  <g class="node node-enter delay-3">
+    <rect x="700" y="414" width="204" height="126" rx="18" fill="#111827" stroke="#64748b" class="card"/>
+    <text x="802" y="439" text-anchor="middle" class="small" font-weight="800">Redis queues</text>
+    <rect x="718" y="448" width="168" height="30" rx="10" fill="#164e63" stroke="#67e8f9" stroke-width="1.4"/>
+    <text x="802" y="468" text-anchor="middle" class="tiny">browser_finalize_queue</text>
+    <rect x="718" y="500" width="168" height="30" rx="10" fill="#7c2d12" stroke="#fdba74" stroke-width="1.4"/>
+    <text x="802" y="520" text-anchor="middle" class="tiny">download_queue</text>
+  </g>
+
+  <g aria-hidden="true">
+    <path d="M918 358 V439 H890" class="flow-base" stroke="#22d3ee"/>
+    <path d="M918 358 V439 H890" class="flow-hot" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+  </g>
+
+  <g aria-hidden="true">
+    <path d="M634 517 H666 V515 H704" class="flow-base" stroke="#f59e0b"/>
+    <path d="M634 517 H666 V515 H704" class="flow-hot" stroke="#f59e0b" marker-end="url(#arrow-amber)"/>
+    <path d="M904 515 H982 V409 H1028" class="flow-base" stroke="#f59e0b"/>
+    <path d="M904 515 H982 V409 H1028" class="flow-hot" stroke="#f59e0b" marker-end="url(#arrow-amber)"/>
+  </g>
+
+  <g class="node node-enter delay-2">
+    <rect x="1042" y="236" width="166" height="190" rx="24" fill="#1f2937" stroke="#4ade80" class="card"/>
+    <text x="1125" y="266" text-anchor="middle" class="section-title">Worker Pool x3</text>
+    <text x="1125" y="287" text-anchor="middle" class="tiny muted">BLPOP id, read/write state</text>
+    <g class="worker-active">
+      <rect x="1066" y="300" width="118" height="34" rx="12" fill="url(#workerGrad)" stroke="#bbf7d0" stroke-width="1.7"/>
+      <text x="1125" y="322" text-anchor="middle" class="tiny">mux staged HLS</text>
+    </g>
+    <g class="worker-active">
+      <rect x="1066" y="346" width="118" height="34" rx="12" fill="url(#workerGrad)" stroke="#bbf7d0" stroke-width="1.7"/>
+      <text x="1125" y="368" text-anchor="middle" class="tiny">DASH finalize</text>
+    </g>
+    <g class="worker-active">
+      <rect x="1066" y="392" width="118" height="34" rx="12" fill="url(#workerGrad)" stroke="#bbf7d0" stroke-width="1.7"/>
+      <text x="1125" y="414" text-anchor="middle" class="tiny">NAS-direct fetch</text>
+    </g>
+  </g>
+
+  <g class="node node-enter delay-3">
+    <rect x="1042" y="454" width="166" height="74" rx="22" fill="#713f12" stroke="#facc15" class="card"/>
+    <text x="1125" y="487" text-anchor="middle" class="label">FFmpeg</text>
+    <text x="1125" y="511" text-anchor="middle" class="tiny">mux / copy / merge</text>
+  </g>
+
+  <g aria-hidden="true">
+    <path d="M1125 426 V454" class="flow-base" stroke="#94a3b8"/>
+    <path d="M1125 426 V454" class="flow-meta" stroke="#94a3b8" marker-end="url(#arrow-slate)"/>
+  </g>
+
+  <g class="node node-enter delay-4">
+    <rect x="1254" y="284" width="122" height="214" rx="24" fill="url(#storageGrad)" stroke="#86efac" class="card"/>
+    <g transform="translate(1280 314)">
+      <path d="M0 14 h24 l10 10 h39 a9 9 0 0 1 9 9 v42 a9 9 0 0 1 -9 9 H9 a9 9 0 0 1 -9 -9 Z" fill="#14532d" stroke="#dcfce7" stroke-width="3"/>
+      <path d="M14 58 h54" class="icon-line" stroke-width="2"/>
+    </g>
+    <text x="1315" y="420" text-anchor="middle" class="label">NAS</text>
+    <text x="1315" y="445" text-anchor="middle" class="small">Storage</text>
+    <text x="1315" y="470" text-anchor="middle" class="tiny">/downloads</text>
+    <text x="1315" y="490" text-anchor="middle" class="tiny">.staging</text>
+  </g>
+
+  <g aria-hidden="true">
+    <path d="M1042 382 C1032 458 1032 528 1008 564" class="state-link" stroke="#94a3b8"/>
+  </g>
+
+  <g class="node node-enter delay-4">
+    <rect x="440" y="568" width="566" height="54" rx="18" fill="rgba(2, 6, 23, 0.34)" stroke="#64748b" stroke-width="1.7"/>
+    <text x="468" y="600" class="small" fill="#cbd5e1" font-weight="800">Shared state</text>
+    <rect x="858" y="564" width="150" height="58" rx="18" fill="#115e59" stroke="#5eead4" class="card"/>
+    <text x="933" y="585" text-anchor="middle" class="small" font-weight="800">Postgres</text>
+    <text x="933" y="603" text-anchor="middle" class="tiny">job database</text>
+    <text x="933" y="617" text-anchor="middle" class="tiny muted">source of truth</text>
+  </g>
+
+  <g class="node-enter delay-5">
+    <rect x="72" y="646" width="1296" height="54" rx="18" fill="#020617" opacity="0.58" stroke="#334155"/>
+    <text x="104" y="680" class="small" fill="#dbeafe" font-weight="800">Legend</text>
+    <circle cx="190" cy="674" r="7" fill="#22d3ee"/>
+    <text x="210" y="680" class="tiny">browser-side / session path</text>
+    <path d="M390 674 h68" class="icon-line" stroke="#22d3ee" stroke-width="3" marker-end="url(#arrow-cyan)"/>
+    <circle cx="502" cy="674" r="7" fill="#f59e0b"/>
+    <text x="522" y="680" class="tiny">NAS-direct queue/download</text>
+    <path d="M706 674 h68" class="icon-line" stroke="#f59e0b" stroke-width="3" marker-end="url(#arrow-amber)"/>
+    <circle cx="818" cy="674" r="7" fill="#94a3b8"/>
+    <text x="838" y="680" class="tiny">Postgres read/write state</text>
+    <path d="M1008 674 h68" class="state-link" stroke="#94a3b8"/>
+    <circle cx="1120" cy="674" r="7" fill="#22c55e"/>
+    <text x="1140" y="680" class="tiny">final MP4 output</text>
+  </g>
+</svg>
