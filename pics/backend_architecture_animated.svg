@@ -1,0 +1,402 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="760" viewBox="0 0 1440 760" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">WebVideo2NAS backend service topology diagram</title>
+  <desc id="desc">Current WebVideo2NAS backend Docker service topology showing the unified image role split, API service, worker replicas, PostgreSQL, Redis runtime coordination, mounted volumes, cleanup service, and operational guardrails.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="55%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#121212"/>
+    </linearGradient>
+    <linearGradient id="imageGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#155e75"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="apiGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="dbGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#115e59"/>
+      <stop offset="100%" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="redisGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#7f1d1d"/>
+      <stop offset="100%" stop-color="#c2410c"/>
+    </linearGradient>
+    <linearGradient id="workerGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#365314"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <linearGradient id="volumeGrad" x1="0" x2="1">
+      <stop offset="0%" stop-color="#064e3b"/>
+      <stop offset="100%" stop-color="#166534"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#020617" flood-opacity="0.34"/>
+    </filter>
+    <marker id="arrow-role" markerWidth="18" markerHeight="18" refX="15" refY="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M2 2 L16 9 L2 16 Z" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrow-state" markerWidth="18" markerHeight="18" refX="15" refY="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M2 2 L16 9 L2 16 Z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="18" markerHeight="18" refX="15" refY="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M2 2 L16 9 L2 16 Z" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="18" markerHeight="18" refX="15" refY="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M2 2 L16 9 L2 16 Z" fill="#f59e0b"/>
+    </marker>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+
+      text {
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        fill: #e5e7eb;
+      }
+
+      .heading {
+        font-size: 34px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .subheading {
+        font-size: 18px;
+        fill: #cbd5e1;
+      }
+
+      .section-title {
+        font-size: 17px;
+        font-weight: 800;
+      }
+
+      .label {
+        font-size: 21px;
+        font-weight: 760;
+      }
+
+      .small {
+        font-size: 15px;
+      }
+
+      .tiny {
+        font-size: 13px;
+      }
+
+      .muted {
+        fill: #94a3b8;
+      }
+
+      .boundary {
+        fill: rgba(15, 23, 42, 0.68);
+        stroke: rgba(148, 163, 184, 0.34);
+        stroke-width: 1.8;
+      }
+
+      .card {
+        filter: url(#shadow);
+        stroke-width: 2.2;
+      }
+
+      .mini {
+        fill: rgba(15, 23, 42, 0.56);
+        stroke: rgba(226, 232, 240, 0.36);
+        stroke-width: 1.2;
+      }
+
+      .pill {
+        fill: rgba(15, 23, 42, 0.62);
+        stroke: rgba(226, 232, 240, 0.34);
+        stroke-width: 1.2;
+      }
+
+      .relationship {
+        fill: none;
+        stroke: #94a3b8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 3.4;
+        stroke-dasharray: 8 12;
+        opacity: 0.5;
+        animation: relationFlow 5.5s linear infinite;
+      }
+
+      .role-link {
+        fill: none;
+        stroke: #22d3ee;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 4;
+        stroke-dasharray: 14 16;
+        opacity: 0.72;
+        animation: relationFlow 4.5s linear infinite;
+      }
+
+      .queue-cyan,
+      .queue-amber {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 4.2;
+        stroke-dasharray: 14 16;
+        opacity: 0.76;
+        animation: relationFlow 3.8s linear infinite;
+      }
+
+      .queue-cyan {
+        stroke: #22d3ee;
+      }
+
+      .queue-amber {
+        stroke: #f59e0b;
+      }
+
+      .arrow-role,
+      .arrow-cyan {
+        fill: #22d3ee;
+        opacity: 0.96;
+      }
+
+      .arrow-amber {
+        fill: #f59e0b;
+        opacity: 0.96;
+      }
+
+      .arrow-state {
+        fill: #94a3b8;
+        opacity: 0.9;
+      }
+
+      .node-enter {
+        opacity: 1;
+        transform-box: fill-box;
+        transform-origin: center;
+        animation: enter 0.6s ease-out forwards;
+      }
+
+      .pulse {
+        animation: pulse 2.8s ease-in-out infinite;
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+
+      .delay-1 { animation-delay: 0.06s; }
+      .delay-2 { animation-delay: 0.16s; }
+      .delay-3 { animation-delay: 0.26s; }
+      .delay-4 { animation-delay: 0.36s; }
+      .delay-5 { animation-delay: 0.46s; }
+
+      @keyframes enter {
+        from {
+          opacity: 0.88;
+          transform: translateY(4px) scale(0.996);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0) scale(1);
+        }
+      }
+
+      @keyframes relationFlow {
+        to {
+          stroke-dashoffset: -80;
+        }
+      }
+
+      @keyframes pulse {
+        0%, 100% {
+          opacity: 0.9;
+          transform: scale(1);
+        }
+        50% {
+          opacity: 1;
+          transform: scale(1.025);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .relationship,
+        .role-link,
+        .queue-cyan,
+        .queue-amber,
+        .node-enter,
+        .pulse {
+          animation: none;
+          opacity: 1;
+          transform: none;
+        }
+      }
+    </style>
+  </defs>
+
+  <rect width="1440" height="760" fill="url(#bg)"/>
+  <path d="M0 612 C222 550 354 680 548 632 C790 572 830 464 1080 512 C1232 544 1320 520 1440 468 L1440 760 L0 760 Z" fill="#020617" opacity="0.38"/>
+  <circle cx="126" cy="106" r="150" fill="#0ea5e9" opacity="0.08"/>
+  <circle cx="1218" cy="142" r="178" fill="#22c55e" opacity="0.07"/>
+  <circle cx="670" cy="628" r="146" fill="#f97316" opacity="0.05"/>
+
+  <g class="node-enter">
+    <text x="62" y="63" class="heading">WebVideo2NAS Backend Service Topology</text>
+    <text x="64" y="95" class="subheading">A complement to the system flow: containers, runtime contracts, persisted data, and guardrails.</text>
+  </g>
+
+  <g class="node-enter delay-1">
+    <rect x="52" y="118" width="1336" height="548" rx="30" class="boundary"/>
+    <text x="84" y="154" class="section-title" fill="#bbf7d0">DOCKER COMPOSE BACKEND</text>
+    <text x="84" y="180" class="tiny muted">Services from docker-compose.synology.yml: api, worker x3, db, redis, db_cleanup, and mounted NAS paths.</text>
+  </g>
+
+  <g class="node node-enter delay-1">
+    <rect x="84" y="216" width="270" height="128" rx="22" fill="url(#imageGrad)" stroke="#67e8f9" class="card"/>
+    <text x="219" y="250" text-anchor="middle" class="label">Unified Image</text>
+    <text x="219" y="274" text-anchor="middle" class="tiny">ghcr.io/.../webvideo2nas</text>
+    <rect x="112" y="296" width="98" height="30" rx="10" class="mini"/>
+    <text x="161" y="316" text-anchor="middle" class="tiny">ROLE=api</text>
+    <rect x="226" y="296" width="100" height="30" rx="10" class="mini"/>
+    <text x="276" y="316" text-anchor="middle" class="tiny">ROLE=worker</text>
+  </g>
+
+  <g class="node node-enter delay-2">
+    <rect x="84" y="380" width="270" height="164" rx="22" fill="url(#apiGrad)" stroke="#67e8f9" class="card"/>
+    <text x="219" y="414" text-anchor="middle" class="label">api service</text>
+    <text x="219" y="438" text-anchor="middle" class="tiny">uvicorn main:app, host 52052 -> 8000</text>
+    <rect x="112" y="458" width="214" height="28" rx="10" class="mini"/>
+    <text x="219" y="477" text-anchor="middle" class="tiny">API_KEY, CORS, CIDR allowlist</text>
+    <rect x="112" y="496" width="214" height="28" rx="10" class="mini"/>
+    <text x="219" y="515" text-anchor="middle" class="tiny">rate buckets: read/write/upload</text>
+  </g>
+
+  <g class="node node-enter delay-2">
+    <rect x="408" y="216" width="270" height="168" rx="22" fill="url(#dbGrad)" stroke="#5eead4" class="card"/>
+    <text x="543" y="250" text-anchor="middle" class="label">db service</text>
+    <text x="543" y="274" text-anchor="middle" class="tiny">Postgres 15, source of truth</text>
+    <rect x="432" y="296" width="96" height="30" rx="10" class="mini"/>
+    <text x="480" y="316" text-anchor="middle" class="tiny">jobs</text>
+    <rect x="540" y="296" width="112" height="30" rx="10" class="mini"/>
+    <text x="596" y="316" text-anchor="middle" class="tiny">job_metadata</text>
+    <rect x="432" y="340" width="220" height="28" rx="10" class="mini"/>
+    <text x="542" y="359" text-anchor="middle" class="tiny">idempotent schema migration</text>
+  </g>
+
+  <g class="node node-enter delay-3">
+    <rect x="408" y="416" width="270" height="128" rx="22" fill="url(#volumeGrad)" stroke="#86efac" class="card"/>
+    <text x="543" y="450" text-anchor="middle" class="label">mounted volumes</text>
+    <rect x="432" y="472" width="102" height="28" rx="10" class="mini"/>
+    <text x="483" y="491" text-anchor="middle" class="tiny">/downloads</text>
+    <rect x="548" y="472" width="104" height="28" rx="10" class="mini"/>
+    <text x="600" y="491" text-anchor="middle" class="tiny">.staging</text>
+    <rect x="432" y="510" width="220" height="22" rx="9" class="mini"/>
+    <text x="542" y="526" text-anchor="middle" class="tiny">db_data, redis_data, logs</text>
+  </g>
+
+  <g class="node node-enter delay-3">
+    <rect x="732" y="216" width="270" height="206" rx="22" fill="url(#redisGrad)" stroke="#fdba74" class="card"/>
+    <text x="867" y="250" text-anchor="middle" class="label">redis service</text>
+    <text x="867" y="274" text-anchor="middle" class="tiny">runtime coordination, not source of truth</text>
+    <rect x="758" y="296" width="218" height="28" rx="10" fill="#164e63" stroke="#67e8f9" stroke-width="1.3"/>
+    <text x="867" y="315" text-anchor="middle" class="tiny">browser_finalize_queue</text>
+    <rect x="758" y="334" width="218" height="28" rx="10" fill="#7c2d12" stroke="#fdba74" stroke-width="1.3"/>
+    <text x="867" y="353" text-anchor="middle" class="tiny">download_queue</text>
+    <rect x="758" y="376" width="218" height="28" rx="10" class="mini"/>
+    <text x="867" y="395" text-anchor="middle" class="tiny">rate, slots, heartbeats, throttle</text>
+  </g>
+
+  <g class="node node-enter delay-4">
+    <rect x="1056" y="216" width="270" height="268" rx="22" fill="#1f2937" stroke="#4ade80" class="card"/>
+    <text x="1191" y="250" text-anchor="middle" class="label">worker services x3</text>
+    <text x="1191" y="274" text-anchor="middle" class="tiny">same image, ROLE=worker</text>
+
+    <rect x="1084" y="300" width="94" height="32" rx="10" fill="url(#workerGrad)" stroke="#bbf7d0" stroke-width="1.5"/>
+    <text x="1131" y="321" text-anchor="middle" class="tiny">worker 1</text>
+    <rect x="1084" y="342" width="94" height="32" rx="10" fill="url(#workerGrad)" stroke="#bbf7d0" stroke-width="1.5"/>
+    <text x="1131" y="363" text-anchor="middle" class="tiny">worker 2</text>
+    <rect x="1084" y="384" width="94" height="32" rx="10" fill="url(#workerGrad)" stroke="#bbf7d0" stroke-width="1.5"/>
+    <text x="1131" y="405" text-anchor="middle" class="tiny">worker 3</text>
+
+    <rect x="1192" y="300" width="108" height="28" rx="10" class="mini"/>
+    <text x="1246" y="319" text-anchor="middle" class="tiny">boot reapers</text>
+    <rect x="1192" y="338" width="108" height="28" rx="10" class="mini"/>
+    <text x="1246" y="357" text-anchor="middle" class="tiny">fair BLPOP</text>
+    <rect x="1192" y="376" width="108" height="28" rx="10" class="mini"/>
+    <text x="1246" y="395" text-anchor="middle" class="tiny">CAS claim</text>
+    <rect x="1192" y="414" width="108" height="28" rx="10" class="mini"/>
+    <text x="1246" y="433" text-anchor="middle" class="tiny">FFmpeg/probe</text>
+    <rect x="1084" y="452" width="216" height="22" rx="9" class="mini"/>
+    <text x="1192" y="468" text-anchor="middle" class="tiny">updates status + cleans staging</text>
+  </g>
+
+  <g class="node node-enter delay-4">
+    <rect x="724" y="456" width="286" height="96" rx="20" fill="#111827" stroke="#64748b" class="card"/>
+    <text x="867" y="488" text-anchor="middle" class="label">db_cleanup</text>
+    <text x="867" y="512" text-anchor="middle" class="tiny">hourly retention</text>
+    <text x="867" y="530" text-anchor="middle" class="tiny muted">latest 100 per terminal status</text>
+    <text x="867" y="546" text-anchor="middle" class="tiny muted">removes failed/cancelled partial files</text>
+  </g>
+
+  <g aria-hidden="true">
+    <path d="M161 344 V380" class="role-link"/>
+    <polygon points="151,368 171,368 161,384" class="arrow-role"/>
+    <path d="M326 311 H374 V198 H1191 V216" class="role-link"/>
+    <polygon points="1181,204 1201,204 1191,220" class="arrow-role"/>
+
+    <path d="M354 438 H382 V340 H408" class="relationship"/>
+    <polygon points="396,332 414,340 396,348" class="arrow-state"/>
+    <path d="M354 472 H408" class="relationship"/>
+    <polygon points="396,464 414,472 396,480" class="arrow-state"/>
+    <path d="M354 510 H382 V404 H732" class="relationship"/>
+    <polygon points="720,396 738,404 720,412" class="arrow-state"/>
+
+    <path d="M976 310 H1056" class="queue-cyan"/>
+    <polygon points="1044,302 1062,310 1044,318" class="arrow-cyan"/>
+    <path d="M976 348 H1056" class="queue-amber"/>
+    <polygon points="1044,340 1062,348 1044,356" class="arrow-amber"/>
+
+    <path d="M1056 262 H1028 V190 H704 V300 H678" class="relationship"/>
+    <polygon points="690,292 672,300 690,308" class="arrow-state"/>
+    <path d="M1056 456 H1028 V560 H704 V486 H678" class="relationship"/>
+    <polygon points="690,478 672,486 690,494" class="arrow-state"/>
+
+    <path d="M724 486 H704 V356 H678" class="relationship"/>
+    <polygon points="690,348 672,356 690,364" class="arrow-state"/>
+    <path d="M724 518 H678" class="relationship"/>
+    <polygon points="690,510 672,518 690,526" class="arrow-state"/>
+  </g>
+
+  <g class="node-enter delay-5">
+    <rect x="84" y="576" width="1242" height="58" rx="18" fill="#020617" opacity="0.58" stroke="#334155"/>
+    <text x="116" y="604" class="section-title" fill="#dbeafe">Operational Guardrails</text>
+    <rect x="318" y="590" width="150" height="28" rx="10" class="pill"/>
+    <text x="393" y="609" text-anchor="middle" class="tiny">API healthcheck auth</text>
+    <rect x="486" y="590" width="150" height="28" rx="10" class="pill"/>
+    <text x="561" y="609" text-anchor="middle" class="tiny">SSRF plan safety</text>
+    <rect x="654" y="590" width="154" height="28" rx="10" class="pill"/>
+    <text x="731" y="609" text-anchor="middle" class="tiny">upload quota gates</text>
+    <rect x="826" y="590" width="160" height="28" rx="10" class="pill"/>
+    <text x="906" y="609" text-anchor="middle" class="tiny">worker heartbeats</text>
+    <rect x="1004" y="590" width="150" height="28" rx="10" class="pill"/>
+    <text x="1079" y="609" text-anchor="middle" class="tiny">host concurrency</text>
+    <rect x="1172" y="590" width="118" height="28" rx="10" class="pill"/>
+    <text x="1231" y="609" text-anchor="middle" class="tiny">safe cleanup</text>
+  </g>
+
+  <g class="node-enter delay-5">
+    <rect x="72" y="690" width="1296" height="50" rx="18" fill="#020617" opacity="0.58" stroke="#334155"/>
+    <text x="104" y="721" class="small" fill="#dbeafe" font-weight="800">Legend</text>
+    <path d="M190 715 h68" class="role-link"/>
+    <polygon points="250,707 266,715 250,723" class="arrow-role"/>
+    <text x="278" y="721" class="tiny">ROLE dispatch</text>
+    <path d="M410 715 h58" class="relationship"/>
+    <polygon points="460,707 476,715 460,723" class="arrow-state"/>
+    <text x="488" y="721" class="tiny">dependency / shared state</text>
+    <path d="M704 715 h54" class="queue-cyan"/>
+    <polygon points="750,707 766,715 750,723" class="arrow-cyan"/>
+    <text x="786" y="721" class="tiny">browser finalize queue</text>
+    <path d="M950 715 h54" class="queue-amber"/>
+    <polygon points="996,707 1012,715 996,723" class="arrow-amber"/>
+    <text x="1032" y="721" class="tiny">NAS-direct queue</text>
+    <rect x="1190" y="702" width="138" height="24" rx="9" fill="#14532d" stroke="#86efac" stroke-width="1.2"/>
+    <text x="1259" y="719" text-anchor="middle" class="tiny">persistent volumes</text>
+  </g>
+</svg>

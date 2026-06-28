@@ -49,7 +49,7 @@ This system enables you to:
 
 ### Backend Architecture
 
-![Backend Architecture](pics/backend_architecture.png)
+![Animated Backend Architecture](pics/backend_architecture_animated.svg)
 
 ## Quick Links
 
