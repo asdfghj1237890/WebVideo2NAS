@@ -57,14 +57,14 @@ def _build_test_engine():
                 source_page TEXT, output_subdir TEXT, duration INTEGER,
                 actual_duration INTEGER, suspect_reason TEXT,
                 mode TEXT, total_segments INTEGER, staging_dir TEXT,
-                finalize_started_at TIMESTAMP
+                finalize_started_at TIMESTAMP, last_activity TIMESTAMP
             )
         """))
     return engine
 
 
 def _plant(engine, *, job_id, status, mode, created_at, staging_dir,
-           finalize_started_at=None):
+           finalize_started_at=None, last_activity=None):
     Sess = sessionmaker(bind=engine)
     db = Sess()
     try:
@@ -75,10 +75,10 @@ def _plant(engine, *, job_id, status, mode, created_at, staging_dir,
             "status": status, "ca": created_at})
         db.execute(sa_text(
             "INSERT INTO job_metadata "
-            "(job_id, mode, total_segments, staging_dir, finalize_started_at) "
-            "VALUES (:id, :mode, 1, :sd, :fsa)"
+            "(job_id, mode, total_segments, staging_dir, finalize_started_at, last_activity) "
+            "VALUES (:id, :mode, 1, :sd, :fsa, :la)"
         ), {"id": job_id, "mode": mode, "sd": staging_dir,
-            "fsa": finalize_started_at})
+            "fsa": finalize_started_at, "la": last_activity})
         db.commit()
     finally:
         db.close()
@@ -148,6 +148,57 @@ def test_reaper_marks_old_browser_pending_failed(worker_module, tmp_path):
     assert status == "failed"
     assert "Stale browser job" in (err or "")
     assert not staging.exists()  # staging wiped
+
+
+def test_reaper_skips_uploading_job_with_fresh_last_activity(worker_module, tmp_path):
+    """Codex adversarial review: a browser_uploading job created >6h ago but
+    STILL actively uploading (fresh last_activity, refreshed on each PUT) must
+    NOT be reaped by the periodic sweep — otherwise a slow/large upload loses
+    its staging mid-flight."""
+    mod, engine = worker_module
+    staging_root = Path(os.environ["STAGING_DIR"])
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    job_id = "22222222-bbbb-bbbb-bbbb-222222222222"
+    staging = staging_root / job_id
+    (staging / "video").mkdir(parents=True)
+    (staging / "video" / "seg_00000000.bin").write_bytes(b"x")
+
+    _plant(engine,
+           job_id=job_id, status="browser_uploading", mode="browser",
+           created_at=_utcnow_naive() - timedelta(hours=24),        # old
+           last_activity=_utcnow_naive() - timedelta(minutes=10),   # but active now
+           staging_dir=str(staging))
+
+    mod._reap_stale_browser_jobs()
+
+    status, _ = _read_status(engine, job_id)
+    assert status == "browser_uploading"  # NOT reaped
+    assert staging.exists()               # staging preserved
+
+
+def test_reaper_reaps_uploading_job_with_stale_last_activity(worker_module, tmp_path):
+    """Old created_at AND stale last_activity (upload genuinely abandoned) →
+    reaped, so leftover staging is still cleaned."""
+    mod, engine = worker_module
+    staging_root = Path(os.environ["STAGING_DIR"])
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    job_id = "33333333-cccc-cccc-cccc-333333333333"
+    staging = staging_root / job_id
+    staging.mkdir()
+
+    _plant(engine,
+           job_id=job_id, status="browser_uploading", mode="browser",
+           created_at=_utcnow_naive() - timedelta(hours=24),
+           last_activity=_utcnow_naive() - timedelta(hours=8),  # stale
+           staging_dir=str(staging))
+
+    mod._reap_stale_browser_jobs()
+
+    status, _ = _read_status(engine, job_id)
+    assert status == "failed"
+    assert not staging.exists()
 
 
 def test_reaper_skips_recent_browser_jobs(worker_module, tmp_path):

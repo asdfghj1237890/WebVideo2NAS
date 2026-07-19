@@ -336,7 +336,7 @@ def test_verify_staging_complete_dash_two_tracks(monkeypatch, tmp_path):
 # Result: completed staging stranded forever. Fix: push first, commit
 # second; rpush failure leaves DB unchanged so the user can retry.
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 from sqlalchemy import create_engine, text as sa_text
 from sqlalchemy.pool import StaticPool
@@ -383,7 +383,7 @@ def _build_finalize_test_env(monkeypatch, tmp_path, *, rpush_fails=False, db_com
                 source_page TEXT, output_subdir TEXT, duration INTEGER,
                 actual_duration INTEGER, suspect_reason TEXT,
                 mode TEXT, total_segments INTEGER, staging_dir TEXT,
-                finalize_started_at TIMESTAMP
+                finalize_started_at TIMESTAMP, last_activity TIMESTAMP
             )
         """))
 
@@ -506,6 +506,51 @@ def test_finalize_retry_from_browser_finalizing_succeeds(monkeypatch, tmp_path):
     # Successful retry: status flipped to 'pending' and rpush ran.
     assert _read_job_status(api_main, job_id) == "pending"
     api_main.redis_client.rpush.assert_called_once_with("browser_finalize_queue", job_id)
+
+
+def test_finalize_resume_refreshes_finalize_started_at(monkeypatch, tmp_path):
+    """Codex adversarial review: resuming a >6h-old browser_finalizing job must
+    refresh finalize_started_at. The (now periodic) stale-browser reaper ages
+    browser_finalizing rows off finalize_started_at, so without this refresh it
+    could flip the resuming job to 'failed' and rmtree its complete staging
+    mid-resume (data loss). After resume, the timestamp must be fresh so the
+    reaper's `fsa < now-6h` predicate is false."""
+    from fastapi.testclient import TestClient
+    api_main, job_id = _build_finalize_test_env(monkeypatch, tmp_path)
+
+    # A prior finalize attempt stamped finalize_started_at long ago, then
+    # failed before reaching 'pending' — exactly what the reaper targets.
+    stale = _utcnow_naive() - timedelta(hours=8)
+    db = api_main.SessionLocal()
+    try:
+        db.execute(sa_text("UPDATE jobs SET status='browser_finalizing' WHERE id=:id"),
+                   {"id": job_id})
+        db.execute(sa_text("UPDATE job_metadata SET finalize_started_at=:t WHERE job_id=:id"),
+                   {"id": job_id, "t": stale})
+        db.commit()
+    finally:
+        db.close()
+
+    with TestClient(api_main.app) as client:
+        resp = client.post(
+            f"/api/jobs/{job_id}/finalize",
+            headers={"Authorization": "Bearer test-key-not-the-default-placeholder"},
+        )
+    assert resp.status_code == 200
+
+    db = api_main.SessionLocal()
+    try:
+        row = db.execute(
+            sa_text("SELECT finalize_started_at FROM job_metadata WHERE job_id=:id"),
+            {"id": job_id},
+        ).first()
+    finally:
+        db.close()
+    fsa = row.finalize_started_at
+    if isinstance(fsa, str):  # sqlite returns TIMESTAMP as text
+        fsa = datetime.fromisoformat(fsa)
+    # Refreshed to ~now, NOT the 8h-old stale value.
+    assert fsa > _utcnow_naive() - timedelta(hours=1)
 
 
 def test_finalize_reports_cancel_if_delete_wins_after_enqueue(monkeypatch, tmp_path):
@@ -769,14 +814,26 @@ def test_existing_segment_retry_bypasses_quota_gate(monkeypatch, tmp_path):
         async def stream(self):
             yield b"DIFFERENT-RETRY-BYTES"
 
+    # Capturing db so we can also assert the idempotent retry refreshes the
+    # activity lease (Codex adversarial review — the periodic reaper must not
+    # reap a client that keeps re-PUTting an already-published segment).
+    executed_sql = []
+    lease_db = MagicMock()
+    lease_db.execute = lambda stmt, params=None: (
+        executed_sql.append(str(stmt)) or MagicMock(first=lambda: None)
+    )
+
     result = asyncio.run(api_main.upload_segment(
-        job_id, 0, _FakeRequest(), track="video", db=object(), api_key="x",
+        job_id, 0, _FakeRequest(), track="video", db=lease_db, api_key="x",
     ))
 
     assert result["idempotent"] is True
     assert target.read_bytes() == b"PRIOR-COMMIT"
     assert claimed == [job_id]
     assert released == [job_id]
+    assert any("last_activity" in s for s in executed_sql), (
+        "idempotent segment retry must refresh the upload lease"
+    )
 
 
 def test_existing_init_retry_bypasses_quota_gate(monkeypatch, tmp_path):
@@ -810,14 +867,25 @@ def test_existing_init_retry_bypasses_quota_gate(monkeypatch, tmp_path):
         async def stream(self):
             yield b"DIFFERENT-INIT-RETRY"
 
+    # Capturing db so we can also assert the idempotent init retry refreshes the
+    # activity lease (Codex adversarial review).
+    executed_sql = []
+    lease_db = MagicMock()
+    lease_db.execute = lambda stmt, params=None: (
+        executed_sql.append(str(stmt)) or MagicMock(first=lambda: None)
+    )
+
     result = asyncio.run(api_main.upload_init_segment(
-        job_id, _FakeRequest(), track="video", db=object(), api_key="x",
+        job_id, _FakeRequest(), track="video", db=lease_db, api_key="x",
     ))
 
     assert result["idempotent"] is True
     assert target.read_bytes() == b"PRIOR-INIT"
     assert claimed == [job_id]
     assert released == [job_id]
+    assert any("last_activity" in s for s in executed_sql), (
+        "idempotent init retry must refresh the upload lease"
+    )
 
 
 # --- Codex review (P2): O(1) staged-bytes counter --------------------
@@ -1255,6 +1323,45 @@ def test_segment_upload_proceeds_when_target_absent(monkeypatch, tmp_path):
     assert result.get("idempotent") is None or result.get("idempotent") is False
     assert result["received"] == len(fresh_bytes)
     assert target.read_bytes() == fresh_bytes
+
+
+def test_refresh_upload_lease_bumps_last_activity(monkeypatch, tmp_path):
+    """Codex adversarial review: the lease refresh — called at every upload
+    endpoint entry, so it also covers the idempotent 'already have this segment'
+    and init concurrent-loser early-returns — bumps last_activity. This keeps
+    the periodic stale-browser reaper (which ages browser_uploading rows off
+    COALESCE(last_activity, created_at)) from reaping a client that's actively
+    re-PUTting near the 6h cutoff."""
+    api_main, job_id = _build_finalize_test_env(monkeypatch, tmp_path)
+
+    stale = _utcnow_naive() - timedelta(hours=8)
+    db = api_main.SessionLocal()
+    try:
+        db.execute(sa_text("UPDATE job_metadata SET last_activity=:t WHERE job_id=:id"),
+                   {"id": job_id, "t": stale})
+        db.commit()
+    finally:
+        db.close()
+
+    db2 = api_main.SessionLocal()
+    try:
+        api_main._refresh_upload_lease(db2, job_id)
+    finally:
+        db2.close()
+
+    db3 = api_main.SessionLocal()
+    try:
+        row = db3.execute(
+            sa_text("SELECT last_activity FROM job_metadata WHERE job_id=:id"),
+            {"id": job_id},
+        ).first()
+    finally:
+        db3.close()
+    la = row.last_activity
+    if isinstance(la, str):  # sqlite returns TIMESTAMP as text
+        la = datetime.fromisoformat(la)
+    # Refreshed to ~now, NOT the 8h-old stale value.
+    assert la > _utcnow_naive() - timedelta(hours=1)
 
 
 def test_segment_upload_overwrites_zero_byte_target(monkeypatch, tmp_path):

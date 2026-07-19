@@ -5,11 +5,12 @@ FastAPI application for managing web video download jobs (M3U8 and MP4)
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
 import errno
+import hmac
 import os
 import re
 import logging
@@ -92,7 +93,7 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(
     title="WebVideo2NAS API",
     description="API for managing web video downloads (M3U8, MP4, and MOV)",
-    version="1.11.0",
+    version=os.getenv("APP_VERSION", "dev"),
     lifespan=_lifespan,
 )
 
@@ -155,6 +156,13 @@ def _ensure_schema() -> None:
             # as "old" and reaped between the CAS commit and the rpush.
             conn.execute(text(
                 "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS finalize_started_at TIMESTAMP"
+            ))
+            # Codex adversarial review: upload activity lease, refreshed on every
+            # segment/init PUT. The stale-browser reaper ages
+            # browser_pending/uploading rows off COALESCE(last_activity,
+            # created_at) so a slow-but-progressing upload isn't reaped.
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS last_activity TIMESTAMP"
             ))
     except Exception as e:
         logger.warning(f"Schema migration skipped: {e}")
@@ -375,7 +383,9 @@ def _verify_key_common(request: Request, authorization: Optional[str], bucket: s
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     token = authorization.replace("Bearer ", "").strip()
-    if token != API_KEY:
+    # Constant-time comparison so response timing can't be used to recover
+    # the key byte-by-byte. API_KEY is guaranteed non-empty by the check above.
+    if not hmac.compare_digest(token.encode("utf-8"), API_KEY.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return token
 
@@ -408,7 +418,7 @@ async def root():
     """Root endpoint"""
     return {
         "name": "WebVideo2NAS API",
-        "version": "1.11.0",
+        "version": os.getenv("APP_VERSION", "dev"),
         "status": "running"
     }
 
@@ -756,6 +766,61 @@ async def get_status(
     except Exception as e:
         logger.error(f"Failed to get status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/metrics")
+async def metrics(
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key_read),
+):
+    """Prometheus text-format metrics for scraping (queue depth, job counts by
+    status, DB/Redis reachability). Requires the read API key like /api/status —
+    point your scraper's bearer_token at it. No new dependency: the exposition
+    format is emitted by hand. DB/Redis failures degrade to *_up 0 rather than
+    500 so a scrape still records the outage instead of going blind.
+    """
+    lines: list[str] = [
+        "# HELP webvideo2nas_up 1 if the API is responding.",
+        "# TYPE webvideo2nas_up gauge",
+        "webvideo2nas_up 1",
+    ]
+
+    try:
+        rows = db.execute(text("SELECT status, COUNT(*) AS count FROM jobs GROUP BY status")).all()
+        lines.append("# HELP webvideo2nas_jobs Number of jobs by status.")
+        lines.append("# TYPE webvideo2nas_jobs gauge")
+        total = 0
+        for row in rows:
+            label = str(row.status or "unknown").replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'webvideo2nas_jobs{{status="{label}"}} {row.count}')
+            total += row.count
+        lines.append("# HELP webvideo2nas_jobs_total Total jobs across all statuses.")
+        lines.append("# TYPE webvideo2nas_jobs_total gauge")
+        lines.append(f"webvideo2nas_jobs_total {total}")
+        db_up = 1
+    except Exception as e:
+        logger.error(f"/metrics DB query failed: {e}")
+        db_up = 0
+    lines.append("# HELP webvideo2nas_db_up 1 if the jobs DB is reachable.")
+    lines.append("# TYPE webvideo2nas_db_up gauge")
+    lines.append(f"webvideo2nas_db_up {db_up}")
+
+    try:
+        dl = redis_client.llen("download_queue")
+        bf = redis_client.llen("browser_finalize_queue")
+        lines.append("# HELP webvideo2nas_queue_length Pending items per queue.")
+        lines.append("# TYPE webvideo2nas_queue_length gauge")
+        lines.append(f'webvideo2nas_queue_length{{queue="download"}} {dl}')
+        lines.append(f'webvideo2nas_queue_length{{queue="browser_finalize"}} {bf}')
+        redis_up = 1
+    except Exception as e:
+        logger.error(f"/metrics redis query failed: {e}")
+        redis_up = 0
+    lines.append("# HELP webvideo2nas_redis_up 1 if Redis is reachable.")
+    lines.append("# TYPE webvideo2nas_redis_up gauge")
+    lines.append(f"webvideo2nas_redis_up {redis_up}")
+
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 # ---------------------------------------------------------------------------
 # v2.5 browser-side download endpoints
@@ -1235,6 +1300,27 @@ def init_browser_job(
     )
 
 
+def _refresh_upload_lease(db: Session, job_id: str) -> None:
+    """Stamp job_metadata.last_activity = now() for an accepted upload PUT.
+
+    Called at each upload endpoint's ENTRY so EVERY accepted PUT refreshes the
+    lease — including the idempotent 'already have this segment' early-return
+    and the init concurrent-loser paths, which return before the write. The
+    periodic stale-browser reaper ages browser_pending/uploading rows off
+    COALESCE(last_activity, created_at); without covering the early-returns a
+    client resuming near the 6h cutoff could keep getting idempotent 200s while
+    the reaper reaps the (still-active) job's staging. Best-effort — a lease
+    refresh failure must not fail the PUT.
+    """
+    try:
+        db.execute(text(
+            "UPDATE job_metadata SET last_activity = :now WHERE job_id = :id"
+        ), {"id": job_id, "now": _utcnow_naive()})
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 @app.put("/api/jobs/{job_id}/segments/{seq}")
 async def upload_segment(
     job_id: str,
@@ -1253,6 +1339,9 @@ async def upload_segment(
             status_code=409,
             detail=f"Job state {meta.status!r} doesn't accept segment uploads",
         )
+    # Refresh the activity lease for every accepted PUT (covers idempotent
+    # early-returns too — see _refresh_upload_lease).
+    _refresh_upload_lease(db, job_id)
     # Codex review #10: per-track bound is the strict check. The legacy
     # job-wide `total_segments` is a per-job sum (video+audio for DASH)
     # so without this an attacker / buggy client could PUT seq=2 on a
@@ -1691,7 +1780,9 @@ async def _stream_segment_to_disk(
         logger.error(f"Failed to stream segment {job_id}/{track}/{seq}: {e}")
         raise HTTPException(status_code=500, detail="Segment write failed")
 
-    # Flip status to 'browser_uploading' on first segment
+    # Flip status to 'browser_uploading' on first segment. (The activity lease
+    # is refreshed at the endpoint entry — see _refresh_upload_lease — so the
+    # idempotent early-return above is covered too.)
     if meta.status == "browser_pending":
         try:
             db.execute(text(
@@ -1720,6 +1811,9 @@ async def upload_init_segment(
         raise HTTPException(status_code=404, detail="Browser-mode job not found")
     if meta.status not in ("browser_pending", "browser_uploading"):
         raise HTTPException(status_code=409, detail=f"Job state {meta.status!r} doesn't accept init upload")
+    # Refresh the activity lease for every accepted PUT (covers the
+    # concurrent-loser early-returns too — see _refresh_upload_lease).
+    _refresh_upload_lease(db, job_id)
 
     target = _init_segment_path(job_id, track)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -2122,6 +2216,29 @@ def finalize_browser_job(
             # before reaching 'pending' (rpush failure or DB commit
             # failure). Resume from here — verify + rpush are idempotent.
             logger.info(f"Finalize {job_id}: resuming from browser_finalizing")
+            # Codex adversarial review: refresh finalize_started_at NOW, before
+            # the (slow) verify + rpush. The stale-browser reaper runs
+            # periodically and keys the browser_finalizing age check on
+            # finalize_started_at. Without this refresh, a job whose FIRST
+            # finalize started >6h ago keeps its stale timestamp on resume, so
+            # the reaper can flip it to 'failed' and rmtree the fully-staged
+            # dir out from under this resume (the worker's later CAS then skips
+            # it → the user loses a complete upload). Stamping a fresh
+            # timestamp here makes the reaper's `fsa < cutoff` predicate false,
+            # shrinking the race to this single commit.
+            try:
+                db.execute(text("""
+                    UPDATE job_metadata SET finalize_started_at = :now
+                    WHERE job_id = :id
+                """), {"id": job_id, "now": finalize_now})
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                logger.error(
+                    f"Finalize {job_id}: failed to refresh finalize_started_at "
+                    f"on resume: {e}"
+                )
+                raise HTTPException(status_code=500, detail=str(e))
         elif cur.status in ("pending", "processing", "completed"):
             # Already finalized successfully; idempotent return.
             logger.info(f"Finalize {job_id}: already at {cur.status!r}, idempotent return")

@@ -183,3 +183,56 @@ def test_health_endpoint_requires_auth_even_for_localhost(monkeypatch):
         # Wrong key → 401
         r = client.get("/api/health", headers={"Authorization": "Bearer wrong"})
         assert r.status_code == 401, r.text
+
+
+def test_metrics_endpoint_requires_auth_and_emits_prometheus(monkeypatch):
+    """/metrics needs the read API key and returns Prometheus text reflecting
+    real job counts by status and Redis queue depths."""
+    from unittest.mock import MagicMock
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine, text as sa_text
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    api_main = _reload_api_main(monkeypatch, API_KEY="test-key-not-the-default-placeholder")
+
+    # Shared in-memory DB (StaticPool) so the TestClient request thread sees
+    # the rows created here — same approach as the browser-jobs endpoint tests.
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    api_main.engine = engine
+    api_main.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with engine.begin() as conn:
+        conn.execute(sa_text("CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT)"))
+        conn.execute(sa_text(
+            "INSERT INTO jobs (id, status) VALUES "
+            "('a','completed'), ('b','completed'), ('c','downloading')"
+        ))
+
+    fake_redis = MagicMock()
+    fake_redis.llen.side_effect = lambda q: {"download_queue": 4, "browser_finalize_queue": 1}.get(q, 0)
+    api_main.redis_client = fake_redis
+
+    with TestClient(api_main.app) as client:
+        assert client.get("/metrics").status_code == 401  # no auth
+
+        r = client.get(
+            "/metrics",
+            headers={"Authorization": "Bearer test-key-not-the-default-placeholder"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"].startswith("text/plain")
+        body = r.text
+        assert "# TYPE webvideo2nas_up gauge" in body
+        assert "webvideo2nas_up 1" in body
+        assert 'webvideo2nas_jobs{status="completed"} 2' in body
+        assert 'webvideo2nas_jobs{status="downloading"} 1' in body
+        assert "webvideo2nas_jobs_total 3" in body
+        assert 'webvideo2nas_queue_length{queue="download"} 4' in body
+        assert 'webvideo2nas_queue_length{queue="browser_finalize"} 1' in body
+        assert "webvideo2nas_db_up 1" in body
+        assert "webvideo2nas_redis_up 1" in body

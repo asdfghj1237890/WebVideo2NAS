@@ -100,7 +100,6 @@ services:
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-postgres_password}@db:5432/video_db
       - REDIS_URL=redis://redis:6379/0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
       - MAX_DOWNLOAD_WORKERS=${MAX_DOWNLOAD_WORKERS:-10}
       - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
       - FFMPEG_THREADS=${FFMPEG_THREADS:-4}
@@ -142,7 +141,6 @@ services:
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-postgres_password}@db:5432/video_db
       - REDIS_URL=redis://redis:6379/0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
       - MAX_DOWNLOAD_WORKERS=${MAX_DOWNLOAD_WORKERS:-10}
       - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
       - FFMPEG_THREADS=${FFMPEG_THREADS:-4}
@@ -184,7 +182,6 @@ services:
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-postgres_password}@db:5432/video_db
       - REDIS_URL=redis://redis:6379/0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
       - MAX_DOWNLOAD_WORKERS=${MAX_DOWNLOAD_WORKERS:-10}
       - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
       - FFMPEG_THREADS=${FFMPEG_THREADS:-4}

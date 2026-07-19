@@ -3,6 +3,7 @@ Segment Downloader
 Multi-threaded downloader for m3u8 video segments
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from ssl_adapter import create_legacy_session, create_impersonated_session, tls_verify_enabled
 from shared.security import redacted_headers_for_log as _redacted_headers_for_log
+from shared.security import guarded_get
 
 # Cross-process per-host concurrency throttle. Optional — no-op when
 # HOST_CONCURRENCY_CAP env is unset. See host_throttle.py for rationale.
@@ -746,7 +748,8 @@ class SegmentDownloader:
             if host_overrides:
                 request_headers.update(host_overrides)
 
-        response = self.session.get(
+        response = guarded_get(
+            self.session,
             key_url,
             headers=request_headers,
             timeout=self.timeout,
@@ -769,20 +772,21 @@ class SegmentDownloader:
         except Exception:
             content_type = ''
         is_printable_ascii = all(0x20 <= b <= 0x7E for b in key)
+        # Never log the key itself (hex or decoded) — it is decryption material.
+        # A short SHA-256 fingerprint is enough to correlate/compare keys across
+        # logs, and the printable-ascii flag preserves the original diagnostic
+        # (spotting an endpoint that returns a hex/text string instead of bytes).
+        key_fp = hashlib.sha256(key).hexdigest()[:12]
         logger.info(
             f"Key fetched from {key_url.split('?', 1)[0]}: "
-            f"Content-Type={content_type!r}, len={len(key)}, hex={key.hex()}"
+            f"Content-Type={content_type!r}, len={len(key)}, "
+            f"sha256={key_fp}, printable_ascii={is_printable_ascii}"
         )
         if is_printable_ascii:
-            try:
-                as_text = key.decode('ascii', errors='replace')
-            except Exception:
-                as_text = repr(key)
             logger.warning(
-                f"AES-128 key looks like printable ASCII text "
-                f"({as_text!r}) — endpoint may be returning a hex string "
-                f"or other text instead of binary bytes. If decryption "
-                f"output looks wrong, check the key endpoint response."
+                "AES-128 key looks like printable ASCII text — the endpoint may "
+                "be returning a hex string or other text instead of binary bytes. "
+                "If decryption output looks wrong, check the key endpoint response."
             )
 
         with self._key_cache_lock:
@@ -1055,7 +1059,8 @@ class SegmentDownloader:
         slot_acquired = throttle.acquire(url) if throttle is not None else False
         try:
             try:
-                response = self.session.get(
+                response = guarded_get(
+                    self.session,
                     url,
                     headers=headers,
                     timeout=self.timeout,

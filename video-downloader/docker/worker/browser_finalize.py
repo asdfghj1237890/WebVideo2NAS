@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -41,6 +42,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 from ffmpeg_wrapper import merge_segments
 
 logger = logging.getLogger(__name__)
+
+# Free-space safety factor for the finalize preflight. The two-track DASH
+# flow transiently needs the staged segments + per-track concat blobs + the
+# mux output, so peak usage is a multiple of the staged size. 0 disables the
+# preflight.
+_MIN_FREE_DISK_MULTIPLIER = float(os.getenv("MIN_FREE_DISK_MULTIPLIER", "1.3"))
 
 
 class BrowserFinalizeError(RuntimeError):
@@ -105,6 +112,97 @@ def _segment_files(staging_dir: Path, track: str, expected_count: int) -> List[P
             f"expected {expected_count}"
         )
     return [by_seq[i] for i in range(expected_count)]
+
+
+def _estimate_staged_bytes(staging_dir: Path, tracks: Dict) -> int:
+    """Best-effort sum of on-disk staged segment + init bytes. Walks the track
+    dirs directly (not via _segment_files) so a count mismatch can't raise
+    here — this is only a size estimate for the preflight."""
+    total = 0
+    for track in ("video", "audio"):
+        if not tracks.get(track):
+            continue
+        track_dir = staging_dir / track
+        if not track_dir.is_dir():
+            continue
+        for seg in track_dir.glob("*.bin"):
+            try:
+                total += seg.stat().st_size
+            except OSError:
+                pass
+    init_dir = staging_dir / "init"
+    if init_dir.is_dir():
+        for init in init_dir.glob("*.bin"):
+            try:
+                total += init.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _same_device(a: Path, b: Path) -> bool:
+    """Whether two paths live on the same filesystem/device. On error, assume
+    same — that makes the preflight sum both transients (the stricter check)."""
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return True
+
+
+def _preflight_disk_space(staging_dir: Path, output_path: Path, tracks: Dict,
+                          container: str = "") -> None:
+    """Fail fast, before the expensive concat + mux, if a volume lacks room for
+    the transient blobs plus the final file. A clean early error beats an ENOSPC
+    deep inside ffmpeg that leaves partial artifacts. No-op when the size is
+    unknown or the factor is 0.
+
+    Worst case is two-track DASH: it byte-concats each track into a blob in
+    *staging* (~staged bytes total) AND muxes an output near *output_path*
+    (~staged bytes). When staging and output share one filesystem those
+    transients coexist, so the volume needs ~2x staged — not 1.3x. Single-track
+    streams straight to the output with no separate staging blob.
+    """
+    if _MIN_FREE_DISK_MULTIPLIER <= 0:
+        return
+    staged = _estimate_staged_bytes(staging_dir, tracks)
+    if staged <= 0:
+        return  # unknown size — don't block the job on a guess
+
+    two_track = container == "dash" and bool(tracks.get("audio"))
+    staging_need = staged if two_track else 0   # per-track concat blobs in staging
+    output_need = staged                         # mux / merged output near output_path
+    output_dir = output_path.parent
+
+    if _same_device(staging_dir, output_dir):
+        # Both transients land on one filesystem → they must fit together.
+        need = int((staging_need + output_need) * _MIN_FREE_DISK_MULTIPLIER)
+        try:
+            free = shutil.disk_usage(str(staging_dir)).free
+        except OSError:
+            return  # can't stat; don't fail the job on the preflight itself
+        if free < need:
+            raise BrowserFinalizeError(
+                f"Insufficient free space on shared staging+output volume: need "
+                f"~{need} bytes (staged {staged}, two_track={two_track}), free {free}"
+            )
+        return
+
+    # Separate volumes: check each against its own transient requirement.
+    for label, path, base in (
+        ("staging", staging_dir, staging_need),
+        ("output", output_dir, output_need),
+    ):
+        if base <= 0:
+            continue
+        try:
+            free = shutil.disk_usage(str(path)).free
+        except OSError:
+            continue
+        if free < int(base * _MIN_FREE_DISK_MULTIPLIER):
+            raise BrowserFinalizeError(
+                f"Insufficient free space on {label} volume: need "
+                f"~{int(base * _MIN_FREE_DISK_MULTIPLIER)} bytes (staged {staged}), free {free}"
+            )
 
 
 def _byte_concat(files: List[Path], output: Path, init_segment: Optional[Path] = None,
@@ -288,6 +386,10 @@ def finalize(staging_dir: Path, output_path: Path, plan: Optional[Dict] = None,
         raise BrowserFinalizeError("plan has no video track")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Fail fast if there isn't room for the concat blobs + mux output, rather
+    # than crashing with ENOSPC part-way through and leaving artifacts behind.
+    _preflight_disk_space(staging_dir, output_path, tracks, container=container)
 
     temp_path = _resolve_partial_path(staging_dir, output_path)
     # Up-front cleanup of any leftover from a same-job prior attempt

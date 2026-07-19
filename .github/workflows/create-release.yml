@@ -64,6 +64,8 @@ jobs:
         with:
           context: video-downloader/docker
           file: video-downloader/docker/Dockerfile
+          build-args: |
+            APP_VERSION=${{ github.ref_name }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

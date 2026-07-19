@@ -391,6 +391,12 @@ RATE_LIMIT_PER_MINUTE=10
 
 ## 7. Monitoring & Logging
 
+> This section is **design intent**. For what is actually wired up today, see
+> [ARCHITECTURE.md §10](ARCHITECTURE.md#10-monitoring--observability) — the
+> current reality is plain-text logs (not JSON), a `/api/health` + `/api/status`
+> pair, and no metrics endpoint or automatic log rotation. The items below are
+> the target shape, not shipped behaviour.
+
 ### 7.1 Metrics to Track
 - Active downloads count
 - Success/failure rate
@@ -402,8 +408,8 @@ RATE_LIMIT_PER_MINUTE=10
 - **API**: Request/response logs (INFO level)
 - **Worker**: NAS-direct download progress, browser-side mux/finalize, errors (DEBUG level)
 - **Extension**: Browser-side upload progress lives in side panel state and is not persisted server-side during upload
-- **Storage**: Rotate logs daily, keep 30 days
-- **Format**: JSON structured logging
+- **Storage**: Rotate logs daily, keep 30 days *(intended; not implemented — no built-in rotation today)*
+- **Format**: structured JSON *(intended; the current format is plain text `%(asctime)s - %(name)s - %(levelname)s - %(message)s`, see ARCHITECTURE.md §10)*
 
 ---
 

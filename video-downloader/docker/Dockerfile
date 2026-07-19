@@ -48,6 +48,14 @@ COPY shared/ ./shared/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Version stamped into the image at build time. The release workflow passes
+# --build-arg APP_VERSION=<tag>; local/dev builds default to "dev". Both the
+# API (FastAPI version + root response) and the worker (startup banner) read
+# APP_VERSION so there is a single source of truth instead of hardcoded
+# strings that drift out of date.
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 # Non-root user (matches Synology default uid:gid).
 RUN useradd -m -u 1026 appuser && chown -R appuser:appuser /app
 USER appuser

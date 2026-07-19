@@ -33,6 +33,13 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
 SSRF_GUARD_ENABLED = os.getenv("SSRF_GUARD", "false").strip().lower() in ("1", "true", "yes", "y", "on")
+# How often the background reaper thread re-sweeps stale browser-job staging
+# dirs (heartbeat-protected, so it can't touch a live job). The zombie reaper
+# is startup-only and deliberately not on this timer — see _run_periodic_reapers.
+# Both reapers still run once at startup; this periodic sweep bounds the window
+# in which abandoned browser staging leaks disk between restarts.
+# 0 disables the periodic sweep (startup-only, legacy behavior).
+REAPER_INTERVAL_SECONDS = int(os.getenv("REAPER_INTERVAL_SECONDS", "900"))
 
 
 def _utcnow_naive() -> datetime:
@@ -299,6 +306,34 @@ class DownloadWorker:
     
     def __init__(self):
         self.db = SessionLocal()
+        # Path most-recently reserved via _reserve_output_path for the job in
+        # flight. _reserve_output_path creates a 0-byte placeholder before any
+        # network I/O; if the download fails/cancels before writing real bytes,
+        # process_job's finally deletes the empty placeholder so retries don't
+        # accumulate Title (1).mp4, Title (2).mp4, ... empties.
+        self._current_reservation: Optional[str] = None
+
+    def _track_reservation(self, output_file: str) -> None:
+        """Record a freshly-reserved output path. If a prior reservation is
+        still an empty placeholder (e.g. the MPD-native path reserved, then
+        fell back to the ffmpeg path which reserves again), drop it now so it
+        doesn't orphan."""
+        self._discard_empty_reservation()
+        self._current_reservation = output_file
+
+    def _discard_empty_reservation(self) -> None:
+        """Delete the tracked reservation iff it's still a 0-byte placeholder,
+        then forget it. A non-empty file (a completed download, or a partial —
+        the M3 case, handled separately) is left untouched."""
+        path = self._current_reservation
+        self._current_reservation = None
+        if not path:
+            return
+        try:
+            if os.path.exists(path) and os.path.getsize(path) == 0:
+                os.unlink(path)
+        except OSError:
+            pass
 
     @staticmethod
     def _probe_duration_float(file_path: str):
@@ -645,14 +680,21 @@ class DownloadWorker:
         format_hint = (job.get('headers') or {}).get('X-WV2NAS-Format', '').lower()
         job_kind = classify_job_kind(job["url"], format_hint)
 
-        if job_kind is JobKind.DIRECT:
-            logger.info(f"Detected as direct download: {job['url'][:100]}...")
-            self._process_direct_download(job_id, job)
-        elif job_kind is JobKind.MPD:
-            logger.info(f"Detected as DASH stream (MPD){' (via format hint)' if format_hint == 'mpd' else ''}: {job['url'][:100]}...")
-            self._process_mpd_download(job_id, job)
-        else:
-            self._process_m3u8_download(job_id, job)
+        # Fresh reservation state per job; the finally deletes the reserved
+        # output if the job left it a 0-byte placeholder (failed/cancelled
+        # before writing any bytes) so retries don't accumulate empty files.
+        self._current_reservation = None
+        try:
+            if job_kind is JobKind.DIRECT:
+                logger.info(f"Detected as direct download: {job['url'][:100]}...")
+                self._process_direct_download(job_id, job)
+            elif job_kind is JobKind.MPD:
+                logger.info(f"Detected as DASH stream (MPD){' (via format hint)' if format_hint == 'mpd' else ''}: {job['url'][:100]}...")
+                self._process_mpd_download(job_id, job)
+            else:
+                self._process_m3u8_download(job_id, job)
+        finally:
+            self._discard_empty_reservation()
     
     def _process_mpd_download(self, job_id: str, job: dict):
         """Process DASH/MPD stream download.
@@ -844,7 +886,7 @@ class DownloadWorker:
                 segments=video['segments'],
                 output_dir=video_dir,
                 headers=headers,
-                max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 2)),
+                max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 10)),
                 m3u8_url=job['url'],
                 session=shared_session,
             )
@@ -895,7 +937,7 @@ class DownloadWorker:
                     segments=audio['segments'],
                     output_dir=audio_dir,
                     headers=headers,
-                    max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 2)),
+                    max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 10)),
                     m3u8_url=job['url'],
                     session=shared_session,
                 )
@@ -936,12 +978,12 @@ class DownloadWorker:
             output_dir = resolve_output_dir(job.get('output_subdir'))
             output_dir.mkdir(parents=True, exist_ok=True)
             base_name = safe_title
-            output_file = output_dir / f"{base_name}.mp4"
-            counter = 1
-            while output_file.exists():
-                output_file = output_dir / f"{base_name} ({counter}).mp4"
-                counter += 1
-            output_file = str(output_file)
+            # Atomic O_CREAT|O_EXCL reservation, shared with browser-finalize,
+            # replacing the exists()-then-write TOCTOU: two workers whose titles
+            # collapse to the same stem could both observe the name as free and
+            # one would silently overwrite the other's finished file.
+            output_file = str(_reserve_output_path(output_dir, base_name))
+            self._track_reservation(output_file)
 
             # Codex review #9: cancellation polling between long-running
             # steps. The old MPD path polled cancellation while ffmpeg was
@@ -1167,14 +1209,10 @@ class DownloadWorker:
                 out_ext = 'mp4'
 
             base_name = safe_title
-            output_file = output_dir / f"{base_name}.{out_ext}"
-            counter = 1
-
-            while output_file.exists():
-                output_file = output_dir / f"{base_name} ({counter}).{out_ext}"
-                counter += 1
-
-            output_file = str(output_file)
+            # Atomic reservation (see _reserve_output_path) instead of the racy
+            # exists()-then-write loop; honors the .mov/.mp4 extension choice.
+            output_file = str(_reserve_output_path(output_dir, base_name, f".{out_ext}"))
+            self._track_reservation(output_file)
 
             # Stream download with progress (using legacy SSL for compatibility)
             session = create_legacy_session()
@@ -1408,13 +1446,15 @@ class DownloadWorker:
                                     p.unlink()
                             except Exception:
                                 pass
-                        # Clean up partial output
-                        try:
-                            if Path(output_file).exists():
-                                Path(output_file).unlink()
-                        except Exception:
-                            pass
-
+                        # Do NOT unlink output_file here. It is this job's
+                        # O_CREAT|O_EXCL-reserved name (see _reserve_output_path).
+                        # Releasing it would let another worker reserve the same
+                        # name during the fallback and both jobs would then write
+                        # the same path — content interleave / overwrite (Codex
+                        # adversarial review). The single-stream fallback opens
+                        # output_file with "wb", truncating any partial range
+                        # bytes in place, so the reservation stays owned
+                        # end-to-end and no second worker can claim it.
                         ok = _single_stream_download()
                         if not ok:
                             return
@@ -1500,12 +1540,10 @@ class DownloadWorker:
         output_dir = resolve_output_dir(job.get('output_subdir'))
         output_dir.mkdir(parents=True, exist_ok=True)
         base_name = safe_title
-        output_file = output_dir / f"{base_name}.mp4"
-        counter = 1
-        while output_file.exists():
-            output_file = output_dir / f"{base_name} ({counter}).mp4"
-            counter += 1
-        output_file = str(output_file)
+        # Atomic reservation (see _reserve_output_path) instead of the racy
+        # exists()-then-write loop shared by every download path.
+        output_file = str(_reserve_output_path(output_dir, base_name))
+        self._track_reservation(output_file)
 
         # Probe duration for progress display
         total_duration = None
@@ -1902,7 +1940,7 @@ class DownloadWorker:
                 segments=playlist_info['segments'],
                 output_dir=temp_dir,
                 headers=segment_headers,
-                max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 2)),
+                max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 10)),
                 # Per-segment keys/IVs are included in segment metadata now.
                 encryption_key=None,
                 encryption_iv=None,
@@ -2068,14 +2106,10 @@ class DownloadWorker:
             logger.info(f"Output directory: {output_dir}")
 
             base_name = safe_title
-            output_file = output_dir / f"{base_name}.mp4"
-            counter = 1
-
-            while output_file.exists():
-                output_file = output_dir / f"{base_name} ({counter}).mp4"
-                counter += 1
-
-            output_file = str(output_file)
+            # Atomic reservation (see _reserve_output_path) instead of the racy
+            # exists()-then-write loop shared by every download path.
+            output_file = str(_reserve_output_path(output_dir, base_name))
+            self._track_reservation(output_file)
 
             # Merge segments. Hard-cap output to the m3u8's declared total so anti-leech
             # streams (whose .ts files pad past EXTINF) don't bloat the merged file.
@@ -2491,11 +2525,34 @@ def _ensure_schema() -> None:
             conn.execute(text(
                 "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS suspect_reason TEXT"
             ))
+            # v2.5 browser-side columns. These are NOT in init-db.sql and are
+            # created only here / in api/main.py's _ensure_schema. The worker's
+            # own browser-finalize path SELECTs mode/total_segments/staging_dir
+            # (see the browser-finalize claim query), so if a worker boots on a
+            # fresh DB before the API has run, it must create them itself —
+            # otherwise that SELECT fails. Previously these three were missing
+            # here despite the "parity" comment below.
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS mode TEXT"
+            ))
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS total_segments INTEGER"
+            ))
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS staging_dir TEXT"
+            ))
             # Codex review #16: keep schema parity with api/main.py
             # _ensure_schema. Worker reads finalize_started_at in the
             # stale-browser reaper.
             conn.execute(text(
                 "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS finalize_started_at TIMESTAMP"
+            ))
+            # Codex adversarial review: upload activity lease. Refreshed by the
+            # API on every segment/init PUT; the stale-browser reaper ages
+            # browser_pending/uploading rows off COALESCE(last_activity,
+            # created_at) so a slow-but-progressing upload isn't reaped.
+            conn.execute(text(
+                "ALTER TABLE job_metadata ADD COLUMN IF NOT EXISTS last_activity TIMESTAMP"
             ))
     except Exception as e:
         logger.warning(f"Schema migration skipped: {e}")
@@ -2795,14 +2852,18 @@ def _reap_stale_browser_jobs() -> None:
             sql = f"""
                 UPDATE jobs
                 SET status = 'failed',
-                    error_message = 'Stale browser job reaped at startup (>6h pre-finalize)',
+                    error_message = 'Stale browser job reaped (>6h inactive)',
                     completed_at = :now
                 FROM job_metadata jm
                 WHERE jm.job_id = jobs.id
                   AND jm.mode = 'browser'
                   AND (
+                    -- Uploading jobs: age off last_activity, refreshed on every
+                    -- segment/init PUT, so a slow-but-progressing upload keeps a
+                    -- fresh lease and is NOT reaped (Codex adversarial review).
+                    -- Falls back to created_at for a job that never uploaded.
                     (jobs.status IN ('browser_pending', 'browser_uploading')
-                     AND jobs.created_at < :cutoff)
+                     AND COALESCE(jm.last_activity, jobs.created_at) < :cutoff)
                     OR
                     (jobs.status = 'browser_finalizing'
                      AND COALESCE(jm.finalize_started_at, jobs.created_at) < :cutoff
@@ -2845,11 +2906,41 @@ def _reap_stale_browser_jobs() -> None:
         logger.warning(f"Stale browser-job reaper skipped: {e}")
 
 
+def _run_periodic_reapers(interval_seconds: int) -> None:
+    """Background loop that periodically re-runs the stale-BROWSER-job reaper.
+
+    Only the browser reaper runs on this timer: it excludes rows with a live
+    heartbeat, so it cannot reclaim an in-flight job, and it addresses the real
+    motivation here — bounding the window in which abandoned browser staging
+    dirs leak disk between worker restarts.
+
+    The zombie reaper (`_reap_zombie_jobs`) is intentionally NOT run here. It
+    classifies a job as dead purely on `started_at` age, and non-browser
+    downloads (direct / HLS / MPD) emit no heartbeat, so a legitimately long
+    (>2h) download would be marked `failed` mid-flight — and the completion
+    path allows failed→completed, so a user retry in that window can yield
+    duplicate downloads. It stays startup-only until every claimed job carries
+    a lease/heartbeat the reaper can check. Daemon thread; exits on shutdown.
+    """
+    while not shutdown_flag:
+        # Sleep in 1s steps so SIGTERM doesn't wait out a full interval.
+        for _ in range(max(1, interval_seconds)):
+            if shutdown_flag:
+                return
+            time.sleep(1)
+        if shutdown_flag:
+            return
+        try:
+            _reap_stale_browser_jobs()
+        except Exception as e:
+            logger.warning(f"Periodic stale-browser reap failed: {e}")
+
+
 def main():
     """Main entry point"""
     logger.info("="*50)
     logger.info("WebVideo2NAS Worker")
-    logger.info("Version: 1.11.1")
+    logger.info(f"Version: {os.getenv('APP_VERSION', 'dev')}")
     logger.info("="*50)
 
     # Wait for database to be ready
@@ -2919,6 +3010,19 @@ def main():
             "set HOST_CONCURRENCY_OVERRIDES=phncdn.com:6 (or similar) in "
             ".env. See .env.example for details."
         )
+
+    # Start the periodic reaper sweep (daemon: never blocks shutdown). The
+    # startup reapers above already ran once; this bounds the leak window
+    # between restarts. Disabled when REAPER_INTERVAL_SECONDS=0.
+    if REAPER_INTERVAL_SECONDS > 0:
+        reaper_thread = threading.Thread(
+            target=_run_periodic_reapers,
+            args=(REAPER_INTERVAL_SECONDS,),
+            name="periodic-reaper",
+            daemon=True,
+        )
+        reaper_thread.start()
+        logger.info(f"Periodic reaper sweep started (every {REAPER_INTERVAL_SECONDS}s)")
 
     # Start worker
     worker = DownloadWorker()

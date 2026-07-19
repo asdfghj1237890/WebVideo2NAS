@@ -257,7 +257,7 @@ byte-concat 主路徑萬一失敗，會自動 fallback 到 `merge_with_re_encode
 | `tests/test_ffmpeg_wrapper.py` | 純 `subprocess.Popen` mock，只驗 command flags 對不對。沒跑真 ffmpeg、沒 fixture .ts 檔案。一直停在 stub level |
 | `tests/test_m3u8_parser.py` | 只驗 m3u8 → segments 的 parse，不到 download，更不到 merge |
 | `tests/test_downloader_edge_cases.py` | 只驗 segment 下載 + 解密的 edge cases（anti-hotlink 偵測、TS sync byte、IV strategies），停在 segment 層 |
-| chrome-extension vitest (13 tests) | 跟 worker 路徑無關，看不到 |
+| chrome-extension vitest | 跟 worker 路徑無關，看不到 |
 | 真機部署 | 理論上 SUSPECT heuristic（`actual_duration < declared * 0.85` → flag）會旗，但這是**事後** flag 不是攔截——使用者下載完才看到 |
 
 關鍵點：整個 worker test suite **沒有任何 end-to-end 測試**會餵真實 .ts segments 進真實 ffmpeg、再 ffprobe output 看 duration。整個 ffmpeg merge step 都是用 Popen mock 驗 command-line flag，merge 內部行為從來沒被測過。

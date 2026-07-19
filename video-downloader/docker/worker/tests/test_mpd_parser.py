@@ -98,6 +98,28 @@ def test_template_substitutes_time():
     assert out == "chunk-12345.m4s"
 
 
+def test_template_clamps_hostile_number_pad_width():
+    """A malicious manifest must not be able to allocate a huge string via an
+    enormous zero-pad width (OOM DoS). The width is clamped; the value is
+    never truncated."""
+    out = _substitute_template(
+        "seg-$Number%9999999999d$.m4s",
+        representation_id="x", bandwidth=0, number=5,
+    )
+    # Padded to the clamp width (20), NOT ~10GB, and the digit is preserved.
+    assert len(out) < 100
+    assert out == "seg-" + "5".rjust(20) + ".m4s"
+
+
+def test_template_clamps_hostile_time_pad_width():
+    out = _substitute_template(
+        "chunk-$Time%2000000000d$.m4s",
+        representation_id="x", bandwidth=0, time_value=7,
+    )
+    assert len(out) < 100
+    assert out.endswith("7.m4s")
+
+
 # --- parse_mpd: structure rejection ------------------------------------
 
 

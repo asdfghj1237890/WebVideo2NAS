@@ -9,6 +9,7 @@ from typing import List, Dict, Optional
 import m3u8
 import urllib3
 from shared.ssl import create_legacy_session, tls_verify_enabled
+from shared.security import guarded_get
 
 if not tls_verify_enabled():
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -137,7 +138,11 @@ class M3U8Parser:
 
             # NOTE: Use non-streaming reads for compatibility across session backends
             # (requests vs curl_cffi BrowserSession). m3u8 playlists should be small.
-            response = self.session.get(
+            # guarded_get re-validates the host on every redirect hop when the
+            # SSRF guard is enabled (a master playlist and its variant URLs come
+            # from untrusted manifest text); it is a plain pass-through otherwise.
+            response = guarded_get(
+                self.session,
                 self.url,
                 headers=self.headers,
                 timeout=30,

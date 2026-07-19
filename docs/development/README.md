@@ -2,6 +2,8 @@
 
 這份是給想動 WebVideo2NAS 程式碼的人看的內部文件。如果你只是要把 chrome extension 載到 Chrome、把 worker 跑到 NAS 上用，請看根目錄 [README](../../README.md)。這裡是寫程式 / 修 bug / 改架構用的。
 
+> 想要 API 契約、DB schema、整體架構的 **canonical 使用者參考**（非實作細節），看 [docs/ 文件索引](../README.md) → `ARCHITECTURE.md` / `SPECIFICATION.md` / `PRIVACY_SECURITY.md`。本 development/ 各章講的是「怎麼實作 / 為什麼這樣寫」，同一主題以 docs/ 那份為準，不要在兩邊各寫一份會 drift 的規格。
+
 ## 怎麼安排這份教學
 
 | # | 章節 | 你會學到 | 預估時間 |

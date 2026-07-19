@@ -349,7 +349,7 @@ Browser Finalize Function
 │ completed_at │ TIMESTAMP    │ Completion time               │
 │ file_size    │ BIGINT       │ File size in bytes            │
 │ file_path    │ TEXT         │ Path to completed file        │
-│ error_msg    │ TEXT         │ Error message if failed       │
+│ error_message│ TEXT         │ Error message if failed       │
 │ retry_count  │ INTEGER      │ Number of retry attempts      │
 └──────────────┴──────────────┴──────────────────────────────┘
 

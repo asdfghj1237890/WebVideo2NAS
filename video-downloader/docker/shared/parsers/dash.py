@@ -225,6 +225,32 @@ def _resolve_base_url(parents: List[ET.Element], manifest_url: str) -> str:
     return base
 
 
+# A hostile manifest can request an enormous zero-pad width, e.g.
+# media="seg$Number%9999999999d$.m4s". Python then evaluates
+# `"%9999999999d" % n`, allocating a multi-gigabyte string on the very
+# first segment (OOM DoS). MAX_SEGMENTS caps the segment *count*, not the
+# width of a single substitution, so we clamp the width here. 20 digits
+# covers any legitimate uint64 value without truncation; real manifests
+# never pad beyond a handful of digits.
+_MAX_TEMPLATE_PAD_WIDTH = 20
+
+
+def _apply_index_spec(spec: str, value: int) -> str:
+    """Expand a `$Number$`/`$Time$` printf spec with a clamped pad width.
+
+    ``spec`` is regex-guaranteed to look like ``%<digits>d`` (possibly
+    ``%d`` with no digits). We re-parse the width and cap it so a malicious
+    width cannot blow up memory, while preserving legitimate zero-padding.
+    """
+    digits = spec[1:-1]  # strip leading '%' and trailing 'd'
+    if not digits:
+        return spec % value  # bare "%d"
+    zero_pad = digits.startswith('0')
+    width = min(int(digits), _MAX_TEMPLATE_PAD_WIDTH)
+    clamped = f"%{'0' if zero_pad else ''}{width}d"
+    return clamped % value
+
+
 def _substitute_template(
     template: str, *, representation_id: str, bandwidth: int,
     number: Optional[int] = None, time_value: Optional[int] = None,
@@ -243,8 +269,8 @@ def _substitute_template(
         if number is None:
             return match.group(0)  # leave as-is if no value (programmer error)
         if spec:
-            # spec includes leading %, e.g. "%05d"
-            return spec % number
+            # spec includes leading %, e.g. "%05d"; width is clamped
+            return _apply_index_spec(spec, number)
         return str(number)
 
     out = re.sub(r'\$Number(%[0-9]*d)?\$', _sub_number, out)
@@ -254,7 +280,7 @@ def _substitute_template(
         if time_value is None:
             return match.group(0)
         if spec:
-            return spec % time_value
+            return _apply_index_spec(spec, time_value)
         return str(time_value)
 
     out = re.sub(r'\$Time(%[0-9]*d)?\$', _sub_time, out)
