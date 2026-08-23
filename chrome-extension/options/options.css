@@ -662,3 +662,144 @@ input:focus-visible, select:focus-visible { outline: none; }
 }
 
 .fade-up { animation: oFadeUp 240ms ease-out; }
+
+/* ==== 1080p desktop spacing ====
+   The options page is usually opened as a full browser tab. At desktop
+   dimensions, use the available canvas for more legible rows and controls;
+   the compact editor layout above remains intact on smaller windows. */
+@media (min-width: 1280px) and (min-height: 800px) {
+  html, body {
+    font-size: 17px;
+    line-height: 1.7;
+  }
+
+  .title-bar {
+    gap: 12px;
+    padding: 12px 20px;
+  }
+  .win-dots { gap: 8px; }
+  .win-dots span { width: 12px; height: 12px; }
+  .title-bar .filename { font-size: 14px; }
+  .theme-toggle {
+    width: 38px;
+    height: 38px;
+    border-radius: 8px;
+  }
+
+  .body { grid-template-columns: 300px minmax(0, 1fr); }
+  .brand-row {
+    gap: 13px;
+    padding: 22px 20px 17px;
+  }
+  .brand-mark {
+    width: 38px;
+    height: 38px;
+    border-radius: 8px;
+  }
+  .brand-text .name { font-size: 20px; }
+  .brand-text .ver { margin-top: 4px; font-size: 14px; }
+  .sidebar-section-label {
+    padding: 12px 20px 8px;
+    font-size: 13px;
+  }
+  .nav {
+    gap: 4px;
+    padding: 0 12px;
+  }
+  .nav-item {
+    gap: 11px;
+    min-height: 46px;
+    padding: 10px 13px;
+    border-radius: 7px;
+    font-size: 16px;
+  }
+  .nav-item .nav-count {
+    height: 21px;
+    min-width: 21px;
+    font-size: 12px;
+  }
+  .sidebar-footer { padding: 14px 18px 18px; }
+  .sidebar-footer .label { margin-bottom: 9px; font-size: 13px; }
+  .sidebar-footer .nas-name { margin-top: 7px; font-size: 13px; }
+  .ping-row { gap: 9px; font-size: 14px; }
+
+  .gutter {
+    width: 64px;
+    padding: 24px 0;
+    font-size: 15px;
+  }
+  .gutter > div {
+    height: 32px;
+    padding-right: 13px;
+  }
+  .editor {
+    padding: 24px 48px 40px 28px;
+    font-size: 17px;
+    line-height: 32px;
+  }
+  .editor > .pane { max-width: 1180px; }
+  .line,
+  .comment,
+  .section-head,
+  .spacer,
+  .kv,
+  .profile-head { height: 32px; }
+  .section-head { gap: 12px; }
+  .kv {
+    gap: 14px;
+    padding-left: 14px;
+  }
+  .kv .key { width: 196px; }
+  .kv .comment-inline { margin-left: 7px; }
+  .kv-edit .input {
+    min-width: 90px;
+    font-size: 17px;
+    line-height: 30px;
+  }
+  .inline-btn {
+    gap: 7px;
+    min-height: 30px;
+    padding: 4px 12px;
+    border-radius: 5px;
+    font-size: 14px;
+  }
+  .toggle-btn,
+  .toml-select { font-size: 17px; }
+  .toml-select {
+    min-height: 30px;
+    padding: 2px 30px 2px 11px;
+  }
+  .profile-block { margin-bottom: 24px; }
+  .profile-head { gap: 14px; font-size: 16px; }
+  .profile-head .actions { gap: 7px; }
+  .btn-link {
+    gap: 9px;
+    min-height: 36px;
+    padding: 7px 14px;
+    font-size: 14px;
+  }
+
+  .hidden-mode-table-wrap {
+    margin-top: 12px;
+    border-radius: 8px;
+  }
+  .hidden-mode-table { font-size: 13px; }
+  .hidden-mode-table thead th { padding: 10px 14px; }
+  .hidden-mode-table tbody td { padding: 10px 14px; }
+  .hidden-mode-table tr.empty-row td { padding: 28px 14px; }
+
+  .status-bar {
+    gap: 18px;
+    min-height: 52px;
+    padding: 10px 20px;
+    font-size: 13px;
+  }
+  .status-toast { padding: 3px 9px; font-size: 13px; }
+  .cmd-btn {
+    gap: 7px;
+    min-height: 34px;
+    padding: 7px 17px;
+    border-radius: 6px;
+    font-size: 14px;
+  }
+}

@@ -91,6 +91,7 @@ describe('background.js pure helpers', () => {
     // false positives
     expect(ctx.isCandidateVideoUrl('https://a/b/preview_720p.mp4.jpg')).toBe(false);
     expect(ctx.isCandidateVideoUrl('https://a/b/playlist.m3u8.png')).toBe(false);
+    expect(ctx.isCandidateVideoUrl('https://a/b/token/playlist.m3u8/key_b5000000.m3u8key')).toBe(false);
     expect(ctx.isCandidateVideoUrl('https://a/b/app.js?video=1.mp4')).toBe(false);
     expect(ctx.isCandidateVideoUrl('https://a/b/preview.mov.jpg')).toBe(false);
   });
@@ -113,6 +114,80 @@ describe('background.js pure helpers', () => {
       .toBeNull();
     expect(ctx.inferHlsManifestFromSegmentUrl('https://cdn.example.com/hls/random.ts?x=1'))
       .toBeNull();
+  });
+
+  it('infers bitrate chunklists while preserving path-embedded auth tokens', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+
+    const segment = 'https://cdn.example.com/video/1080p/hdntl=exp%3D999~hmac%3Dabc/media_b5000000_324.ts';
+    expect(ctx.inferHlsManifestFromSegmentUrl(segment)).toEqual({
+      url: 'https://cdn.example.com/video/1080p/hdntl=exp%3D999~hmac%3Dabc/chunklist_b5000000.m3u8',
+      dedupeKey: 'https://cdn.example.com/video/1080p/hdntl=exp%3D999~hmac%3Dabc/chunklist_b5000000.m3u8',
+    });
+  });
+
+  it('marks the closest observed HLS manifest as played for unknown segment names', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+
+    const now = 4_000_000;
+    withFixedNow(ctx, now);
+    ctx.__eval(`currentTabUrls[7] = [
+      {
+        url: 'https://cdn.example.com/video/master.m3u8',
+        detectedFormat: 'm3u8',
+        timestamp: 10
+      },
+      {
+        url: 'https://cdn.example.com/video/1080p/token/chunklist.m3u8',
+        detectedFormat: 'm3u8',
+        timestamp: 20
+      },
+      {
+        url: 'https://other.example/video/1080p/token/chunklist.m3u8',
+        detectedFormat: 'm3u8',
+        timestamp: 30
+      }
+    ]`);
+
+    const marked = ctx.markExistingHlsPlaybackFromSegment({
+      tabId: 7,
+      url: 'https://cdn.example.com/video/1080p/token/part-0042.ts',
+    });
+    expect(marked.url).toBe('https://cdn.example.com/video/1080p/token/chunklist.m3u8');
+    expect(marked.playbackObserved).toBe(true);
+    expect(marked.lastSegmentAt).toBe(now);
+
+    const rows = ctx.__eval('currentTabUrls[7]');
+    expect(rows[0].playbackObserved).not.toBe(true);
+    expect(rows[1].playbackObserved).toBe(true);
+    expect(rows[2].playbackObserved).not.toBe(true);
+  });
+
+  it('does not treat unrelated files as HLS playback evidence', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    ctx.__eval(`currentTabUrls[7] = [{
+      url: 'https://cdn.example.com/video/chunklist.m3u8',
+      detectedFormat: 'm3u8'
+    }]`);
+
+    expect(ctx.markExistingHlsPlaybackFromSegment({
+      tabId: 7,
+      url: 'https://cdn.example.com/video/app.js',
+    })).toBeNull();
+    expect(ctx.markExistingHlsPlaybackFromSegment({
+      tabId: 7,
+      url: 'https://other.example/video/part-1.ts',
+    })).toBeNull();
+    expect(ctx.__eval('currentTabUrls[7][0].playbackObserved')).not.toBe(true);
   });
 
   it('dedupes inferred HLS manifests by stable playlist key while keeping the latest token', () => {
@@ -253,6 +328,97 @@ describe('background.js pure helpers', () => {
     expect(sorted[0].url).toContain('high.mp4');
     expect(sorted[0].isNowPlaying).toBe(false);
     expect(sorted[1].isNowPlaying).toBe(false);
+  });
+
+  it('marks only the freshest recently requested HLS rendition as now playing', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+    });
+    const now = 5_000_000;
+    withFixedNow(ctx, now);
+    const tabId = 124;
+    ctx.__eval(`currentTabUrls[${tabId}] = ${JSON.stringify([
+      {
+        url: 'https://cdn.example.com/v/720/chunklist.m3u8',
+        timestamp: now - 5_000,
+        lastSegmentAt: now - 8_000,
+        playbackObserved: true,
+      },
+      {
+        url: 'https://cdn.example.com/v/1080/chunklist.m3u8',
+        timestamp: now - 2_000,
+        lastSegmentAt: now - 1_000,
+        playbackObserved: true,
+      },
+      {
+        url: 'https://cdn.example.com/v/old/chunklist.m3u8',
+        timestamp: now - 60_000,
+        lastSegmentAt: now - 30_001,
+        playbackObserved: true,
+      },
+    ])};`);
+
+    const sorted = ctx.getSortedUrlsForTab(tabId);
+    expect(sorted.find(x => x.url.includes('/1080/')).isNowPlaying).toBe(true);
+    expect(sorted.find(x => x.url.includes('/720/')).isNowPlaying).toBe(false);
+    expect(sorted.find(x => x.url.includes('/old/')).isNowPlaying).toBe(false);
+  });
+
+  it('does not resurrect a stale/ad manifest after the player pauses', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+    });
+    const now = 5_100_000;
+    withFixedNow(ctx, now);
+    const tabId = 125;
+
+    ctx.__eval(`currentTabUrls[${tabId}] = ${JSON.stringify([
+      {
+        url: 'https://cdn.example.com/ad/welcome/playlist.m3u8',
+        timestamp: now - 60_000,
+        lastSegmentAt: now - 2_000,
+        playbackObserved: true,
+      },
+      {
+        url: 'https://cdn.example.com/episode/1080/chunklist.m3u8',
+        timestamp: now - 30_000,
+        lastSegmentAt: now - 31_000,
+        playbackObserved: true,
+      },
+    ])};`);
+    ctx.__eval(`userClickedVideoByTab[${tabId}] = {
+      videoSrc: 'blob:https://page.example/player',
+      videoIndex: 0,
+      timestamp: ${now - 1_000},
+      matchedUrl: 'https://cdn.example.com/ad/welcome/playlist.m3u8'
+    };`);
+    ctx.__eval(`videoPlaybackStateByTab[${tabId}] = {
+      isPlaying: false,
+      videoIndex: 0,
+      frameId: 0,
+      timestamp: ${now - 500}
+    };`);
+
+    const sorted = ctx.getSortedUrlsForTab(tabId);
+    expect(sorted.every(item => item.isNowPlaying === false)).toBe(true);
+  });
+
+  it('ignores segments buffered before the latest resume event', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+    });
+    const now = 5_200_000;
+    const rows = [
+      { url: 'https://cdn.example.com/old.m3u8', lastSegmentAt: now - 2_000, isNowPlaying: false },
+      { url: 'https://cdn.example.com/new.m3u8', lastSegmentAt: now - 200, isNowPlaying: false },
+    ];
+
+    expect(ctx.markFreshSegmentNowPlaying(rows, now, {
+      isPlaying: true,
+      timestamp: now - 500,
+    })).toBe(true);
+    expect(rows[0].isNowPlaying).toBe(false);
+    expect(rows[1].isNowPlaying).toBe(true);
   });
 
   it('getSortedUrlsForTab marks video as now playing when user clicked', () => {
@@ -480,6 +646,52 @@ describe('background.js pure helpers', () => {
         hitCount: 1,
       }),
     ]);
+  });
+
+  it('does not map a blob video index to the first detected manifest', () => {
+    const chrome = makeChromeStub();
+    const ctx = loadScriptIntoContext('background.js', { chrome });
+    const tabId = 56;
+    ctx.__eval(`currentTabUrls[${tabId}] = ${JSON.stringify([
+      { url: 'https://cdn.example.com/ad/welcome/playlist.m3u8' },
+      { url: 'https://cdn.example.com/episode/1080/chunklist.m3u8' },
+    ])};`);
+
+    const listener = chrome.runtime.__onMessageListeners[0];
+    listener({
+      action: 'videoStartedPlaying',
+      videoSrc: 'blob:https://page.example/player',
+      videoIndex: 0,
+      videoCount: 1,
+      pageUrl: 'https://page.example/watch',
+      timestamp: 10_000,
+    }, { tab: { id: tabId }, frameId: 0 }, () => {});
+
+    expect(ctx.__eval(`userClickedVideoByTab[${tabId}].matchedUrl`)).toBe(null);
+    expect(ctx.__eval(`videoPlaybackStateByTab[${tabId}].isPlaying`)).toBe(true);
+  });
+
+  it('keeps the tab playing while another video element pauses', () => {
+    const chrome = makeChromeStub();
+    const ctx = loadScriptIntoContext('background.js', { chrome });
+    const listener = chrome.runtime.__onMessageListeners[0];
+    const tabId = 57;
+    const sender = { tab: { id: tabId }, frameId: 0 };
+    const send = (action, videoElementId, timestamp) => listener({
+      action,
+      videoElementId,
+      videoIndex: videoElementId === 'video-a' ? 0 : 1,
+      timestamp,
+    }, sender, () => {});
+
+    send('videoStartedPlaying', 'video-a', 1_000);
+    send('videoStartedPlaying', 'video-b', 2_000);
+    send('videoPaused', 'video-b', 3_000);
+    expect(ctx.__eval(`videoPlaybackStateByTab[${tabId}].isPlaying`)).toBe(true);
+    expect(ctx.__eval(`videoPlaybackStateByTab[${tabId}].videoElementId`)).toBe('video-a');
+
+    send('videoEnded', 'video-a', 4_000);
+    expect(ctx.__eval(`videoPlaybackStateByTab[${tabId}].isPlaying`)).toBe(false);
   });
 });
 

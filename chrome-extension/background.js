@@ -33,6 +33,13 @@ let capturedHeaders = {};
 // Key: tabId, Value: { videoSrc, videoIndex, videoCount, pageUrl, timestamp, matchedUrl }
 let userClickedVideoByTab = {};
 
+// Authoritative DOM playback state from content.js. Segment requests may
+// continue briefly after pause because players buffer ahead; a known paused
+// state must therefore override request-based "Now Playing" heuristics.
+// Key: tabId, Value: { isPlaying, timestamp, media: { targetKey: state } }
+let videoPlaybackStateByTab = {};
+const MAX_TRACKED_MEDIA_PER_TAB = 32;
+
 // Cached thumbnails per tab from content.js
 // Key: tabId, Value: { pageUrl, pageThumbnail, posters: [{ poster, src, index }] }
 let pageThumbnailsByTab = {};
@@ -42,6 +49,10 @@ let pageThumbnailsByTab = {};
 let videoMetaByUrl = {};
 let videoMetaProbing = new Set();
 const VIDEO_META_MAX_ENTRIES = 500;
+// Segment traffic is the authoritative signal for the rendition currently
+// consumed by a MediaSource player. Keep the badge active across normal HLS
+// buffering gaps, but let it expire shortly after playback pauses or switches.
+const ACTIVE_SEGMENT_WINDOW_MS = 30_000;
 
 // Hidden-mode AV-task pipeline: tabs we opened on the user's behalf so the
 // site's own JS can produce a fresh m3u8. Keyed by tabId; expires after the
@@ -126,6 +137,84 @@ function matchesUserClickedVideo(detectedUrl, clickedInfo) {
   return false;
 }
 
+function markFreshSegmentNowPlaying(scored, now = Date.now(), playbackState = null) {
+  if (playbackState && playbackState.isPlaying === false) return false;
+
+  // After a pause/resume transition, ignore segment requests left over from
+  // the paused buffering period. A new request after play() will identify the
+  // active rendition again.
+  const playingSince = playbackState && playbackState.isPlaying === true
+    ? (Number(playbackState.timestamp) || 0)
+    : 0;
+  let freshest = null;
+  let freshestAt = -1;
+  for (const item of scored || []) {
+    const at = Number(item && item.lastSegmentAt) || 0;
+    const age = now - at;
+    if (at <= 0 || age < 0 || age > ACTIVE_SEGMENT_WINDOW_MS) continue;
+    if (playingSince > 0 && at < playingSince) continue;
+    if (at > freshestAt) {
+      freshest = item;
+      freshestAt = at;
+    }
+  }
+  if (!freshest) return false;
+  freshest.isNowPlaying = true;
+  return true;
+}
+
+function playbackTargetKey(request, sender) {
+  const frameId = Number.isInteger(sender && sender.frameId) ? sender.frameId : 0;
+  const elementPart = request && request.videoElementId
+    ? `element:${String(request.videoElementId)}`
+    : `index:${Number.isInteger(request && request.videoIndex) ? request.videoIndex : -1}`;
+  return `${frameId}:${elementPart}`;
+}
+
+function updateTabPlaybackState(tabId, request, sender, isPlaying) {
+  const timestamp = Number(request && request.timestamp) || Date.now();
+  const frameId = Number.isInteger(sender && sender.frameId) ? sender.frameId : 0;
+  const targetKey = playbackTargetKey(request, sender);
+  const tabState = videoPlaybackStateByTab[tabId] || { media: {} };
+  if (!tabState.media || typeof tabState.media !== 'object') tabState.media = {};
+
+  tabState.media[targetKey] = {
+    isPlaying: !!isPlaying,
+    timestamp,
+    frameId,
+    videoElementId: request && request.videoElementId || null,
+    videoIndex: request && request.videoIndex,
+  };
+
+  // SPAs may replace media elements repeatedly. Retain every active element,
+  // but bound stopped history so a long-lived tab cannot grow this map forever.
+  const mediaEntries = Object.entries(tabState.media);
+  if (mediaEntries.length > MAX_TRACKED_MEDIA_PER_TAB) {
+    const stoppedOldestFirst = mediaEntries
+      .filter(([, state]) => !state || state.isPlaying !== true)
+      .sort(([, a], [, b]) => (Number(a && a.timestamp) || 0) - (Number(b && b.timestamp) || 0));
+    let excess = mediaEntries.length - MAX_TRACKED_MEDIA_PER_TAB;
+    for (const [key] of stoppedOldestFirst) {
+      if (excess <= 0) break;
+      if (key === targetKey) continue;
+      delete tabState.media[key];
+      excess -= 1;
+    }
+  }
+
+  const active = Object.values(tabState.media)
+    .filter(state => state && state.isPlaying === true)
+    .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+  const representative = active[0] || tabState.media[targetKey];
+  tabState.isPlaying = active.length > 0;
+  tabState.timestamp = Number(representative && representative.timestamp) || timestamp;
+  tabState.frameId = representative && representative.frameId;
+  tabState.videoElementId = representative && representative.videoElementId;
+  tabState.videoIndex = representative && representative.videoIndex;
+  videoPlaybackStateByTab[tabId] = tabState;
+  return tabState;
+}
+
 function getSortedUrlsForTab(tabId) {
   const list = Array.isArray(currentTabUrls[tabId]) ? currentTabUrls[tabId] : [];
   const scored = list.map((u) => {
@@ -134,6 +223,13 @@ function getSortedUrlsForTab(tabId) {
   });
 
   scored.sort((a, b) => (b.score - a.score) || ((b.timestamp || 0) - (a.timestamp || 0)));
+
+  const playbackState = videoPlaybackStateByTab[tabId] || null;
+  if (playbackState && playbackState.isPlaying === false) return scored;
+
+  // A fresh segment request identifies the exact active rendition and is more
+  // reliable than DOM play events whose currentSrc is often only a blob: URL.
+  if (markFreshSegmentNowPlaying(scored, Date.now(), playbackState)) return scored;
 
   // Check for user-clicked video first (most accurate signal)
   const clickedInfo = userClickedVideoByTab[tabId];
@@ -539,6 +635,11 @@ function getSortedUrlsForTabWithOrphans(tabId, tabUrl) {
 
   scored.sort((a, b) => (b.score - a.score) || ((b.timestamp || 0) - (a.timestamp || 0)));
 
+  const playbackState = videoPlaybackStateByTab[tabId] || null;
+  if (playbackState && playbackState.isPlaying === false) return scored;
+
+  if (markFreshSegmentNowPlaying(scored, Date.now(), playbackState)) return scored;
+
   // Check for user-clicked video first (most accurate signal)
   const clickedInfo = userClickedVideoByTab[tabId];
   const clickAge = clickedInfo ? (Date.now() - (clickedInfo.timestamp || 0)) : Infinity;
@@ -670,7 +771,10 @@ function isCandidateVideoUrl(rawUrl) {
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.ico',
     '.css', '.js', '.mjs',
     '.html', '.htm',
-    '.json', '.txt'
+    '.json', '.txt',
+    // HLS AES key resources may contain ".m3u8" in both the filename and
+    // an encoded ACL path, but they are binary keys rather than manifests.
+    '.m3u8key', '.m3u8.key'
   ];
 
   let pathnameLower = '';
@@ -705,10 +809,18 @@ function inferHlsManifestFromSegmentUrl(rawUrl) {
 
   const pathParts = u.pathname.split('/');
   const last = pathParts[pathParts.length - 1] || '';
-  const match = /^seg-\d+-(v\d+)(?:-(a\d+))?\.ts$/i.exec(last);
-  if (!match) return null;
+  const indexedSegment = /^seg-\d+-(v\d+)(?:-(a\d+))?\.ts$/i.exec(last);
+  const bitrateSegment = /^media_(b\d+)_\d+\.ts$/i.exec(last);
+  if (!indexedSegment && !bitrateSegment) return null;
 
-  pathParts[pathParts.length - 1] = `index-${match[1]}${match[2] ? '-' + match[2] : ''}.m3u8`;
+  // Support both common deterministic HLS layouts:
+  //   seg-13-v1-a1.ts       -> index-v1-a1.m3u8
+  //   media_b5000000_42.ts  -> chunklist_b5000000.m3u8
+  // The latter is frequently paired with an auth token embedded as a path
+  // segment. Replacing only the final filename preserves that token exactly.
+  pathParts[pathParts.length - 1] = indexedSegment
+    ? `index-${indexedSegment[1]}${indexedSegment[2] ? '-' + indexedSegment[2] : ''}.m3u8`
+    : `chunklist_${bitrateSegment[1]}.m3u8`;
   u.pathname = pathParts.join('/');
   u.hash = '';
 
@@ -721,6 +833,73 @@ function inferHlsManifestFromSegmentUrl(rawUrl) {
   };
 }
 
+// A media-segment request is stronger playback evidence than a DOM <video>
+// event: MediaSource players expose only a blob: URL, while the request tells
+// us which concrete HLS rendition is actually being consumed. For segment
+// naming schemes that cannot be deterministically reversed into a manifest,
+// associate the request with the closest already-detected manifest directory.
+// Exact-directory matches win over parent manifests (for example a master
+// playlist one directory above the active rendition).
+function markExistingHlsPlaybackFromSegment(details) {
+  const tabId = details && details.tabId;
+  if (tabId == null || typeof tabId !== 'number' || tabId < 0) return null;
+
+  let segment;
+  try {
+    segment = new URL(details.url);
+  } catch (_) {
+    return null;
+  }
+  if (segment.protocol !== 'http:' && segment.protocol !== 'https:') return null;
+  if (!/\.(?:ts|m4s)$/i.test(segment.pathname)) return null;
+
+  const segmentSlash = segment.pathname.lastIndexOf('/');
+  const segmentDir = segment.pathname.slice(0, segmentSlash + 1);
+  let best = null;
+  let bestScore = -1;
+  let bestTimestamp = -1;
+
+  for (const item of currentTabUrls[tabId] || []) {
+    if (!item || !item.url) continue;
+    const format = String(item.detectedFormat || '').toLowerCase();
+    if (format !== 'm3u8' && !/\.m3u8(?:[?#]|$)/i.test(String(item.url))) continue;
+
+    let manifest;
+    try {
+      manifest = new URL(item.url);
+    } catch (_) {
+      continue;
+    }
+    if (manifest.origin !== segment.origin) continue;
+
+    const manifestSlash = manifest.pathname.lastIndexOf('/');
+    const manifestDir = manifest.pathname.slice(0, manifestSlash + 1);
+    let score = -1;
+    if (segmentDir === manifestDir) {
+      score = 1_000_000 + manifestDir.length;
+    } else if (segmentDir.startsWith(manifestDir)) {
+      score = manifestDir.length;
+    }
+    if (score < 0) continue;
+
+    const timestamp = Number(item.timestamp) || 0;
+    if (score > bestScore || (score === bestScore && timestamp > bestTimestamp)) {
+      best = item;
+      bestScore = score;
+      bestTimestamp = timestamp;
+    }
+  }
+
+  if (!best) return null;
+
+  best.playbackObserved = true;
+  best.lastSegmentAt = Date.now();
+  // notifyDetectedUrlsUpdated is throttled, so calling it for every segment
+  // keeps LIVE responsive without spamming the side panel.
+  notifyDetectedUrlsUpdated(tabId);
+  return best;
+}
+
 function mergeDetectedUrlExtra(existing, extra) {
   if (!existing || !extra) return;
   if (extra.detectedFormat && !existing.detectedFormat) {
@@ -728,6 +907,10 @@ function mergeDetectedUrlExtra(existing, extra) {
   }
   if (extra.playbackObserved) {
     existing.playbackObserved = true;
+  }
+  const lastSegmentAt = Number(extra.lastSegmentAt) || 0;
+  if (lastSegmentAt > (Number(existing.lastSegmentAt) || 0)) {
+    existing.lastSegmentAt = lastSegmentAt;
   }
 }
 
@@ -863,8 +1046,18 @@ chrome.webRequest.onBeforeRequest.addListener(
       console.log('Inferred HLS manifest from segment:', details.url, '->', inferredManifest.url);
       registerDetectedUrl(
         { ...details, url: inferredManifest.url },
-        { detectedFormat: 'm3u8', playbackObserved: true, dedupeKey: inferredManifest.dedupeKey }
+        {
+          detectedFormat: 'm3u8',
+          playbackObserved: true,
+          lastSegmentAt: Date.now(),
+          dedupeKey: inferredManifest.dedupeKey,
+        }
       );
+    } else if (/\.(?:ts|m4s)(?:[?#]|$)/i.test(details.url)) {
+      // Generic fallback for HLS layouts whose segment filename does not
+      // encode the playlist name. Never creates a guessed URL; it only marks
+      // the closest manifest that was already observed in this tab.
+      markExistingHlsPlaybackFromSegment(details);
     }
   },
   { urls: ["<all_urls>"] }
@@ -1013,6 +1206,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete currentTabUrlKeys[tabId];
   delete deepHitsByTab[tabId];
   delete userClickedVideoByTab[tabId];
+  delete videoPlaybackStateByTab[tabId];
   delete pageThumbnailsByTab[tabId];
 });
 
@@ -1024,6 +1218,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
     currentTabUrlKeys[details.tabId] = new Set();
     deepHitsByTab[details.tabId] = [];
     delete userClickedVideoByTab[details.tabId];
+    delete videoPlaybackStateByTab[details.tabId];
     delete pageThumbnailsByTab[details.tabId];
     updateBadge(details.tabId);
     chrome.storage.local.set({ detectedUrls: Array.from(detectedUrls) });
@@ -1939,13 +2134,32 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return;
   }
 
-  // Handle user clicking on a video element (from content script)
+  // A pause/ended event is authoritative. Players often keep requesting
+  // buffered segments for a short time after pause, so request traffic alone
+  // must not keep (or later resurrect) the LIVE badge.
+  if (request.action === 'videoPaused' || request.action === 'videoEnded') {
+    const tabId = sender.tab?.id;
+    if (tabId != null && tabId >= 0) {
+      updateTabPlaybackState(tabId, request, sender, false);
+      notifyDetectedUrlsUpdated(tabId);
+    }
+    sendResponse({ success: true });
+    return;
+  }
+
+  // Handle user clicking on or starting a video element (from content script)
   if (request.action === 'userClickedVideo' || request.action === 'videoStartedPlaying') {
     const tabId = sender.tab?.id;
     if (tabId != null && tabId >= 0) {
       const videoIndex = request.videoIndex;
+
+      if (request.action === 'videoStartedPlaying') {
+        updateTabPlaybackState(tabId, request, sender, true);
+      }
       
-      // Try to immediately associate with a URL based on video index
+      // Try to immediately associate only through the concrete media src.
+      // DOM video order has no relationship to network request order; using
+      // index 0 => first detected M3U8 incorrectly selects preload/ad streams.
       let matchedUrl = null;
       
       // First, try direct src matching
@@ -1956,20 +2170,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             matchedUrl = item.url;
             break;
           }
-        }
-      }
-      
-      // If no direct match, use video index to map to detection order
-      if (!matchedUrl && typeof videoIndex === 'number' && videoIndex >= 0) {
-        const list = currentTabUrls[tabId] || [];
-        // Filter to m3u8 or mp4 URLs in detection order
-        const m3u8Urls = list.filter(u => String(u.url || '').toLowerCase().includes('.m3u8'));
-        const mpdUrls = list.filter(u => String(u.url || '').toLowerCase().includes('.mpd'));
-        const mp4Urls = list.filter(u => String(u.url || '').toLowerCase().includes('.mp4'));
-        const urlsInOrder = m3u8Urls.length > 0 ? m3u8Urls : (mpdUrls.length > 0 ? mpdUrls : mp4Urls);
-        
-        if (urlsInOrder.length > 0 && videoIndex < urlsInOrder.length) {
-          matchedUrl = urlsInOrder[videoIndex].url;
         }
       }
       

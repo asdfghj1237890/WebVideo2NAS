@@ -49,4 +49,26 @@ describe('content.js MAIN-world detection bridge', () => {
       pageUrl: window.location.href,
     }));
   });
+
+  it('reports video play, pause, and ended lifecycle events', () => {
+    const sendMessage = vi.fn();
+    const video = document.createElement('video');
+    video.src = 'https://cdn.example.com/video.mp4';
+    document.body.appendChild(video);
+    loadContent(sendMessage);
+
+    video.dispatchEvent(new Event('play'));
+    video.dispatchEvent(new Event('pause'));
+    video.dispatchEvent(new Event('ended'));
+
+    const actions = sendMessage.mock.calls.map(([message]) => message.action);
+    expect(actions).toContain('videoStartedPlaying');
+    expect(actions).toContain('videoPaused');
+    expect(actions).toContain('videoEnded');
+
+    const lifecycle = sendMessage.mock.calls
+      .map(([message]) => message)
+      .filter(message => ['videoStartedPlaying', 'videoPaused', 'videoEnded'].includes(message.action));
+    expect(new Set(lifecycle.map(message => message.videoElementId)).size).toBe(1);
+  });
 });

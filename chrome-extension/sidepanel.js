@@ -773,6 +773,13 @@ function uniqueQualityLabels(items) {
   return order.filter(q => set.has(q));
 }
 
+function shouldShowDetectedToolbar(items, activeSearch = '') {
+  const rows = Array.isArray(items) ? items : [];
+  return !!String(activeSearch || '').trim() ||
+    rows.length > MANY_THRESHOLD ||
+    uniqueQualityLabels(rows).length > 1;
+}
+
 function normalizeQualityFilter() {
   if (qualityFilter === 'all') return;
   const qualities = uniqueQualityLabels(detectedUrls);
@@ -821,6 +828,7 @@ function renderDetectedUrls(opts) {
 
   const total = detectedUrls.length;
   const isMany = total > MANY_THRESHOLD;
+  const showToolbar = shouldShowDetectedToolbar(detectedUrls, searchQuery);
 
   // Pane ratio: dynamic based on detected count.
   //   0       → empty-state height only
@@ -848,8 +856,8 @@ function renderDetectedUrls(opts) {
 
   // Toolbar visibility + chips
   const toolbar = document.getElementById('toolbar');
-  if (toolbar) toolbar.hidden = !isMany;
-  if (isMany) renderQualityChips();
+  if (toolbar) toolbar.hidden = !showToolbar;
+  if (showToolbar) renderQualityChips();
 
   // Grid density
   listElement.classList.toggle('dense', isMany);
@@ -2023,5 +2031,8 @@ function containsIpAddress(url) {
   return sidepanelCore.containsIpAddress(url);
 }
 
-// Auto-refresh jobs every 2 seconds
+// Auto-refresh jobs every 2 seconds. Detected URLs use a slower poll so a
+// segment-derived LIVE badge also expires after playback pauses; push updates
+// from background.js still make active playback appear immediately.
 setInterval(loadRecentJobs, 2000);
+setInterval(loadDetectedUrls, 5000);

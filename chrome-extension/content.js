@@ -3,15 +3,31 @@
 (function() {
   'use strict';
 
+  // DOM order can change while a player is running (ads, SPA transitions,
+  // overlays). Give each media element a stable per-frame identity so a pause
+  // event always closes the same playback state that its play event opened.
+  const videoElementIds = new WeakMap();
+  let nextVideoElementId = 1;
+
+  function getVideoElementId(video) {
+    if (!videoElementIds.has(video)) {
+      videoElementIds.set(video, `video-${nextVideoElementId++}`);
+    }
+    return videoElementIds.get(video);
+  }
+
   // Get the index of a video element among all videos on the page
   function getVideoIndex(video) {
-    const allVideos = Array.from(document.querySelectorAll('video'));
+    const doc = video && video.ownerDocument;
+    if (!doc) return -1;
+    const allVideos = Array.from(doc.querySelectorAll('video'));
     return allVideos.indexOf(video);
   }
 
   // Get total number of videos on the page
-  function getVideoCount() {
-    return document.querySelectorAll('video').length;
+  function getVideoCount(video) {
+    const doc = video && video.ownerDocument;
+    return doc ? doc.querySelectorAll('video').length : 0;
   }
 
   // Find the video element from a click target (could be the video itself or a parent/overlay)
@@ -64,15 +80,17 @@
   function sendVideoInteraction(action, video) {
     const src = getVideoSrc(video);
     const videoIndex = getVideoIndex(video);
-    const videoCount = getVideoCount();
+    const videoCount = getVideoCount(video);
+    const pageUrl = video?.ownerDocument?.defaultView?.location?.href || '';
 
     try {
       chrome.runtime.sendMessage({
         action: action,
         videoSrc: src || null,
+        videoElementId: getVideoElementId(video),
         videoIndex: videoIndex,
         videoCount: videoCount,
-        pageUrl: window.location.href,
+        pageUrl,
         timestamp: Date.now()
       });
     } catch (e) {
@@ -96,18 +114,35 @@
     sendVideoInteraction('videoStartedPlaying', video);
   }
 
+  function handlePause(event) {
+    const video = event.target;
+    if (!video || video.tagName !== 'VIDEO') return;
+
+    sendVideoInteraction('videoPaused', video);
+  }
+
+  function handleEnded(event) {
+    const video = event.target;
+    if (!video || video.tagName !== 'VIDEO') return;
+
+    sendVideoInteraction('videoEnded', video);
+  }
+
   // Use capture phase to catch clicks before they're stopped by video player overlays
   document.addEventListener('click', handleClick, true);
   
   // Also listen for play events on video elements
   document.addEventListener('play', handlePlay, true);
+  document.addEventListener('pause', handlePause, true);
+  document.addEventListener('ended', handleEnded, true);
+  document.addEventListener('emptied', handleEnded, true);
 
   // For dynamically added videos, observe DOM mutations
   const observer = new MutationObserver((mutations) => {
     let sawNewVideo = false;
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
-        if (node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node.nodeType !== 1) continue; // ELEMENT_NODE
 
         // Check if it's a video element or contains one
         if (node.tagName === 'VIDEO') {
@@ -119,6 +154,19 @@
             videos.forEach(v => v.addEventListener('play', handlePlay));
             sawNewVideo = true;
           }
+        }
+      }
+
+      // A detached MediaSource video is not guaranteed to emit pause/ended.
+      // Mutation callbacks run after the DOM operation, so isConnected avoids
+      // treating an element that was merely moved as stopped.
+      for (const node of mutation.removedNodes) {
+        if (node.nodeType !== 1) continue; // ELEMENT_NODE
+        const removedVideos = node.tagName === 'VIDEO'
+          ? [node]
+          : (node.querySelectorAll ? Array.from(node.querySelectorAll('video')) : []);
+        for (const video of removedVideos) {
+          if (!video.isConnected) sendVideoInteraction('videoEnded', video);
         }
       }
     }

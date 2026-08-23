@@ -148,6 +148,28 @@ describe('sidepanel.js helper functions', () => {
     expect(ctx.__eval('qualityFilter')).toBe('all');
   });
 
+  it('shows quality filters below the bulk-mode threshold when qualities are mixed', () => {
+    const ctx = loadScriptIntoContext('sidepanel.js', {
+      chrome: makeChromeStub(),
+      document: makeDocumentStub(),
+      window: {},
+    });
+
+    expect(ctx.shouldShowDetectedToolbar([
+      { url: 'https://cdn.example.com/video/1080p/playlist.m3u8' },
+      { url: 'https://cdn.example.com/video/720p/playlist.m3u8' },
+    ])).toBe(true);
+
+    expect(ctx.shouldShowDetectedToolbar([
+      { url: 'https://cdn.example.com/video/1080p/a.m3u8' },
+      { url: 'https://cdn.example.com/video/1080p/b.m3u8' },
+    ])).toBe(false);
+
+    expect(ctx.shouldShowDetectedToolbar([
+      { url: 'https://cdn.example.com/video/1080p/a.m3u8' },
+    ], '1080')).toBe(true);
+  });
+
   it('updates the progress bar colour when browser upload leaves pending', () => {
     const ctx = loadScriptIntoContext('sidepanel.js', {
       chrome: makeChromeStub(),

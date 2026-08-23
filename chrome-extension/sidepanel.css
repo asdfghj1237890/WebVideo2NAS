@@ -536,6 +536,12 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .thumb-live {
   position: absolute; top: 4px; left: 4px;
   display: flex; align-items: center; gap: 3px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(0,0,0,0.68);
+  border: 1px solid rgba(255,255,255,0.14);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.28);
 }
 .thumb-live .live-dot {
   width: 6px; height: 6px; border-radius: 50%;
@@ -623,11 +629,13 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   outline-offset: -3px;
   box-shadow: 0 0 16px -2px oklch(78% 0.13 155 / 0.55);
 }
-/* Hide the LIVE badge when the tile is sent — sent is the dominant
-   state, and LIVE's mint dot+glow visually merges with the mint frame
-   at the top-left, making the border look "blocked". The LIVE info is
-   still shown in the meta line ("LIVE · host"). */
-.tile.sent .thumb-live { display: none; }
+/* Keep LIVE visible after sending. The dark pill separates it from the sent
+   tile's mint tint/border, so playback and delivery remain independent states. */
+.tile.sent .thumb-live {
+  display: flex;
+  background: rgba(0,0,0,0.76);
+  border-color: rgba(255,255,255,0.22);
+}
 [data-theme="light"] .tile.sent {
   background: oklch(58% 0.14 155 / 0.08);
   box-shadow: 0 0 14px -2px oklch(58% 0.14 155 / 0.40);
@@ -827,6 +835,11 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mini-ring {
   position: relative; flex-shrink: 0;
   width: 32px; height: 32px;
+}
+.mini-ring > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 .mini-ring .ring-pct {
   position: absolute; inset: 0;
@@ -1175,4 +1188,199 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @keyframes wv2nLive {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.4; }
+}
+
+/* ==== Roomier desktop layout ====
+   A 1080p desktop gives the side panel substantially more vertical room than
+   a laptop viewport. Keep the compact rules above for short windows, then use
+   that extra room for larger targets, clearer type, and cards that choose
+   their column count from the panel width instead of the item count. */
+@media (min-height: 800px) {
+  html, body {
+    font-size: 15px;
+    line-height: 1.55;
+  }
+
+  .wv-header {
+    padding: 18px 16px;
+    gap: 12px;
+  }
+  .brand-block { gap: 8px; }
+  .brand { font-size: 13px; }
+  .status-row { gap: 8px; }
+  .conn-chip,
+  .count-badge {
+    min-height: 28px;
+    padding: 5px 10px;
+    font-size: 12px;
+  }
+  .mode-badge {
+    min-height: 28px;
+    padding: 5px 10px 5px 8px;
+    font-size: 11px;
+  }
+  .header-right { gap: 6px; }
+  .icon-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+  }
+
+  .toolbar {
+    padding: 14px 16px;
+    gap: 10px;
+  }
+  .search {
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+  }
+  .search-input { font-size: 13px; }
+  .chips { gap: 6px; font-size: 12px; }
+  .chip { padding: 5px 10px; }
+
+  .pane-divider { margin: 18px; }
+  .section-label {
+    padding: 16px 18px 10px;
+    font-size: 12px;
+  }
+  .view-all { font-size: 12px; }
+  .trusted-cdn-section {
+    padding: 0 18px 9px;
+    font-size: 12px;
+  }
+  .trusted-cdn-section[open] { padding-bottom: 12px; }
+  .trusted-cdn-summary { gap: 7px; padding: 5px 0; }
+  .trusted-cdn-row { gap: 8px; padding-top: 7px; }
+  .trusted-cdn-input {
+    padding: 7px 9px;
+    border-radius: 6px;
+    font-size: 12px;
+  }
+
+  .grid,
+  .grid.dense {
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 12px;
+    padding: 12px 18px 8px;
+  }
+  .tile {
+    padding: 6px;
+    border-radius: 14px;
+  }
+  .thumb,
+  .grid.dense .thumb {
+    width: 100%;
+    height: auto;
+    min-height: 112px;
+    aspect-ratio: 16 / 9;
+    border-radius: 8px;
+  }
+  .thumb-wrap,
+  .grid.dense .thumb-wrap { border-radius: 8px; }
+  .send-btn {
+    bottom: 9px;
+    left: 9px;
+    width: 38px;
+    height: 38px;
+  }
+  .trust-cdn-btn {
+    top: 9px;
+    right: 9px;
+    width: 28px;
+    height: 28px;
+  }
+  .sel-dot {
+    top: 8px;
+    right: 8px;
+    width: 26px;
+    height: 26px;
+  }
+  .tile-body,
+  .grid.dense .tile-body { padding: 10px 9px 8px; }
+  .tile-title,
+  .grid.dense .tile-title {
+    margin-bottom: 5px;
+    font-size: 14px;
+  }
+  .tile-meta,
+  .grid.dense .tile-meta { font-size: 12px; }
+  .ip-warn { margin: 8px 9px 10px; }
+  .ip-warn-summary {
+    gap: 8px;
+    padding: 7px 9px;
+    font-size: 12px;
+  }
+  .ip-warn-body {
+    padding: 10px;
+    font-size: 12px;
+  }
+  .empty-state {
+    padding: 48px 20px;
+    font-size: 14px;
+  }
+  .empty-state .hint { margin-top: 7px; font-size: 13px; }
+
+  .jobs { padding: 0 16px 22px; }
+  .job-row {
+    gap: 12px;
+    padding: 13px 6px;
+  }
+  .job-thumb {
+    width: 52px;
+    height: 34px;
+    border-radius: 6px;
+  }
+  .job-title { font-size: 14px; }
+  .job-meta { margin-top: 4px; font-size: 12px; }
+  .job-bar { height: 3px; margin-top: 7px; }
+  .mini-ring { width: 36px; height: 36px; }
+  .mini-ring .ring-pct { font-size: 11px; }
+  .cancel-btn {
+    width: 28px;
+    height: 28px;
+    opacity: 0.25;
+  }
+  .error-details,
+  .suspect-block { margin-top: 10px; }
+  .error-summary { padding: 9px 11px; font-size: 13px; }
+  .error-content { padding: 11px; font-size: 13px; }
+  .error-message,
+  .error-solution-title { font-size: 12px; }
+  .error-solution { font-size: 13px; }
+
+  .av-task-block { padding: 12px 16px; }
+  .av-task-block .section-label {
+    margin-bottom: 8px;
+    padding: 0;
+    font-size: 12px;
+  }
+  .av-input-row { gap: 9px; }
+  .av-input,
+  .av-submit-btn {
+    min-height: 38px;
+    padding: 8px 11px;
+    font-size: 13px;
+  }
+  .av-submit-btn { padding-inline: 16px; }
+  .av-tasks { margin-top: 9px; gap: 6px; }
+  .av-task-row { padding: 6px 8px; font-size: 12px; }
+
+  .bulk-bar {
+    padding: 14px 16px;
+    gap: 10px;
+  }
+  .bulk-line1 { font-size: 14px; }
+  .bulk-line2 { margin-top: 2px; font-size: 12px; }
+  .bulk-btn,
+  .bulk-btn-secondary {
+    min-height: 40px;
+    padding: 10px 16px;
+    font-size: 14px;
+  }
+  .update-banner {
+    margin: 12px 16px 0;
+    padding: 10px 12px;
+    font-size: 13px;
+  }
 }
