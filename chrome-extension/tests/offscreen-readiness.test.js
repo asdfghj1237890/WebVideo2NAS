@@ -36,6 +36,7 @@ function makeChromeStub({ hasDocumentImpl } = {}) {
         },
       },
       onInstalled: { addListener: noop },
+      onStartup: { addListener: noop },
       lastError: null,
       openOptionsPage: noop,
       getManifest: () => ({ version: '2.5.0' }),

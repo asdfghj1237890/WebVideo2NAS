@@ -9,6 +9,7 @@ function makeChromeStub() {
       sendMessage: () => {},
       lastError: null,
       onInstalled: { addListener: () => {} },
+      onStartup: { addListener: () => {} },
       onMessage: { addListener: (fn) => onMessageListeners.push(fn) },
       __onMessageListeners: onMessageListeners,
       openOptionsPage: () => {},
@@ -479,5 +480,104 @@ describe('background.js pure helpers', () => {
         hitCount: 1,
       }),
     ]);
+  });
+});
+
+describe('extension update check (getUpdateStatus)', () => {
+  function makeBackedLocalStorage() {
+    const store = {};
+    return {
+      store,
+      api: {
+        get: async (keys) => {
+          const out = {};
+          for (const k of Array.isArray(keys) ? keys : [keys]) {
+            if (k in store) out[k] = store[k];
+          }
+          return out;
+        },
+        set: async (obj) => { Object.assign(store, obj); },
+      },
+    };
+  }
+
+  function dispatchMessage(chromeStub, msg) {
+    return new Promise((resolve) => {
+      for (const fn of chromeStub.runtime.__onMessageListeners) {
+        fn(msg, {}, resolve);
+      }
+    });
+  }
+
+  function loadWithRelease({ tagName, htmlUrl, failFetch = false }) {
+    const chromeStub = makeChromeStub();
+    const local = makeBackedLocalStorage();
+    chromeStub.storage.local = local.api;
+    const fetchCalls = [];
+    loadScriptIntoContext('background.js', {
+      chrome: chromeStub,
+      fetch: async (url) => {
+        fetchCalls.push(url);
+        if (failFetch) throw new Error('network down');
+        return {
+          ok: true,
+          json: async () => ({ tag_name: tagName, html_url: htmlUrl }),
+        };
+      },
+    });
+    return { chromeStub, local, fetchCalls };
+  }
+
+  it('reports updateAvailable for a newer release and caches the result', async () => {
+    const releaseUrl = 'https://github.com/asdfghj1237890/WebVideo2NAS/releases/tag/v9.9.9';
+    const { chromeStub, local, fetchCalls } = loadWithRelease({
+      tagName: 'v9.9.9',
+      htmlUrl: releaseUrl,
+    });
+
+    const resp = await dispatchMessage(chromeStub, { action: 'getUpdateStatus' });
+    expect(resp.status).toMatchObject({
+      updateAvailable: true,
+      latestVersion: '9.9.9',
+      currentVersion: '0.0.0',
+      releaseUrl,
+      lastResult: 'ok',
+    });
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]).toContain('api.github.com');
+    expect(local.store.extUpdateCheck).toMatchObject({
+      latestVersion: '9.9.9',
+      lastResult: 'ok',
+    });
+
+    // Second ask inside the throttle window: served from storage, no refetch.
+    const resp2 = await dispatchMessage(chromeStub, { action: 'getUpdateStatus' });
+    expect(resp2.status.updateAvailable).toBe(true);
+    expect(fetchCalls).toHaveLength(1);
+  });
+
+  it('does not flag an update when the release is not newer', async () => {
+    const { chromeStub } = loadWithRelease({
+      tagName: 'v0.0.0',
+      htmlUrl: 'https://github.com/asdfghj1237890/WebVideo2NAS/releases/tag/v0.0.0',
+    });
+
+    const resp = await dispatchMessage(chromeStub, { action: 'getUpdateStatus' });
+    expect(resp.status.updateAvailable).toBe(false);
+    expect(resp.status.latestVersion).toBe('0.0.0');
+  });
+
+  it('records a failed check without flagging an update, and throttles retries', async () => {
+    const { chromeStub, local, fetchCalls } = loadWithRelease({ failFetch: true });
+
+    const resp = await dispatchMessage(chromeStub, { action: 'getUpdateStatus' });
+    expect(resp.status.updateAvailable).toBe(false);
+    expect(resp.status.latestVersion).toBeUndefined();
+    expect(resp.status.lastResult).toBe('error');
+    expect(local.store.extUpdateCheck.lastResult).toBe('error');
+
+    // Failed checks retry on the 1h interval, not immediately.
+    await dispatchMessage(chromeStub, { action: 'getUpdateStatus' });
+    expect(fetchCalls).toHaveLength(1);
   });
 });

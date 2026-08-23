@@ -80,6 +80,22 @@
         </div>
       </header>
 
+      <!-- Update reminder. The extension is sideloaded (GitHub Release zip),
+           so Chrome never auto-updates it; background.js polls the GitHub
+           latest-release API and this banner appears when the installed
+           version is behind. Dismiss mutes that specific version only. -->
+      <div id="updateBanner" class="update-banner" hidden>
+        <span class="update-banner-dot" aria-hidden="true"></span>
+        <span id="updateBannerText" class="update-banner-text"></span>
+        <a id="updateBannerLink" class="update-banner-link" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <button id="updateBannerDismiss" class="update-banner-dismiss" type="button" title="Dismiss">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+               stroke-width="1.6" stroke-linecap="round">
+            <path d="M4 4l8 8M12 4l-8 8"/>
+          </svg>
+        </button>
+      </div>
+
       <!-- Toolbar (only visible in many-mode) -->
       <div id="toolbar" class="toolbar" hidden>
         <div class="search">

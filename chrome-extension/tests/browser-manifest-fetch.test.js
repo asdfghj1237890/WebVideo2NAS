@@ -18,6 +18,7 @@ function makeChromeStub() {
       sendMessage: vi.fn(),
       onMessage: { addListener: noop, removeListener: noop },
       onInstalled: { addListener: noop },
+      onStartup: { addListener: noop },
       lastError: null,
       openOptionsPage: noop,
       getManifest: () => ({ version: '2.5.0' }),

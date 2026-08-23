@@ -1073,6 +1073,43 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   box-shadow: inset 0 0 0 2px var(--accent);
 }
 
+/* ==== Update banner (sideloaded install — Chrome can't auto-update) ==== */
+.update-banner {
+  display: flex; align-items: center; gap: 8px;
+  margin: 10px 12px 0;
+  padding: 8px 10px;
+  background: var(--glass-bg-hi);
+  border: 1px solid var(--glass-border-hi);
+  border-radius: 8px;
+  font-size: 12px;
+  flex-shrink: 0;
+  animation: wv2nFadeDown 280ms ease-out both;
+}
+.update-banner[hidden] { display: none; }
+.update-banner-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--info);
+  flex-shrink: 0;
+}
+.update-banner-text {
+  flex: 1; min-width: 0;
+  color: var(--text-mid);
+}
+.update-banner-link {
+  color: var(--accent); text-decoration: none; font-weight: 600;
+  white-space: nowrap;
+}
+.update-banner-link:hover { text-decoration: underline; }
+.update-banner-dismiss {
+  display: flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0;
+  background: transparent; border: none; border-radius: 6px;
+  color: var(--text-dim); cursor: pointer;
+  flex-shrink: 0;
+  transition: background 150ms, color 150ms;
+}
+.update-banner-dismiss:hover { background: var(--glass-bg-hi); color: var(--text); }
+
 /* ==== Toast ==== */
 .wv-toast {
   position: fixed; bottom: 16px; left: 50%;

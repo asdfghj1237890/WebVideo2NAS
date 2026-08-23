@@ -282,6 +282,49 @@ async function setTheme(next) {
   } catch (_) { /* ignore */ }
 }
 
+// ---------- Update banner ----------
+// The extension is sideloaded (GitHub Release zip), so Chrome never
+// auto-updates it. background.js polls GitHub's latest-release API on a
+// throttle; asking for the status here is what actually triggers a check
+// when the window has elapsed, and we surface a dismissable reminder when
+// the installed version is behind.
+function initUpdateBanner() {
+  chrome.runtime.sendMessage({ action: 'getUpdateStatus' }, (response) => {
+    if (chrome.runtime.lastError) return;
+    const status = response && response.status;
+    if (!status || !status.updateAvailable || !status.latestVersion) return;
+    showUpdateBannerFor(status).catch(() => {});
+  });
+}
+
+async function showUpdateBannerFor(status) {
+  const banner = document.getElementById('updateBanner');
+  const text = document.getElementById('updateBannerText');
+  const link = document.getElementById('updateBannerLink');
+  const dismissBtn = document.getElementById('updateBannerDismiss');
+  if (!banner || !text || !link || !dismissBtn) return;
+
+  let dismissedVersion = null;
+  try {
+    const stored = await chrome.storage.local.get(['updateBannerDismissedVersion']);
+    dismissedVersion = stored.updateBannerDismissedVersion || null;
+  } catch (_) { /* ignore */ }
+  if (dismissedVersion === status.latestVersion) return;
+
+  text.textContent = t('update.banner.text', { version: `v${status.latestVersion}` });
+  link.textContent = t('update.banner.download');
+  link.href = status.releaseUrl || 'https://github.com/asdfghj1237890/WebVideo2NAS/releases/latest';
+  dismissBtn.setAttribute('title', t('update.banner.dismiss'));
+  // onclick (not addEventListener) so a re-shown banner doesn't stack handlers.
+  dismissBtn.onclick = async () => {
+    banner.hidden = true;
+    try {
+      await chrome.storage.local.set({ updateBannerDismissedVersion: status.latestVersion });
+    } catch (_) { /* ignore */ }
+  };
+  banner.hidden = false;
+}
+
 // ---------- Init ----------
 document.addEventListener('DOMContentLoaded', async () => {
   await loadSettingsFromStorage();
@@ -296,6 +339,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadRecentJobs();
 
   setupEventListeners();
+  initUpdateBanner();
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message && message.action === 'detectedUrlsUpdated') {

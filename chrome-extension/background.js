@@ -2,11 +2,16 @@
 
 if (typeof importScripts === 'function') {
   importScripts('browserPipelineCore.js');
+  importScripts('updateCheckCore.js');
 }
 const _wv2nasGlobalRoot = (typeof globalThis !== 'undefined' && globalThis) || this;
 const _wv2nasBrowserPipelineCore = _wv2nasGlobalRoot.WV2NASBrowserPipeline;
 if (!_wv2nasBrowserPipelineCore) {
   throw new Error('WV2NASBrowserPipeline core failed to load');
+}
+const _wv2nasUpdateCheckCore = _wv2nasGlobalRoot.WV2NUpdateCheckCore;
+if (!_wv2nasUpdateCheckCore) {
+  throw new Error('WV2NUpdateCheckCore failed to load');
 }
 
 // Store detected video URLs (m3u8, mpd, mp4)
@@ -1032,6 +1037,81 @@ chrome.runtime.onInstalled.addListener(() => {
     title: "Send to NAS",
     contexts: ["link", "page"]
   });
+  maybeCheckExtensionUpdate().catch(() => {});
+});
+
+// ---------------------------------------------------------------------------
+// Extension update check.
+//
+// The extension is sideloaded from GitHub Release zips, so Chrome never
+// auto-updates it. Poll the GitHub "latest release" API — throttled through
+// chrome.storage.local so service-worker restarts don't refetch — and let the
+// sidepanel ask for the result via the 'getUpdateStatus' message. No alarms
+// permission needed: onInstalled/onStartup plus every sidepanel open give
+// plenty of chances to land inside the check window.
+
+const UPDATE_CHECK_API_URL = 'https://api.github.com/repos/asdfghj1237890/WebVideo2NAS/releases/latest';
+const UPDATE_RELEASE_URL_PREFIX = 'https://github.com/asdfghj1237890/WebVideo2NAS/';
+const UPDATE_RELEASES_PAGE_URL = 'https://github.com/asdfghj1237890/WebVideo2NAS/releases/latest';
+const UPDATE_CHECK_STORAGE_KEY = 'extUpdateCheck';
+const UPDATE_CHECK_OK_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const UPDATE_CHECK_ERROR_RETRY_MS = 60 * 60 * 1000;
+const UPDATE_CHECK_TIMEOUT_MS = 10_000;
+
+// Single-flight so a burst of triggers (sidepanel reopen spam) shares one
+// storage read + at most one API call.
+let _updateCheckInflight = null;
+function maybeCheckExtensionUpdate() {
+  if (_updateCheckInflight) return _updateCheckInflight;
+  _updateCheckInflight = _runUpdateCheck().finally(() => { _updateCheckInflight = null; });
+  return _updateCheckInflight;
+}
+
+async function _runUpdateCheck() {
+  const stored = await chrome.storage.local.get([UPDATE_CHECK_STORAGE_KEY]);
+  const prev = stored[UPDATE_CHECK_STORAGE_KEY] || null;
+  const now = Date.now();
+  if (!_wv2nasUpdateCheckCore.shouldCheckForUpdate(prev, now, {
+    okIntervalMs: UPDATE_CHECK_OK_INTERVAL_MS,
+    errorIntervalMs: UPDATE_CHECK_ERROR_RETRY_MS,
+  })) {
+    return prev;
+  }
+
+  let next;
+  try {
+    const signal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+      ? AbortSignal.timeout(UPDATE_CHECK_TIMEOUT_MS)
+      : undefined;
+    const response = await fetch(UPDATE_CHECK_API_URL, {
+      headers: { 'Accept': 'application/vnd.github+json' },
+      cache: 'no-store',
+      signal,
+    });
+    if (!response || !response.ok) {
+      throw new Error(`GitHub API HTTP ${response && response.status}`);
+    }
+    const data = await response.json();
+    const info = _wv2nasUpdateCheckCore.normalizeReleaseInfo({
+      tagName: data && data.tag_name,
+      htmlUrl: data && data.html_url,
+      allowedUrlPrefix: UPDATE_RELEASE_URL_PREFIX,
+      fallbackUrl: UPDATE_RELEASES_PAGE_URL,
+    });
+    if (!info) throw new Error(`unrecognized release tag: ${data && data.tag_name}`);
+    next = { ...info, lastResult: 'ok', lastCheckedAt: now };
+  } catch (err) {
+    console.warn('Extension update check failed:', err && err.message);
+    // Keep the last known-good latestVersion/releaseUrl so a flaky network
+    // doesn't clear an already-surfaced reminder.
+    next = { ...(prev || {}), lastResult: 'error', lastCheckedAt: now };
+  }
+  await chrome.storage.local.set({ [UPDATE_CHECK_STORAGE_KEY]: next });
+  return next;
+}
+
+chrome.runtime.onStartup.addListener(() => {
+  maybeCheckExtensionUpdate().catch(() => {});
 });
 
 // Handle context menu clicks
@@ -1989,6 +2069,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     handleAvTaskFetch(request)
       .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ error: err && err.message }));
+    return true;
+  }
+
+  if (request.action === 'getUpdateStatus') {
+    // updateAvailable is recomputed against the live manifest version on
+    // every read, so a cached "3.3.0 is out" entry stops nagging the moment
+    // the user actually installs 3.3.0 — no waiting for the next API poll.
+    maybeCheckExtensionUpdate()
+      .then((state) => {
+        const currentVersion = chrome.runtime.getManifest().version;
+        const updateAvailable = !!(state && state.latestVersion
+          && _wv2nasUpdateCheckCore.isNewerVersion(state.latestVersion, currentVersion));
+        sendResponse({ status: state ? { ...state, currentVersion, updateAvailable } : null });
+      })
+      .catch((err) => sendResponse({ status: null, error: err && err.message }));
     return true;
   }
 

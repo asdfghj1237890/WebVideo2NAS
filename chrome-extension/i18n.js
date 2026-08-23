@@ -231,7 +231,11 @@
       'options.status.connectionFailedPrefix': '❌ Connection failed: ',
       'options.status.cannotReach': 'Cannot reach NAS. Check IP address and port.',
       'options.status.invalidApiKey': 'Invalid API key.',
-      'options.status.apiNotFound': 'API endpoint not found. Check NAS configuration.'
+      'options.status.apiNotFound': 'API endpoint not found. Check NAS configuration.',
+
+      'update.banner.text': 'New version {version} available',
+      'update.banner.download': 'Update on GitHub',
+      'update.banner.dismiss': 'Dismiss'
     },
     'zh-TW': {
       'status.checking': '檢查中…',
@@ -432,7 +436,11 @@
       'options.status.connectionFailedPrefix': '❌ 連線失敗：',
       'options.status.cannotReach': '無法連到 NAS，請檢查 IP 與埠號。',
       'options.status.invalidApiKey': 'API 金鑰無效。',
-      'options.status.apiNotFound': '找不到 API 端點，請檢查 NAS 設定。'
+      'options.status.apiNotFound': '找不到 API 端點，請檢查 NAS 設定。',
+
+      'update.banner.text': '新版本 {version} 已發布',
+      'update.banner.download': '前往 GitHub 下載',
+      'update.banner.dismiss': '關閉提醒'
     },
     'zh-CN': {
       'status.checking': '检查中…',
@@ -582,7 +590,11 @@
       'options.status.connectionFailedPrefix': '❌ 连接失败：',
       'options.status.cannotReach': '无法访问 NAS，请检查 IP 和端口。',
       'options.status.invalidApiKey': 'API Key 无效。',
-      'options.status.apiNotFound': '找不到 API 端点，请检查 NAS 配置。'
+      'options.status.apiNotFound': '找不到 API 端点，请检查 NAS 配置。',
+
+      'update.banner.text': '新版本 {version} 已发布',
+      'update.banner.download': '前往 GitHub 下载',
+      'update.banner.dismiss': '关闭提醒'
     },
     ja: {
       'status.checking': '確認中…',
@@ -703,7 +715,11 @@
       'options.status.connectionFailedPrefix': '❌ 接続失敗: ',
       'options.status.cannotReach': 'NAS に到達できません。IP とポートを確認してください。',
       'options.status.invalidApiKey': 'API キーが無効です。',
-      'options.status.apiNotFound': 'API エンドポイントが見つかりません。NAS 設定を確認してください。'
+      'options.status.apiNotFound': 'API エンドポイントが見つかりません。NAS 設定を確認してください。',
+
+      'update.banner.text': '新しいバージョン {version} が公開されました',
+      'update.banner.download': 'GitHub で更新',
+      'update.banner.dismiss': '閉じる'
     },
     ko: {
       'status.checking': '확인 중...',
@@ -824,7 +840,11 @@
       'options.status.connectionFailedPrefix': '❌ 연결 실패: ',
       'options.status.cannotReach': 'NAS에 연결할 수 없습니다. IP와 포트를 확인하세요.',
       'options.status.invalidApiKey': 'API 키가 올바르지 않습니다.',
-      'options.status.apiNotFound': 'API 엔드포인트를 찾을 수 없습니다. NAS 설정을 확인하세요.'
+      'options.status.apiNotFound': 'API 엔드포인트를 찾을 수 없습니다. NAS 설정을 확인하세요.',
+
+      'update.banner.text': '새 버전 {version} 사용 가능',
+      'update.banner.download': 'GitHub에서 업데이트',
+      'update.banner.dismiss': '닫기'
     },
     fr: {
       'status.checking': 'Vérification…',
@@ -945,7 +965,11 @@
       'options.status.connectionFailedPrefix': '❌ Échec de connexion : ',
       'options.status.cannotReach': 'Impossible d’atteindre le NAS. Vérifiez l’adresse IP et le port.',
       'options.status.invalidApiKey': 'Clé API invalide.',
-      'options.status.apiNotFound': 'Point de terminaison API introuvable. Vérifiez la configuration du NAS.'
+      'options.status.apiNotFound': 'Point de terminaison API introuvable. Vérifiez la configuration du NAS.',
+
+      'update.banner.text': 'Nouvelle version {version} disponible',
+      'update.banner.download': 'Mettre à jour sur GitHub',
+      'update.banner.dismiss': 'Ignorer'
     },
     es: {
       'status.checking': 'Comprobando…',
@@ -1066,7 +1090,11 @@
       'options.status.connectionFailedPrefix': '❌ Error de conexión: ',
       'options.status.cannotReach': 'No se puede acceder al NAS. Revisa la IP y el puerto.',
       'options.status.invalidApiKey': 'Clave API inválida.',
-      'options.status.apiNotFound': 'No se encontró el endpoint de la API. Revisa la configuración del NAS.'
+      'options.status.apiNotFound': 'No se encontró el endpoint de la API. Revisa la configuración del NAS.',
+
+      'update.banner.text': 'Nueva versión {version} disponible',
+      'update.banner.download': 'Actualizar en GitHub',
+      'update.banner.dismiss': 'Descartar'
     },
     pt: {
       'status.checking': 'Verificando…',
@@ -1187,7 +1215,11 @@
       'options.status.connectionFailedPrefix': '❌ Falha na conexão: ',
       'options.status.cannotReach': 'Não foi possível acessar o NAS. Verifique o IP e a porta.',
       'options.status.invalidApiKey': 'Chave de API inválida.',
-      'options.status.apiNotFound': 'Endpoint da API não encontrado. Verifique a configuração do NAS.'
+      'options.status.apiNotFound': 'Endpoint da API não encontrado. Verifique a configuração do NAS.',
+
+      'update.banner.text': 'Nova versão {version} disponível',
+      'update.banner.download': 'Atualizar no GitHub',
+      'update.banner.dismiss': 'Dispensar'
     }
   };
 

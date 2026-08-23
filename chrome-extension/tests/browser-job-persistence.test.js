@@ -21,7 +21,7 @@ function makeChromeStub({ storageInitial = {}, abortFetchOk = true, dnrFn } = {}
     runtime: {
       sendMessage: vi.fn(), id: 'test-extension-id',
       onMessage: { addListener: noop, removeListener: noop },
-      onInstalled: { addListener: noop }, lastError: null,
+      onInstalled: { addListener: noop }, onStartup: { addListener: noop }, lastError: null,
       openOptionsPage: noop, getManifest: () => ({ version: '2.5.0' }),
       getURL: (p) => `chrome-extension://test-extension-id/${p}`,
     },
