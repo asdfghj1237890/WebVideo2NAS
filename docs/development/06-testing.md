@@ -11,12 +11,12 @@
 
 | 層級 | 工具 | 跑在 | 數量 | 涵蓋什麼 |
 |---|---|---|---|---|
-| Chrome extension unit | vitest + jsdom | Node | **317 tests / 15 檔** | pure helper（URL 分類、tab 隔離、findBestCapturedEntry）+ browser-side pipeline（manifest fetch、segmentDownloader、DNR rules、offscreen、job persistence）|
-| API + Worker unit | pytest | Python（host 或 docker） | **516 tests 合計** | worker: m3u8 / mpd parse、downloader edge cases、ffmpeg_wrapper、host throttle、browser finalize、reaper 等；api: DownloadRequest validation、rate limit、SSRF guard、output_subdir、browser-jobs endpoints / service、manifest planner、shared security |
-| Dep-pin smoke | pytest | Python | （含在上面 516 內）| `test_*_upgrade_smoke.py` 鎖定 redis / curl_cffi / m3u8 / pycryptodome / fastapi / starlette 等最低版本 |
+| Chrome extension unit | vitest + jsdom | Node | **358 tests / 16 檔** | pure helper（URL 分類、tab 隔離、findBestCapturedEntry）+ browser-side pipeline（manifest / JSON DASH detection、segment/range upload、DNR rules、offscreen、job persistence）|
+| API + Worker unit | pytest | Python（host 或 docker） | **539 tests 合計** | worker: m3u8 / mpd parse、downloader edge cases、ffmpeg_wrapper、host throttle、browser finalize、reaper 等；api: DownloadRequest validation、rate limit、SSRF guard、output_subdir、browser-jobs endpoints / service、manifest + direct-DASH planner、shared security |
+| Dep-pin smoke | pytest | Python | （含在上面 539 內）| `test_*_upgrade_smoke.py` 鎖定 redis / curl_cffi / m3u8 / pycryptodome / fastapi / starlette 等最低版本 |
 | E2E api smoke | bash script | docker compose | 1 「test」 | 起 db+redis+api，POST /api/download → poll status |
 
-> 數字校準方式：`cd chrome-extension && npm test`（vitest 報 `Tests 317 passed`）、`uv run pytest -q video-downloader/docker/{api,worker}/tests`。改動 test 後回來更新這格。
+> 數字校準方式：`cd chrome-extension && npm test`（vitest 報 `Tests 358 passed`）、`uv run pytest -q video-downloader/docker/api/tests video-downloader/docker/worker/tests`（pytest 報 `539 passed`）。改動 test 後回來更新這格。
 
 **沒**有：
 - Worker 端的 e2e (real ffmpeg + .ts fixture) — 是 [ch 08 §1.4 選項 A](./08-bug-case-studies.md#14-補-cover-的方向從便宜到貴) 待補的東西
@@ -33,7 +33,7 @@ chrome-extension/
 │    / offscreen.js / content.js ...   ← code under test
 ├─ vitest.config.js           ← (空殼，用預設 config)
 ├─ package.json               ← devDeps: vitest, jsdom
-├─ tests/                     ← 15 個 *.test.js，共 317 tests
+├─ tests/                     ← 16 個 *.test.js，共 358 tests
 │  ├─ helpers/
 │  │  └─ load-script.js       ← 用 vm 把 .js 載進 sandbox
 │  ├─ background.test.js          ← SW helper（URL 分類、跨 tab 隔離）
@@ -43,11 +43,12 @@ chrome-extension/
 │  ├─ offscreen.test.js / offscreen-readiness.test.js
 │  ├─ browserPipelineCore.test.js / browser-manifest-fetch.test.js
 │  ├─ browser-job-persistence.test.js / runBrowserSideJob-ordering.test.js
-│  └─ segmentDownloader.test.js   ← browser-side segment fetch / decrypt / upload
+│  ├─ segmentDownloader.test.js   ← browser-side segment / byte-range fetch、decrypt、upload
+│  └─ updateCheckCore.test.js
 ```
 
 > 早期只有 `background.test.js` + `sidepanel.test.js`；v3.0 browser-side pipeline
-> 落地後 test 檔擴到 15 個。下面 §2.2–2.4 的 `load-script` / chrome-stub 技巧仍是
+> 落地後 test 檔持續擴充到 16 個。下面 §2.2–2.4 的 `load-script` / chrome-stub 技巧仍是
 > 所有檔案共用的基礎。
 
 跑：
@@ -237,9 +238,9 @@ docker exec -it video_worker_1 python -m pytest -q /app/worker/tests
 video-downloader/docker/api/tests/
 ├─ conftest.py
 ├─ test_api_validation.py           ← DownloadRequest / rate limit / SSRF
-├─ test_browser_jobs_endpoints.py   ← /api/jobs/init、segment PUT、finalize、abort
+├─ test_browser_jobs_endpoints.py   ← /api/jobs/init（含 direct_dash）、segment PUT、finalize、abort
 ├─ test_browser_jobs_service.py     ← browser-job service 層邏輯
-├─ test_manifest_planner.py         ← manifest → segment plan 產生
+├─ test_manifest_planner.py         ← manifest / direct-DASH complete tracks → segment/range plan
 ├─ test_shared_security.py          ← 共用 network safety helper
 └─ test_api_upgrade_smoke.py        ← fastapi/sqlalchemy/redis/starlette 版本鎖
 ```

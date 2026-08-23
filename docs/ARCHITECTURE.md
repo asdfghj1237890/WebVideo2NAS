@@ -17,20 +17,20 @@ This document provides detailed architecture diagrams and explanations for the W
 │  │                                                           │  │
 │  │  ┌─────────────────────────────────────────────────┐     │  │
 │  │  │  Website (Streaming Service)                    │     │  │
-│  │  │  └─→ Serves manifest / media URLs               │     │  │
+│  │  │  └─→ Serves manifests or player JSON + media    │     │  │
 │  │  └─────────────────────────────────────────────────┘     │  │
 │  │                         ↑                                 │  │
 │  │                         │ User browses                    │  │
 │  │                         ↓                                 │  │
 │  │  ┌─────────────────────────────────────────────────┐     │  │
 │  │  │  WebVideo2NAS Extension                         │     │  │
-│  │  │  • Detects m3u8/mpd/mp4/mov URLs               │     │  │
+│  │  │  • Detects URLs + paired JSON DASH tracks      │     │  │
 │  │  │  • Displays side panel UI                      │     │  │
 │  │  │  • Sends jobs or uploads browser segments      │     │  │
 │  │  └─────────────────────────────────────────────────┘     │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                         ↓                                       │
-│       HTTPS API calls: {url, headers} or staged segments         │
+│       HTTPS API calls: media input + headers or staged bytes     │
 │                         ↓                                       │
 └───────────────────────────────────────────────────────────────┘
                           │
@@ -84,7 +84,7 @@ This document provides detailed architecture diagrams and explanations for the W
 WebVideo2NAS has two job paths:
 
 - **NAS-direct** (`/api/download`): the NAS worker fetches the media URL itself. This remains the path for MP4/MOV and for HLS/DASH when browser-side mode is disabled.
-- **Browser-side** (`/api/jobs/init` + segment PUTs): the extension fetches HLS/DASH manifests and segments in the user's browser session, uploads staged bytes to the NAS, and the worker only muxes them with FFmpeg. This is the default for M3U8/MPD because many streams bind tokens/cookies to the browser session or public IP.
+- **Browser-side** (`/api/jobs/init` + segment PUTs): the extension fetches HLS/DASH manifests and segments in the user's browser session, or pairs complete video/audio `.m4s` tracks exposed by player JSON and fetches them as byte ranges. It uploads staged bytes to the NAS, and the worker only muxes them with FFmpeg. This is the default for M3U8/MPD and the required path for manifest-less JSON DASH.
 
 ### 2.1 NAS-direct lifecycle
 
@@ -180,20 +180,24 @@ WebVideo2NAS has two job paths:
 
 ```
 Chrome Extension / Offscreen
-├─→ Safety gate master URL
+├─→ Detect either a manifest or paired player-JSON DASH tracks
+├─→ Safety gate every source URL
 │   └─ HTTPS-only, local/private IP refusal, same-site or trusted CDN suffix
-├─→ Fetch manifest in browser session
-├─→ POST /api/jobs/init {manifest_text, base_url, headers}
-│   └─ API builds plan and runs always-on plan URL safety checks
+├─→ Manifest: fetch text in browser session
+│   └─ POST /api/jobs/init {manifest_text, base_url, headers}
+├─→ JSON DASH: probe video/audio length with Range: bytes=0-0
+│   └─ Require one-byte 206 + authoritative Content-Range total
+│      └─ POST /api/jobs/init {direct_dash:{video,audio}, headers}
+├─→ API builds plan and runs always-on plan URL safety checks
 ├─→ PUT /api/jobs/{id}/segments/{track}/{seq}
-│   └─ Extension fetches/decrypts media segments and uploads bytes
+│   └─ Extension fetches/decrypts media segments or contiguous ranges; API verifies declared Range length
 ├─→ POST /api/jobs/{id}/finalize
 │   └─ API queues a browser finalize job
 └─→ BROWSER_JOB_PROGRESS → sidepanel live progress
 
 Worker
 └─→ BLPOP browser finalize queue
-    └─ FFmpeg mux staged bytes → /downloads/... → completed
+    └─ FFmpeg mux staged bytes → duration/suspect validation → /downloads/... → completed
 ```
 
 ---
@@ -211,13 +215,16 @@ Worker
    │       └─→ Store: detectedUrls[]
    │           └─→ Update: Badge count
    │
+   ├─→ Receive: manifestDetected / directDashDetected from content script
+   │   └─→ Register manifest or paired representation per source tab
+   │
    ├─→ Listen: contextMenus.onClicked
    │   └─→ Action: sendToNAS(url)
    │       ├─→ API: POST /api/download (NAS-direct)
-   │       └─→ API: POST /api/jobs/init + PUT segments (browser-side)
+   │       └─→ API: POST /api/jobs/init + PUT segments/ranges (browser-side)
    │
    ├─→ Own offscreen document
-   │   └─→ Long-lived browser-side segment fetch/upload loop
+   │   └─→ Long-lived browser-side segment/range fetch/upload loop
    │
    └─→ Listen: chrome.alarms
        └─→ Action: pollJobStatus()
@@ -254,7 +261,7 @@ FastAPI Application
 │   │   └─→ Return 201 + job_id
 │   │
 │   ├─→ /api/jobs/init
-│   │   ├─→ Validate manifest text or URL
+│   │   ├─→ Validate manifest input or paired direct_dash tracks
 │   │   ├─→ Enforce browser plan URL safety
 │   │   ├─→ Create browser job + staging dir
 │   │   └─→ Return job_id + segment plan
@@ -633,4 +640,3 @@ Chrome    NAS
 ---
 
 For deployment instructions and configuration, see the project [README.md](../README.md). For API contracts and database schema, see [SPECIFICATION.md](SPECIFICATION.md).
-

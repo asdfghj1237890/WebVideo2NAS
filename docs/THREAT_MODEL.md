@@ -41,6 +41,7 @@
 ```
 [ 不受信任的網頁 ]
   manifest 文字 / segment URL / AES-key URI / DASH init·media URL
+  / player JSON 內成對的 direct-DASH video/audio URL + metadata
   + 使用者在該站的 cookie / 擷取到的 auth header
         │
         │  ← 邊界 A:網頁 → 擴充功能(background.js sendToNAS 組裝 job)
@@ -212,6 +213,12 @@ Guard 由環境變數 `SSRF_GUARD` 控制,**預設為關**:
 - 每 job staging 位元組配額:同時計入「已落地」與「in-flight 最壞值
   (`slot_count × MAX_SEGMENT_BYTES`)」對照 `MAX_JOB_STAGING_BYTES`(`main.py:1313-1333`),
   關閉多個併發 PUT 共同衝破配額的競態。
+- `direct_dash` 在建立 plan 前先加總 video/audio `content_length`，並用實際 chunk size 預估
+  segment count；超過 `MAX_JOB_STAGING_BYTES` 或 `MAX_BROWSER_SEGMENTS` 直接 413，避免先
+  materialize 大量重複 Range entries 才發現配額超標。
+- Direct-DASH 的 `content_length` 必須來自 one-byte `206` 的有效 `Content-Range` 總長；每個
+  Range PUT 在發布前核對實收長度，finalize 再逐檔核對 plan 長度，避免 stale metadata 或
+  被截斷的 response 變成看似完整的輸出。
 - 另有 browser-side plan 的 URL 安全檢查 `_enforce_plan_url_safety()`
   (`main.py:847-869`、`main.py:1135`),**永遠開啟**(不受 `SSRF_GUARD` 影響),因為擴充功能
   會帶著憑證跨來源讀取 plan 內的每個 URL,故拒絕指向非公開位址或非 http(s) scheme 的 plan。
@@ -221,10 +228,12 @@ Guard 由環境變數 `SSRF_GUARD` 控制,**預設為關**:
 - 網頁**無法直接**對 service worker 送訊息:`manifest.json` 未設定 `externally_connectable`,
   故任意頁面無法呼叫 `chrome.runtime.sendMessage` 觸發 `action:'sendToNAS'`
   (`background.js:1952`)。
-- 但頁面**可以「播種」偵測清單**:`content.js:248-256` 監聽 `window` 的 `message` 事件,只檢查
+- 但頁面**可以「播種」偵測清單**:`content.js` 監聽 `window` 的 `message` 事件,只檢查
   `event.source === window`、**未檢查 origin**;頁面自身在 MAIN world 執行的腳本可送出
-  `{type:'WV2NAS_MANIFEST_DETECTED', ...}`,由 `content.js` 轉發為 `manifestDetected`
-  (`background.js:1826`),使攻擊者選定的 URL 進入偵測清單。一般路徑仍需使用者手動點 Send
+  `{type:'WV2NAS_MANIFEST_DETECTED', ...}` 或 `{type:'WV2NAS_DIRECT_DASH_DETECTED', ...}`，
+  由 `content.js` 轉發為 `manifestDetected` / `directDashDetected`，使攻擊者選定的 URL 或 paired
+  track metadata 進入偵測清單。background 仍會做欄位/URL sanitization，`/api/jobs/init` 也會對
+  plan 中兩軌的每個 URL 跑 always-on safety check；一般路徑仍需使用者手動點 Send
   (`background.js:1045`),但使用者點下的 URL 與隨附的 cookie/token 可能是攻擊者安排的。
 - **AV-task 隱藏模式會無點擊自動送出**:`maybeFireAvTaskAutoSend()`
   (`background.js:1326-1365`,由 `background.js:819` 觸發)會把擴充功能自己開啟之分頁偵測到的

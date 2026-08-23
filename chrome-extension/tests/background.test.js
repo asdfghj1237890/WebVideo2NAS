@@ -96,6 +96,161 @@ describe('background.js pure helpers', () => {
     expect(ctx.isCandidateVideoUrl('https://a/b/preview.mov.jpg')).toBe(false);
   });
 
+  it('registers paired JSON DASH tracks as one MPD tile and refreshes signed URLs by stable key', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    const base = {
+      pageUrl: 'https://page.example/watch',
+      duration: 120,
+      video: {
+        url: 'https://cdn.example.com/video-1080.m4s?token=old',
+        mimeType: 'video/mp4',
+        codecs: 'avc1.640028',
+        width: 1920,
+        height: 1080,
+      },
+      audio: {
+        url: 'https://cdn.example.com/audio.m4s?token=old',
+        mimeType: 'audio/mp4',
+        codecs: 'mp4a.40.2',
+      },
+    };
+    expect(ctx.registerDirectDashDetection(7, base)).toBe(true);
+    expect(ctx.registerDirectDashDetection(7, {
+      ...base,
+      video: { ...base.video, url: 'https://cdn.example.com/video-1080.m4s?token=fresh' },
+      audio: { ...base.audio, url: 'https://cdn.example.com/audio.m4s?token=fresh' },
+    })).toBe(true);
+
+    const rows = ctx.__eval('currentTabUrls[7]');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].detectedFormat).toBe('mpd');
+    expect(rows[0].qualityHeight).toBe(1080);
+    expect(rows[0].url).toContain('token=fresh');
+    expect(rows[0].directDash.audio.url).toContain('token=fresh');
+  });
+
+  it('scopes detected DASH metadata and titles to the source tab', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    const sharedUrl = 'https://cdn.example.com/video.m4s?shared=1';
+    ctx.__eval(`
+      currentTabUrls[7] = [{
+        url: ${JSON.stringify(sharedUrl)},
+        pageTitle: 'Tab Seven',
+        detectedFormat: 'mpd',
+        directDash: { audio: { url: 'https://cdn.example.com/audio-a.m4s' } },
+      }];
+      currentTabUrls[8] = [{
+        url: ${JSON.stringify(sharedUrl)},
+        pageTitle: 'Tab Eight',
+        detectedFormat: 'mpd',
+        directDash: { audio: { url: 'https://cdn.example.com/audio-b.m4s' } },
+      }];
+    `);
+
+    expect(ctx.getDetectedUrlInfo(sharedUrl, 7).directDash.audio.url).toContain('audio-a');
+    expect(ctx.getDetectedUrlInfo(sharedUrl, 8).directDash.audio.url).toContain('audio-b');
+    expect(ctx.getDetectedUrlInfo(sharedUrl, 9)).toBe(null);
+    expect(ctx.getStoredPageTitle(sharedUrl, 7)).toBe('Tab Seven');
+    expect(ctx.getStoredPageTitle(sharedUrl, 8)).toBe('Tab Eight');
+  });
+
+  it('uses a shared DASH audio request as playback evidence for every quality', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    const audio = { url: 'https://cdn.example.com/audio.m4s?sig=1', mimeType: 'audio/mp4' };
+    for (const height of [1080, 720]) {
+      ctx.registerDirectDashDetection(7, {
+        pageUrl: 'https://page.example/watch',
+        video: { url: `https://cdn.example.com/video-${height}.m4s?sig=1`, mimeType: 'video/mp4', height },
+        audio,
+      });
+    }
+
+    const matches = ctx.markExistingDirectDashPlaybackFromTrack({
+      tabId: 7,
+      url: 'https://cdn.example.com/audio.m4s?sig=refreshed',
+    });
+    expect(matches).toHaveLength(2);
+    expect(ctx.__eval('currentTabUrls[7].every((row) => row.playbackObserved)')).toBe(true);
+  });
+
+  it('probes complete DASH track length with a one-byte Range request', async () => {
+    let requestInit = null;
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async (_url, init) => {
+        requestInit = init;
+        return {
+          status: 206,
+          headers: {
+            get(name) {
+              if (String(name).toLowerCase() === 'content-range') return 'bytes 0-0/12345678';
+              if (String(name).toLowerCase() === 'content-length') return '1';
+              return null;
+            },
+          },
+          arrayBuffer: async () => new Uint8Array([0]).buffer,
+        };
+      },
+    });
+
+    await expect(ctx._wv2nasProbeDirectDashLength(
+      { url: 'https://cdn.example.com/video.m4s' },
+      { Authorization: 'Bearer token', Cookie: 'secret' },
+    )).resolves.toBe(12345678);
+    expect(requestInit.headers.Range).toBe('bytes=0-0');
+    expect(requestInit.headers.Authorization).toBe('Bearer token');
+    expect(requestInit.headers.Cookie).toBeUndefined();
+    expect(requestInit.redirect).toBe('error');
+  });
+
+  it('rejects a DASH length probe that omits Content-Range', async () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({
+        status: 206,
+        headers: {
+          get(name) {
+            return String(name).toLowerCase() === 'content-length' ? '1' : null;
+          },
+        },
+        arrayBuffer: async () => new Uint8Array([0]).buffer,
+      }),
+    });
+
+    await expect(ctx._wv2nasProbeDirectDashLength({
+      url: 'https://cdn.example.com/video.m4s',
+      contentLength: 12345678,
+    }, {})).rejects.toThrow(/Content-Range/);
+  });
+
+  it('never treats a complete JSON DASH m4s track as MPD text during metadata probing', async () => {
+    let fetchCalls = 0;
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => {
+        fetchCalls += 1;
+        throw new Error('binary track must not be fetched by probeMpd');
+      },
+    });
+    await ctx.probeVideoMeta({
+      url: 'https://cdn.example.com/video.m4s',
+      detectedFormat: 'mpd',
+      directDash: { video: {}, audio: {} },
+      duration: 90,
+    }, 7);
+    expect(fetchCalls).toBe(0);
+    expect(ctx.__eval("videoMetaByUrl['https://cdn.example.com/video.m4s'].duration")).toBe(90);
+  });
+
   it('infers an HLS variant playlist from segment URLs without treating segments as videos', () => {
     const ctx = loadScriptIntoContext('background.js', {
       chrome: makeChromeStub(),

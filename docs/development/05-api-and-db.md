@@ -15,8 +15,8 @@
 | `/api/jobs/{id}` | GET | ✅ Bearer | read (×6) | 單 job 詳情 |
 | `/api/jobs/{id}` | DELETE | ✅ Bearer | write | 取消 job |
 | `/api/status` | GET | ✅ Bearer | read (×6) | 系統狀態(active downloads / queue length) |
-| `/api/jobs/init` | POST | ✅ Bearer | write | **v3.0+** browser-side: 建 job + 解析 manifest_text → plan |
-| `/api/jobs/{id}/segments/{track}/{seq}` | PUT | ✅ Bearer | write | **v3.0+** browser-side: 上傳一段 staged segment |
+| `/api/jobs/init` | POST | ✅ Bearer | write | **v3.0+** browser-side: 由 manifest input 或 paired `direct_dash` 建 job + plan |
+| `/api/jobs/{id}/segments/{track}/{seq}` | PUT | ✅ Bearer | write | **v3.0+** browser-side: 上傳一段 manifest segment 或 direct-DASH Range chunk |
 | `/api/jobs/{id}/init/{label}` | PUT | ✅ Bearer | write | **v3.0+** browser-side: 上傳 init segment(label = `video` / `audio`) |
 | `/api/jobs/{id}/finalize` | POST | ✅ Bearer | write | **v3.0+** browser-side: 觸發 worker mux |
 | `/api/jobs/{id}/abort` | POST | ✅ Bearer | write | **v3.0+** browser-side: 客戶端中斷,刪 staging |
@@ -179,6 +179,50 @@ GROUP BY status;
 - 失敗 / 重啟 worker 對 API 透明
 
 代價：sidepanel 看到 `pending` 之後要 poll `/api/jobs` 才知道進度。每 2s poll 一次 acceptable（13 active jobs × 6 reads/sec 還在 read rate limit 內）。
+
+### 4.5 POST `/api/jobs/init` 的 input forms
+
+`JobInitRequest` 接受三種來源形狀：
+
+1. `url`：API / NAS 端抓 manifest。
+2. `manifest_text` + `base_url`：extension 已在 browser session 讀到 manifest body。
+3. `direct_dash`：頁面沒有 MPD，播放器 JSON 直接暴露完整 video/audio 軌道；此形狀跟所有 manifest fields（`url` / `manifest_text` / `base_url`）互斥。
+
+`direct_dash` request shape：
+
+```json
+{
+  "direct_dash": {
+    "video": {
+      "url": "https://media.example.com/video.m4s?token=...",
+      "content_length": 734003200,
+      "mime_type": "video/mp4",
+      "codecs": "avc1.640028",
+      "width": 1920,
+      "height": 1080,
+      "bandwidth": 2500000
+    },
+    "audio": {
+      "url": "https://media.example.com/audio.m4s?token=...",
+      "content_length": 52428800,
+      "mime_type": "audio/mp4",
+      "codecs": "mp4a.40.2"
+    },
+    "duration": 2432.0
+  },
+  "title": "Video title",
+  "referer": "https://example.com/watch/123",
+  "headers": {"Referer": "https://example.com/watch/123"}
+}
+```
+
+兩軌的 `url` 與正整數 `content_length` 必填。API 在 materialize plan 之前先拒絕：
+
+- video + audio 總長超過 `MAX_JOB_STAGING_BYTES`（預設 50 GiB）
+- 預估 Range chunk 數超過 `MAX_BROWSER_SEGMENTS`（預設 100,000）
+- 任一 URL 未通過 always-on browser plan URL safety
+
+Planner 以 `min(8 MiB, MAX_SEGMENT_BYTES)` 切出連續、無缺口的 byte ranges，回傳標記 `direct_range_concat=true` 的標準兩軌 DASH plan。Extension 仍走既有 segment PUT；API 會在每次 PUT 發布前核對實收 bytes 與 plan 的 `byte_range.length`，finalize 再逐檔核對一次。Worker 依 seq 重建每條完整軌道後 mux，並套用與 NAS-direct 相同的 duration shortfall / `suspect_reason` 判定。
 
 ## 5. GET /api/jobs（list）— sidepanel 主要呼叫
 

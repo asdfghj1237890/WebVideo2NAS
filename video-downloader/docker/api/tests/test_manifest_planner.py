@@ -936,3 +936,47 @@ asset.mp4
     segments = plan["tracks"]["video"]["segments"]
     assert segments[0]["byte_range"] == {"offset": 24, "length": 1000}
     assert segments[1]["byte_range"] == {"offset": 1024, "length": 500}
+
+
+def test_plan_direct_dash_splits_complete_tracks_into_contiguous_ranges():
+    plan = manifest_planner.plan_direct_dash(
+        {
+            "url": "https://cdn.example.com/video.m4s?sig=1",
+            "content_length": 21,
+            "mime_type": "video/mp4",
+            "codecs": "avc1.640028",
+            "width": 1920,
+            "height": 1080,
+        },
+        {
+            "url": "https://cdn.example.com/audio.m4s?sig=1",
+            "content_length": 9,
+            "mime_type": "audio/mp4",
+            "codecs": "mp4a.40.2",
+        },
+        duration=123.5,
+        chunk_bytes=8,
+    )
+
+    assert plan["container"] == "dash"
+    assert plan["direct_range_concat"] is True
+    assert plan["duration"] == 123.5
+    assert plan["resolution"] == {"width": 1920, "height": 1080}
+    assert plan["total_segments"] == 5
+    assert [s["byte_range"] for s in plan["tracks"]["video"]["segments"]] == [
+        {"offset": 0, "length": 8},
+        {"offset": 8, "length": 8},
+        {"offset": 16, "length": 5},
+    ]
+    assert [s["byte_range"] for s in plan["tracks"]["audio"]["segments"]] == [
+        {"offset": 0, "length": 8},
+        {"offset": 8, "length": 1},
+    ]
+
+
+def test_plan_direct_dash_rejects_invalid_lengths():
+    with pytest.raises(ManifestPlanError, match="content_length"):
+        manifest_planner.plan_direct_dash(
+            {"url": "https://cdn.example.com/video.m4s", "content_length": 0},
+            {"url": "https://cdn.example.com/audio.m4s", "content_length": 1},
+        )

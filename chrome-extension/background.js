@@ -415,7 +415,14 @@ function findBestCapturedEntry(targetUrl, sourcePageUrl, sourceTabId) {
     // Only consider manifest captures (m3u8/mpd or Content-Type detected)
     const kl = k.toLowerCase();
     const isManifestByExt = kl.includes('.m3u8') || kl.includes('.mpd');
-    const isManifestByFormat = !!getDetectedFormat(k);
+    const detectedInfo = getDetectedUrlInfo(
+      k,
+      hasSourceTab ? sourceTabId : undefined,
+    );
+    // JSON DASH uses detectedFormat='mpd' for UI/routing, but this key is a
+    // complete binary track, never a manifest substitute for another tile.
+    if (detectedInfo && detectedInfo.directDash) continue;
+    const isManifestByFormat = !!(detectedInfo && detectedInfo.detectedFormat);
     if (!isManifestByExt && !isManifestByFormat) continue;
 
     if (hasSourceTab) {
@@ -552,6 +559,20 @@ async function probeVideoMeta(row, tabId) {
   // hasOwnProperty so a stored "failed" entry still counts as cached.
   if (Object.prototype.hasOwnProperty.call(videoMetaByUrl, url)) return;
   if (videoMetaProbing.has(url)) return;
+
+  // A manifest-less DASH candidate points at the complete binary video track,
+  // not MPD XML. Never feed that URL to probeMpd(). Besides returning nonsense,
+  // res.text() would buffer the entire .m4s file in the service worker. The JSON
+  // payload already gave us its duration when available.
+  if (row.directDash) {
+    const duration = Number(row.duration);
+    videoMetaByUrl[url] = {
+      duration: Number.isFinite(duration) && duration > 0 ? duration : null,
+      isLive: false,
+      ts: Date.now(),
+    };
+    return;
+  }
 
   const lower = url.toLowerCase();
   const fmt = String(row.detectedFormat || '').toLowerCase();
@@ -795,6 +816,127 @@ function isCandidateVideoUrl(rawUrl) {
   return true;
 }
 
+function sanitizeDirectDashTrack(raw, kind) {
+  if (!raw || typeof raw !== 'object') return null;
+  let parsed;
+  try { parsed = new URL(String(raw.url || '')); } catch (_) { return null; }
+  // Browser-side plans require HTTPS so DNS-rebinding protection can remain
+  // fail-closed between API validation and the extension's later fetch.
+  if (parsed.protocol !== 'https:') return null;
+
+  const mimeType = String(raw.mimeType || raw.mime_type || '').toLowerCase().slice(0, 200);
+  if (mimeType && !mimeType.startsWith(`${kind}/`)) return null;
+  if (!/\.m4s$/i.test(parsed.pathname) && !mimeType.startsWith(`${kind}/`)) return null;
+
+  const positiveNumber = (value, max = Number.MAX_SAFE_INTEGER) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 && n <= max ? n : null;
+  };
+  const backupUrls = [];
+  for (const candidate of Array.isArray(raw.backupUrls) ? raw.backupUrls.slice(0, 3) : []) {
+    try {
+      const backup = new URL(String(candidate));
+      if (backup.protocol === 'https:') backupUrls.push(backup.href);
+    } catch (_) { /* ignore malformed backup */ }
+  }
+
+  return {
+    url: parsed.href,
+    backupUrls,
+    mimeType: mimeType || null,
+    codecs: raw.codecs == null ? null : String(raw.codecs).slice(0, 200),
+    width: positiveNumber(raw.width, 32768),
+    height: positiveNumber(raw.height, 32768),
+    bandwidth: positiveNumber(raw.bandwidth),
+    contentLength: positiveNumber(raw.contentLength),
+    representationId: raw.representationId == null
+      ? null : String(raw.representationId).slice(0, 100),
+  };
+}
+
+function directDashResourceKey(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+function directDashDedupeKey(track) {
+  const resource = directDashResourceKey(track && track.url);
+  if (!resource) return null;
+  return `direct-dash|${resource}|${track.height || ''}|${track.representationId || ''}`;
+}
+
+function directDashTrackUrls(item) {
+  const direct = item && item.directDash;
+  if (!direct) return [];
+  const out = [];
+  for (const track of [direct.video, direct.audio]) {
+    if (!track) continue;
+    if (track.url) out.push(track.url);
+    for (const backup of track.backupUrls || []) out.push(backup);
+  }
+  return out;
+}
+
+function findDirectDashCandidatesForTrack(tabId, rawUrl) {
+  if (tabId == null || typeof tabId !== 'number' || tabId < 0) return [];
+  const requestKey = directDashResourceKey(rawUrl);
+  if (!requestKey) return [];
+  return (currentTabUrls[tabId] || []).filter((item) => (
+    item && item.directDash && directDashTrackUrls(item)
+      .some((url) => directDashResourceKey(url) === requestKey)
+  ));
+}
+
+function markExistingDirectDashPlaybackFromTrack(details) {
+  const matches = findDirectDashCandidatesForTrack(details && details.tabId, details && details.url);
+  if (matches.length === 0) return [];
+  const now = Date.now();
+  for (const item of matches) {
+    item.playbackObserved = true;
+    item.lastSegmentAt = now;
+    item.timestamp = now;
+  }
+  notifyDetectedUrlsUpdated(details.tabId);
+  return matches;
+}
+
+function registerDirectDashDetection(tabId, request) {
+  if (tabId == null || typeof tabId !== 'number' || tabId < 0) return false;
+  const video = sanitizeDirectDashTrack(request && request.video, 'video');
+  const audio = sanitizeDirectDashTrack(request && request.audio, 'audio');
+  if (!video || !audio) return false;
+
+  const dedupeKey = directDashDedupeKey(video);
+  if (!dedupeKey) return false;
+  const tabRows = currentTabUrls[tabId] || [];
+  const alreadyKnown = findExistingDetectedUrlInfo(tabRows, dedupeKey, video.url);
+  if (!alreadyKnown && tabRows.filter((row) => row && row.directDash).length >= 32) {
+    return false;
+  }
+
+  const duration = Number(request && request.duration);
+  registerDetectedUrl({
+    url: video.url,
+    tabId,
+    initiator: request.pageUrl,
+    documentUrl: request.pageUrl,
+    type: 'xmlhttprequest',
+    frameId: 0,
+    method: 'GET',
+  }, {
+    detectedFormat: 'mpd',
+    dedupeKey,
+    qualityHeight: video.height || null,
+    duration: Number.isFinite(duration) && duration > 0 ? duration : null,
+    directDash: { video, audio },
+  });
+  return true;
+}
+
 function inferHlsManifestFromSegmentUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return null;
 
@@ -912,6 +1054,9 @@ function mergeDetectedUrlExtra(existing, extra) {
   if (lastSegmentAt > (Number(existing.lastSegmentAt) || 0)) {
     existing.lastSegmentAt = lastSegmentAt;
   }
+  if (extra.directDash) existing.directDash = extra.directDash;
+  if (extra.qualityHeight) existing.qualityHeight = extra.qualityHeight;
+  if (extra.duration) existing.duration = extra.duration;
 }
 
 function findExistingDetectedUrlInfo(list, detectionKey, url) {
@@ -1053,7 +1198,13 @@ chrome.webRequest.onBeforeRequest.addListener(
           dedupeKey: inferredManifest.dedupeKey,
         }
       );
-    } else if (/\.(?:ts|m4s)(?:[?#]|$)/i.test(details.url)) {
+    } else if (/\.m4s(?:[?#]|$)/i.test(details.url)) {
+      // Manifest-less DASH JSON exposes complete video/audio .m4s tracks.
+      // A matching request proves the player has started and the signed URLs
+      // belong to this tab; it must never create a standalone .m4s tile.
+      markExistingDirectDashPlaybackFromTrack(details);
+      markExistingHlsPlaybackFromSegment(details);
+    } else if (/\.ts(?:[?#]|$)/i.test(details.url)) {
       // Generic fallback for HLS layouts whose segment filename does not
       // encode the playlist name. Never creates a guessed URL; it only marks
       // the closest manifest that was already observed in this tab.
@@ -1100,9 +1251,10 @@ chrome.webRequest.onHeadersReceived.addListener(
 chrome.webRequest.onSendHeaders.addListener(
   function(details) {
     const urlLower = details.url.toLowerCase();
+    const directDashMatches = findDirectDashCandidatesForTrack(details.tabId, details.url);
     
     // Capture headers for video URLs (by extension or Content-Type detection)
-    if (isCandidateVideoUrl(details.url) || getDetectedFormat(details.url)) {
+    if (isCandidateVideoUrl(details.url) || getDetectedFormat(details.url) || directDashMatches.length > 0) {
       // Convert headers array to object
       const headersObj = {};
       const SINGLETON_HEADERS = new Set(['User-Agent', 'Referer', 'Origin']);
@@ -1155,14 +1307,26 @@ chrome.webRequest.onSendHeaders.addListener(
           }
         }
       }
+      if (directDashMatches.length > 0) {
+        markExistingDirectDashPlaybackFromTrack(details);
+      }
       
       // Store headers keyed by URL
-      capturedHeaders[details.url] = {
+      const capturedEntry = {
         headers: headersObj,
         timestamp: Date.now(),
         initiator: details.initiator || details.documentUrl,
         tabId: details.tabId
       };
+      capturedHeaders[details.url] = capturedEntry;
+      // A player may choose a backup CDN URL while the JSON candidate keeps
+      // the primary URL. Reuse the observed same-tab headers for each paired
+      // primary track so clicking any quality does not lose Referer/auth.
+      for (const item of directDashMatches) {
+        for (const track of [item.directDash.video, item.directDash.audio]) {
+          if (track && track.url) capturedHeaders[track.url] = capturedEntry;
+        }
+      }
       
       console.log('Captured headers for:', details.url);
       const loggedHeaders = { ...headersObj };
@@ -1331,7 +1495,12 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
-function getDetectedUrlInfo(url) {
+function getDetectedUrlInfo(url, preferredTabId) {
+  if (typeof preferredTabId === 'number' && preferredTabId >= 0) {
+    const scopedList = currentTabUrls[preferredTabId];
+    if (!Array.isArray(scopedList)) return null;
+    return scopedList.find(x => x && x.url === url) || null;
+  }
   for (const tabId of Object.keys(currentTabUrls)) {
     const list = currentTabUrls[tabId];
     if (!Array.isArray(list)) continue;
@@ -1345,8 +1514,8 @@ function getDetectedUrlInfo(url) {
 }
 
 // Check if a URL was detected via Content-Type (stored in per-tab or orphan lists)
-function getDetectedFormat(url) {
-  const item = getDetectedUrlInfo(url);
+function getDetectedFormat(url, preferredTabId) {
+  const item = getDetectedUrlInfo(url, preferredTabId);
   return (item && item.detectedFormat) ? item.detectedFormat : null;
 }
 
@@ -1354,7 +1523,13 @@ function getDetectedFormat(url) {
 // This is the source of truth for "what tab/page this URL came from" — using
 // it avoids the multi-tab bug where the active tab at click-time could be
 // different from the tab the URL was actually detected on.
-function getStoredPageTitle(url) {
+function getStoredPageTitle(url, preferredTabId) {
+  if (typeof preferredTabId === 'number' && preferredTabId >= 0) {
+    const scopedList = currentTabUrls[preferredTabId];
+    if (!Array.isArray(scopedList)) return null;
+    const scopedItem = scopedList.find(x => x && x.url === url);
+    return scopedItem && scopedItem.pageTitle ? scopedItem.pageTitle : null;
+  }
   for (const tabId of Object.keys(currentTabUrls)) {
     const list = currentTabUrls[tabId];
     if (!Array.isArray(list)) continue;
@@ -1638,7 +1813,10 @@ function maybeFireAvTaskAutoSend(tabId, manifestUrl) {
     const cachedTitle = getStoredPageTitle(manifestUrl);
     const title = liveTitle || cachedTitle || `[${pending.code}]`;
     sendToNAS(manifestUrl, title, pageUrl, tabId)
-      .then(() => {
+      .then((result) => {
+        if (!result || result.success !== true) {
+          throw new Error((result && result.error) || 'sendToNAS failed');
+        }
         avHistoryUpdate(pending.historyId, {
           status: 'sent',
           sentAt: Date.now(),
@@ -1701,6 +1879,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // missing, substitution falls back to strict initiator equality.
 async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
   try {
+    const targetInfo = getDetectedUrlInfo(url, sourceTabId);
     // Codex review (P1): `getDetectedFormat()` only returns a value
     // when the URL was detected via Content-Type sniffing. Most
     // streams are detected via URL-pattern matching in
@@ -1712,15 +1891,16 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     // Fall back to URL-suffix sniffing for the common .m3u8 / .mpd
     // case so the routing decision matches user intent. Same
     // pattern as `probeVideoMeta`, which already does this.
-    let formatHint = getDetectedFormat(url);
+    let formatHint = getDetectedFormat(url, sourceTabId);
     if (!formatHint) {
       const lower = url.toLowerCase();
       if (lower.includes('.m3u8')) formatHint = 'm3u8';
       else if (lower.includes('.mpd')) formatHint = 'mpd';
     }
     if (!isCandidateVideoUrl(url) && !formatHint) {
-      showNotification('Error', 'Not a valid video URL');
-      return;
+      const message = 'Not a valid video URL';
+      showNotification('Error', message);
+      return { success: false, error: message };
     }
 
     // Get settings
@@ -1730,9 +1910,10 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     ]);
 
     if (!settings.nasEndpoint || !settings.apiKey) {
-      showNotification('Configuration Required', 'Please configure NAS settings in extension options');
+      const message = 'Please configure NAS settings in extension options';
+      showNotification('Configuration Required', message);
       chrome.runtime.openOptionsPage();
-      return;
+      return { success: false, error: message };
     }
     
     // Extract title from page title or URL
@@ -1747,7 +1928,6 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     let finalHeaders = {};
     let urlToSend = url;
 
-    const targetInfo = getDetectedUrlInfo(url);
     let captured = capturedHeaders[url];
     const best = findBestCapturedEntry(url, pageUrl, sourceTabId);
     const keepClickedDetectedSignedUrl = shouldKeepClickedDetectedSignedUrl(url, targetInfo, best);
@@ -1760,6 +1940,7 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     // substitution is possible at this point.
     const shouldUseBest =
       !!best &&
+      !(targetInfo && targetInfo.directDash) &&
       !keepClickedDetectedSignedUrl &&
       (captured == null || best.score >= 15 || (best.entry && best.entry.timestamp && captured.timestamp && best.entry.timestamp > captured.timestamp));
 
@@ -1861,6 +2042,13 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
       referer: pageUrl,
       headers: finalHeaders
     };
+    if (targetInfo && targetInfo.directDash) {
+      requestBody.direct_dash = targetInfo.directDash;
+      const directDuration = Number(targetInfo.duration);
+      if (Number.isFinite(directDuration) && directDuration > 0) {
+        requestBody.direct_dash.duration = directDuration;
+      }
+    }
     if (formatHint) {
       requestBody.format = formatHint;
     }
@@ -1887,6 +2075,9 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     let useBrowserSide =
       (settings.useBrowserSide !== false) &&
       (formatHint === 'm3u8' || formatHint === 'mpd');
+    if (requestBody.direct_dash && settings.useBrowserSide === false) {
+      throw new Error('JSON DASH video/audio tracks require browser-side mode');
+    }
 
     // Pre-check the master URL against the browser-side safety gate
     // before attempting browser-side mode. Private/metadata/local or
@@ -1932,9 +2123,22 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
           formatHint,
           trustedCdnSuffixes: settings.trustedCdnSuffixes,
         });
-        return;
+        return { success: true, mode: 'browser' };
       } catch (err) {
         browserSideErr = err;
+      }
+      // A locally-reloaded extension can be newer than the deployed NAS
+      // container. The pre-direct-DASH API ignores the unknown field and its
+      // old validator reports that url/manifest_text is missing. Surface that
+      // as an explicit deployment mismatch instead of a generic 422 that the
+      // sidepanel previously swallowed as a successful submission.
+      if (
+        requestBody.direct_dash
+        && (browserSideErr.fallbackable || browserSideErr.directDashUnsupported)
+      ) {
+        const message = 'The NAS API does not support JSON DASH yet. Update/redeploy the NAS service, then retry.';
+        showNotification('NAS update required', message, { requireInteraction: true, priority: 2 });
+        return { success: false, error: message, code: 'direct_dash_api_unsupported' };
       }
       // Codex adversarial-review: legacy compat fallback is now
       // gated to 404 only (legacy NAS without /api/jobs/init). Other
@@ -1945,11 +2149,12 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
       // legitimate HTTP-only streams without going through 422.
       if (!browserSideErr.fallbackable) {
         console.error('Browser-side job failed:', browserSideErr);
+        const message = browserSideErr.message || String(browserSideErr);
         showNotification(
           'Browser-side job failed',
-          browserSideErr.message || String(browserSideErr),
+          message,
         );
-        return;
+        return { success: false, error: message };
       }
       console.warn(
         '[wv2nas] Browser-side init returned 404 (legacy NAS?); '
@@ -1997,6 +2202,7 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     
     // Store job info
     storeJob(result);
+    return { success: true, mode: 'nas_direct', jobId: result.id };
     
   } catch (error) {
     console.error('Error sending to NAS:', error);
@@ -2015,6 +2221,7 @@ async function sendToNAS(url, pageTitle, pageUrl, sourceTabId) {
     } else {
       showNotification('Error', error.message);
     }
+    return { success: false, error: error && error.message ? error.message : String(error) };
   }
 }
 
@@ -2116,6 +2323,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       registerDetectedUrl(details, { detectedFormat: format });
     }
     sendResponse({ success: true });
+    return;
+  }
+
+  if (request.action === 'directDashDetected') {
+    const tabId = sender.tab?.id;
+    const accepted = registerDirectDashDetection(tabId, request);
+    sendResponse({ success: accepted });
     return;
   }
 
@@ -2230,20 +2444,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'sendToNAS') {
+    // Anchor every URL-derived lookup to the tab that issued the send. The
+    // same signed URL can appear in multiple tabs with different paired DASH
+    // audio tracks, titles, cookies, or expiry state; a global first-match
+    // lookup can silently build a cross-tab payload.
+    const sourceTabId = (typeof request.tabId === 'number' && request.tabId >= 0)
+      ? request.tabId : null;
     // Prefer the title that was captured when this URL was first detected —
     // that pins the title to the URL's source tab and survives the user
     // switching tabs before clicking Send. Fall back to whatever the caller
     // sent (right-click context menu provides the correct tab.title), then
     // to a generic placeholder.
     const titleToUse =
-      getStoredPageTitle(request.url) || request.title || 'Untitled Video';
+      getStoredPageTitle(request.url, sourceTabId) || request.title || 'Untitled Video';
     // Anchor the captured-header substitution to the tab the user clicked
     // Send from. Without this, same-site multi-tab sessions leak each
     // other's URLs through findBestCapturedEntry's origin scoring (see the
     // hard filter there for the full story).
-    const sourceTabId = (typeof request.tabId === 'number' && request.tabId >= 0)
-      ? request.tabId : null;
-
     // Hold the message channel open until sendToNAS settles. Without `return
     // true` + a deferred sendResponse, Chrome considers this handler done the
     // moment we return synchronously, and the MV3 service worker becomes
@@ -2252,7 +2469,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // tabs in quick succession, the first 1–2 land but the later ones lose
     // their in-flight chains to SW termination and never reach the NAS.
     sendToNAS(request.url, titleToUse, request.pageUrl, sourceTabId)
-      .then(() => sendResponse({ success: true }))
+      .then((result) => sendResponse(result || { success: true }))
       .catch((err) => {
         console.error('sendToNAS failed:', err);
         sendResponse({ success: false, error: err && err.message });
@@ -2593,6 +2810,67 @@ function _wv2nasHttpsEquivalent(rawUrl) {
 
 function _wv2nasCanUseNasDirectForBrowserUnsafeUrl(url, pageUrl) {
   return _wv2nasBrowserPipelineCore.canUseNasDirectForBrowserUnsafeUrl(url, pageUrl);
+}
+
+
+async function _wv2nasProbeDirectDashLength(track, requestHeaders) {
+  if (!track || !track.url) throw new Error('Direct DASH track URL is missing');
+  const headers = _wv2nasFilterFetchHeaders(requestHeaders || {});
+  headers.Range = 'bytes=0-0';
+  const response = await fetch(track.url, {
+    credentials: 'include',
+    headers,
+    cache: 'no-store',
+    redirect: 'error',
+  });
+  if (response.status !== 206) {
+    try { if (response.body) await response.body.cancel(); } catch (_) {}
+    throw new Error(`Direct DASH range probe returned HTTP ${response.status}`);
+  }
+
+  const declared = Number(response.headers && response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > 1) {
+    try { if (response.body) await response.body.cancel(); } catch (_) {}
+    throw new Error(`Direct DASH range probe returned ${declared} bytes instead of 1`);
+  }
+  const bytes = await response.arrayBuffer();
+  if (bytes.byteLength !== 1) {
+    throw new Error(`Direct DASH range probe body was ${bytes.byteLength} bytes instead of 1`);
+  }
+
+  const contentRange = response.headers && response.headers.get('content-range');
+  const match = /^bytes\s+0-0\/(\d+)$/i.exec(String(contentRange || '').trim());
+  const total = match ? Number(match[1]) : NaN;
+  if (!Number.isSafeInteger(total) || total <= 0) {
+    throw new Error('Direct DASH range probe did not expose a valid Content-Range total');
+  }
+  return total;
+}
+
+
+async function _wv2nasPrepareDirectDashPayload(directDash, requestHeaders) {
+  if (!directDash || !directDash.video || !directDash.audio) {
+    throw new Error('Direct DASH requires paired video and audio tracks');
+  }
+  const toApiTrack = async (track) => ({
+    url: track.url,
+    content_length: await _wv2nasProbeDirectDashLength(track, requestHeaders),
+    mime_type: track.mimeType || null,
+    codecs: track.codecs || null,
+    width: track.width || null,
+    height: track.height || null,
+    bandwidth: track.bandwidth || null,
+  });
+  const [video, audio] = await Promise.all([
+    toApiTrack(directDash.video),
+    toApiTrack(directDash.audio),
+  ]);
+  const duration = Number(directDash.duration);
+  return {
+    video,
+    audio,
+    duration: Number.isFinite(duration) && duration > 0 ? duration : null,
+  };
 }
 
 
@@ -3207,6 +3485,7 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
   // when both completion failed AND finalize was never attempted.
   let finalizeAttempted = false;
   let userCancelled = false;
+  const directDash = requestBody && requestBody.direct_dash;
 
   try {
     // Codex adversarial-review (high): determine whether the master
@@ -3221,19 +3500,22 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     // for untrusted hosts so neither header-spoof nor CORS-relax
     // emits.
     const masterTrustAnchor = pageUrl || (requestBody && requestBody.source_page) || null;
-    let masterUrlHost = null;
-    try {
-      masterUrlHost = new URL(requestBody.url).hostname.toLowerCase();
-    } catch (_) { /* malformed URL caught earlier by safety gate */ }
-    // User-allowlisted CDN suffix counts as same-site for the DNR
-    // CORS-relax decision too — otherwise the response body comes back
-    // opaque and `_wv2nasFetchManifestInBrowser` can't read it as
-    // `manifest_text`. The user explicitly asserted trust for this
-    // suffix in extension options.
-    const masterTrustedForDnr = masterTrustAnchor && (
-      _wv2nasIsTrustedDnrUrl(requestBody.url, masterTrustAnchor)
-      || _wv2nasMatchesTrustedCdnSuffix(masterUrlHost, trustedCdnSuffixes)
-    );
+    const phase1Urls = directDash
+      ? [directDash.video && directDash.video.url, directDash.audio && directDash.audio.url].filter(Boolean)
+      : [requestBody.url];
+    const trustedPhase1Urls = [];
+    for (const phase1Url of phase1Urls) {
+      const safety = _wv2nasIsManifestUrlSafeForBrowser(
+        phase1Url,
+        masterTrustAnchor,
+        trustedCdnSuffixes,
+      );
+      if (!safety.safe) {
+        const refusalKind = directDash ? 'media URL' : 'manifest fetch';
+        throw new Error(`Browser-side ${refusalKind} refused: ${safety.reason}`);
+      }
+      trustedPhase1Urls.push(phase1Url);
+    }
 
     // === Phase 1 DNR: cover the manifest URL ===
     // Codex review #8: install header-spoof rules for the manifest URL
@@ -3241,11 +3523,11 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     // bare fetch will see Referer/Origin/UA matching what the player
     // sent and serve the manifest the same way.
     const phase1Rules = _wv2nasBuildDnrRules({
-      segmentUrls: [requestBody.url],
+      segmentUrls: phase1Urls,
       // Codex adversarial-review: explicit trusted set — empty when
       // the master URL isn't same-site with the page so CORS-relax
       // doesn't fire on an unvalidated host.
-      trustedSegmentUrls: masterTrustedForDnr ? [requestBody.url] : [],
+      trustedSegmentUrls: trustedPhase1Urls,
       referer, origin: originValue, userAgent, idBase,
       initiatorDomain: chrome.runtime.id,
     });
@@ -3258,14 +3540,15 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
       ruleIds = phase1Ids;
     }
 
-    // Now fetch the manifest with DNR rules active.
+    // Now fetch the manifest (or probe the paired complete fMP4 tracks) with
+    // DNR rules active.
     // Codex review: pass the dnrContext so the helper can (1) extend
     // DNR coverage to the variant URL when an HLS master resolves to
     // a variant on a different directory/origin, and (2) ride captured
     // auth headers (Authorization / X-* tokens) along with the fetch.
     // Without (1), variant fetches lack spoofed Referer/Origin/UA and
     // 403. Without (2), header-token-gated manifests 401 before init.
-    const browserFetched = await _wv2nasFetchManifestInBrowser(
+    const browserFetched = directDash ? null : await _wv2nasFetchManifestInBrowser(
       requestBody.url,
       {
         referer,
@@ -3299,7 +3582,12 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
       output_subdir: requestBody.output_subdir,
       container_hint: formatHint,
     };
-    if (browserFetched) {
+    if (directDash) {
+      initPayload.direct_dash = await _wv2nasPrepareDirectDashPayload(
+        directDash,
+        requestBody.headers,
+      );
+    } else if (browserFetched) {
       initPayload.manifest_text = browserFetched.manifest_text;
       initPayload.base_url = browserFetched.base_url;
       // base_url already pinpoints the variant; don't also send url to
@@ -3320,6 +3608,13 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
       const errJson = await initResp.json().catch(() => ({}));
       const detail = formatApiErrorDetail(errJson, initResp.status);
       const initErr = new Error(`Init failed: ${detail}`);
+      if (
+        directDash
+        && initResp.status === 422
+        && /Either url or manifest_text(?:, or direct_dash)? is required/i.test(detail)
+      ) {
+        initErr.directDashUnsupported = true;
+      }
       // Codex adversarial-review (high): only 404 is a clear
       // compatibility issue (the /api/jobs/init endpoint doesn't
       // exist on a legacy NAS that hasn't been upgraded to v2.5).
@@ -3353,6 +3648,8 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
       plan,
       [
         requestBody.url,
+        directDash && directDash.video && directDash.video.url,
+        directDash && directDash.audio && directDash.audio.url,
         browserFetched && browserFetched.base_url,
         plan && plan.source_url,
         plan && plan.selected_variant_url,

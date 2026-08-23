@@ -8,7 +8,7 @@
 
 **Languages**: **English** (`README.md`) | **繁體中文** (`README.zh-TW.md`)
 
-> Seamlessly capture web video URLs (M3U8, MPD, MP4, and MOV) from Chrome and download them to your NAS — including browser-side HLS/DASH jobs for session-bound streams
+> Seamlessly capture web video URLs (M3U8, MPD, MP4, and MOV) plus manifest-less JSON DASH tracks from Chrome and download them to your NAS — including browser-side HLS/DASH jobs for session-bound streams
 
 > [!IMPORTANT]
 > This project does **not** guarantee every video can be downloaded. Some sites use DRM, expiring URLs, anti-hotlinking, IP restrictions, or change their delivery logic at any time.
@@ -38,7 +38,7 @@
 ## Overview
 
 This system enables you to:
-1. 🔍 Detect M3U8, MPD, MP4, and MOV video URLs in Chrome (including disguised streams)
+1. 🔍 Detect M3U8, MPD, MP4, and MOV video URLs in Chrome, including disguised manifests and paired video/audio DASH tracks exposed only through player JSON
 2. 📤 Send URLs to your NAS with one click
 3. ⬇️ Download through NAS-direct or browser-side mode for session-bound HLS/DASH streams
 4. 💾 Store videos on your NAS storage
@@ -69,6 +69,8 @@ This system enables you to:
 ### Chrome Extension
 - ✅ Automatic M3U8, MPD, MP4, and MOV URL detection
 - ✅ Deep manifest interception — detects disguised streams (e.g. `.jpg`-wrapped HLS) via fetch/XHR content inspection
+- ✅ Manifest-less JSON DASH detection — pairs complete video/audio `.m4s` tracks and keeps each quality selectable
+- ✅ Quality filters appear whenever mixed known resolutions are present, even with six or fewer detected items
 - ✅ One-click send to NAS
 - ✅ Side panel interface for easy access
 - ✅ Browser-side HLS/DASH mode for cookie/IP-bound streams
@@ -237,7 +239,7 @@ Synology UI: open the Project → **Action → Pull** → **Restart**.
 ## Usage
 
 1. Browse to any video streaming site
-2. When a video URL (M3U8/MPD/MP4/MOV) is detected, the extension side panel lists it
+2. When a video URL (M3U8/MPD/MP4/MOV) or a paired JSON DASH representation is detected, the extension side panel lists it
 3. Click extension icon to open side panel, or right-click → "Send to NAS"
 4. For browser-side HLS/DASH, press play on the page first so the player issues the current session token
 5. Video downloads automatically to your NAS (with cookies/headers for authenticated streams)
@@ -270,7 +272,7 @@ The default compose runs **3 download workers**. For higher throughput copy the 
 In `chrome://extensions/` → **WebVideo2NAS** → **Settings**:
 - **NAS Endpoint**: `http://YOUR_NAS_IP:52052` (LAN IP, not `localhost`)
 - **API Key**: same value as `API_KEY` in `.env`
-- **Auto Detect**: surfaces M3U8/MP4 URLs as you browse
+- **Auto Detect**: surfaces M3U8/MPD/MP4/MOV URLs and paired JSON DASH representations as you browse
 - **Notifications**: completion alerts
 
 ## Security
@@ -293,6 +295,7 @@ When reporting, include: type of issue, affected file path / commit, reproductio
 
 - ❌ DRM-protected content not supported
 - ❌ Some streaming sites use additional encryption
+- ℹ️ Manifest-less DASH requires the player response to expose both complete video and audio track URLs plus byte lengths; telemetry/heartbeat requests alone are not media sources
 - ❌ Requires network connectivity between Chrome and NAS
 - ℹ️ Download speed limited by network and NAS hardware
 
@@ -307,7 +310,7 @@ For first-run / install issues see the [Common issues table](#common-issues) at 
 
 ### Download fails
 - `docker compose logs -f worker` — failure reason is usually one error line
-- For authenticated streams: confirm the extension captured cookies for the manifest's domain (extension Settings → check the captured-headers panel)
+- For authenticated streams: confirm the extension captured cookies for the manifest or media-track domain (extension Settings → check the captured-headers panel)
 - HTTP 403/474 from segment downloads usually means the URL has expired — re-detect from a fresh page load
 - Disk full? `df -h /downloads`
 
@@ -348,6 +351,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <details>
 <summary><strong>Full Changelog (click to expand)</strong></summary>
+
+### [Unreleased]
+
+### [3.3.2] - 2026-08-24
+
+#### Added
+- Manifest-less JSON DASH support: bounded player-response inspection (including chunked JSON without `Content-Length`) pairs complete video/audio `.m4s` tracks, keeps query-only qualities distinct, exposes one selectable tile per quality, and requires a one-byte Range response with an authoritative `Content-Range` total.
+- A mutually exclusive `/api/jobs/init` `direct_dash` input. The API validates both tracks, enforces URL and staging caps before plan materialization, and splits complete tracks into contiguous byte-range tasks for bounded browser memory use.
+
+#### Changed
+- Resolution sorting and filters now use structural `qualityHeight` metadata, so mixed 1080p/720p results remain filterable even when six or fewer items are detected.
+- Submission feedback is now immediate, but a tile is marked sent only after background confirmation; failures restore its retryable selection state. Background/API failures are returned to the side panel instead of being reported as successful sends, and a locally reloaded extension paired with an older NAS API shows an explicit NAS-update error for JSON DASH.
+- Direct-DASH metadata/title lookup is pinned to the source tab. The NAS verifies every uploaded byte-range length before publish and again at finalize, while browser-finalized files now run the same duration-shortfall/suspect check as NAS-direct downloads.
+- The animated system architecture diagram now shows both manifest planning and manifest-less JSON DASH range staging.
 
 ### [3.1.10] - 2026-06-13
 

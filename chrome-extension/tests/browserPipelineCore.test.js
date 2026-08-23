@@ -32,7 +32,11 @@ describe('browserPipelineCore shared helpers', () => {
     expect(rules[0].action.requestHeaders.map((h) => h.header))
       .toEqual(['referer', 'origin', 'user-agent']);
     expect(rules[1].action.responseHeaders.map((h) => h.header))
-      .toEqual(['access-control-allow-origin', 'access-control-allow-credentials']);
+      .toEqual([
+        'access-control-allow-origin',
+        'access-control-allow-credentials',
+        'access-control-expose-headers',
+      ]);
     expect(rules[0].condition.initiatorDomains).toEqual(['extension-id']);
   });
 

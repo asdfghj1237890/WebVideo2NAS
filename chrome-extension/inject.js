@@ -29,6 +29,19 @@
     } catch (_) {}
   }
 
+  function notifyDirectDash(video, audio, duration) {
+    var data = {
+      type: 'WV2NAS_DIRECT_DASH_DETECTED',
+      video: video,
+      audio: audio,
+      duration: duration
+    };
+    window.__wv2nas_manifests.push(data);
+    try {
+      window.postMessage(data, '*');
+    } catch (_) {}
+  }
+
   // Skip URLs that definitely can't be manifests.
   // We intentionally do NOT filter by Content-Type because some sites
   // disguise manifests as image/jpeg or other non-standard types.
@@ -36,6 +49,42 @@
     if (!url || typeof url !== 'string') return false;
     if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('chrome')) return false;
     return true;
+  }
+
+  // Read a cloned JSON response without trusting Content-Length. HTTP/2 and
+  // chunked responses often omit it, but clone().json() would buffer an
+  // unbounded body. Stop as soon as the same 4 MiB deep-scan budget is
+  // crossed, then parse with the page's original JSON.parse implementation.
+  async function scanFetchJsonResponseBounded(response, maxBytes) {
+    var cloned = response.clone();
+    if (!cloned.body || typeof cloned.body.getReader !== 'function') return;
+    var reader = cloned.body.getReader();
+    var chunks = [];
+    var total = 0;
+    try {
+      while (true) {
+        var result = await reader.read();
+        if (result.done) break;
+        if (!result.value) continue;
+        if (total + result.value.byteLength > maxBytes) {
+          try { await reader.cancel(); } catch (_) {}
+          return;
+        }
+        chunks.push(result.value);
+        total += result.value.byteLength;
+      }
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
+    }
+    if (total === 0) return;
+    var merged = new Uint8Array(total);
+    var offset = 0;
+    for (var i = 0; i < chunks.length; i++) {
+      merged.set(chunks[i], offset);
+      offset += chunks[i].byteLength;
+    }
+    var parsed = origJsonParse(new TextDecoder().decode(merged));
+    scanParsedValueForDirectDash(parsed);
   }
 
   // When content.js signals it's ready, replay any buffered manifests
@@ -68,7 +117,13 @@
           if (!shouldInspect(url)) return;
 
           var cl = parseInt(response.headers.get('content-length') || '0', 10);
-          if (cl > 5 * 1024 * 1024) return;
+          if (cl > SCAN_MAX_RAW_BYTES) return;
+
+          var contentType = String(response.headers.get('content-type') || '').toLowerCase();
+          if (contentType.indexOf('json') !== -1) {
+            scanFetchJsonResponseBounded(response, SCAN_MAX_RAW_BYTES)
+              .catch(function() {});
+          }
 
           var cloned = response.clone();
           var reader = cloned.body.getReader();
@@ -108,6 +163,8 @@
         var text = null;
         if (xhr.responseType === '' || xhr.responseType === 'text') {
           text = (xhr.responseText || '').substring(0, 500);
+        } else if (xhr.responseType === 'json' && xhr.response) {
+          scanParsedValueForDirectDash(xhr.response);
         } else if (xhr.responseType === 'arraybuffer' && xhr.response) {
           try { text = new TextDecoder().decode(new Uint8Array(xhr.response).slice(0, 500)); } catch (_) {}
         }
@@ -204,7 +261,7 @@
   // serializers escape punctuation, and missing this prefilter case
   // silently drops the structural scan even though the parsed value would
   // contain a normal `.m3u8`. (Codex adversarial review #11.)
-  var PREFILTER_MARKER_RE = /(?:\.|\\u002[eE])(?:m3u8|mpd)/i;
+  var PREFILTER_MARKER_RE = /(?:\.|\\u002[eE])(?:m3u8|mpd|m4s)/i;
 
   // Stats counter — closure-local so the MAIN-world page cannot disable
   // the scan by pre-locking, freezing, or replacing the stats slot
@@ -285,6 +342,187 @@
     return true;
   }
 
+  function firstTrackUrl(row) {
+    if (!row || typeof row !== 'object') return null;
+    var value = row.baseUrl || row.base_url || row.url;
+    if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return null;
+    return value;
+  }
+
+  function boundedBackupUrls(row) {
+    var raw = row && (row.backupUrl || row.backup_url || row.backupUrls || row.backup_urls);
+    if (!Array.isArray(raw)) return [];
+    var out = [];
+    for (var i = 0; i < raw.length && out.length < 3; i++) {
+      if (typeof raw[i] === 'string' && /^https?:\/\//i.test(raw[i])) out.push(raw[i]);
+    }
+    return out;
+  }
+
+  function finitePositive(value) {
+    var n = Number(value);
+    return isFinite(n) && n > 0 ? n : null;
+  }
+
+  function normalizeDirectDashTrack(row, kind) {
+    var url = firstTrackUrl(row);
+    if (!url) return null;
+    var mime = String(row.mimeType || row.mime_type || row.mime || '').toLowerCase();
+    var urlLooksFmp4 = /\.m4s(?:[?#]|$)/i.test(url);
+    if (kind === 'video' && mime && mime.indexOf('video/') !== 0) return null;
+    if (kind === 'audio' && mime && mime.indexOf('audio/') !== 0) return null;
+    if (!urlLooksFmp4 && mime.indexOf(kind + '/') !== 0) return null;
+
+    var width = finitePositive(row.width);
+    var height = finitePositive(row.height);
+    var bandwidth = finitePositive(row.bandwidth || row.bandWidth);
+    var size = finitePositive(row.size || row.contentLength || row.content_length);
+    var codecs = row.codecs == null ? null : String(row.codecs).substring(0, 200);
+    return {
+      url: url,
+      backupUrls: boundedBackupUrls(row),
+      mimeType: mime ? mime.substring(0, 200) : null,
+      codecs: codecs,
+      width: width,
+      height: height,
+      bandwidth: bandwidth,
+      contentLength: size,
+      representationId: row.id == null ? null : String(row.id).substring(0, 100)
+    };
+  }
+
+  function directDashCodecScore(track) {
+    var codecs = String(track && track.codecs || '').toLowerCase();
+    if (/avc1|avc3|h264/.test(codecs)) return 40;
+    if (/hev1|hvc1|h265/.test(codecs)) return 30;
+    if (/av01/.test(codecs)) return 20;
+    if (/vp0?9/.test(codecs)) return 10;
+    return 0;
+  }
+
+  function chooseDirectDashAudio(rows) {
+    var best = null;
+    for (var i = 0; i < rows.length; i++) {
+      var track = normalizeDirectDashTrack(rows[i], 'audio');
+      if (!track) continue;
+      var codec = String(track.codecs || '').toLowerCase();
+      var score = (/mp4a|aac/.test(codec) ? 1000000000 : 0) + (track.bandwidth || 0);
+      if (!best || score > best.score) best = { score: score, track: track };
+    }
+    return best && best.track;
+  }
+
+  function directDashUrlHost(url) {
+    try { return new URL(url).hostname.toLowerCase(); } catch (_) { return ''; }
+  }
+
+  function directDashHostTail(host) {
+    var parts = String(host || '').split('.').filter(Boolean);
+    return parts.length >= 2 ? parts.slice(-2).join('.') : host;
+  }
+
+  function directDashTrackWithPrimary(track, primaryUrl) {
+    var sources = [track.url].concat(track.backupUrls || []);
+    var backups = [];
+    for (var i = 0; i < sources.length && backups.length < 3; i++) {
+      if (sources[i] !== primaryUrl && backups.indexOf(sources[i]) === -1) backups.push(sources[i]);
+    }
+    var out = {};
+    for (var key in track) {
+      if (Object.prototype.hasOwnProperty.call(track, key)) out[key] = track[key];
+    }
+    out.url = primaryUrl;
+    out.backupUrls = backups;
+    return out;
+  }
+
+  function pairDirectDashTrackHosts(video, audio) {
+    var videoSources = [video.url].concat(video.backupUrls || []);
+    var audioSources = [audio.url].concat(audio.backupUrls || []);
+    var best = null;
+    for (var vi = 0; vi < videoSources.length; vi++) {
+      var videoHost = directDashUrlHost(videoSources[vi]);
+      if (!videoHost) continue;
+      for (var ai = 0; ai < audioSources.length; ai++) {
+        var audioHost = directDashUrlHost(audioSources[ai]);
+        if (!audioHost) continue;
+        var sameHost = videoHost === audioHost;
+        var sameTail = directDashHostTail(videoHost) === directDashHostTail(audioHost);
+        var score = (sameHost ? 10000 : (sameTail ? 1000 : 0)) - (vi * 10) - ai;
+        if (!best || score > best.score) {
+          best = { score: score, videoUrl: videoSources[vi], audioUrl: audioSources[ai] };
+        }
+      }
+    }
+    if (!best) return { video: video, audio: audio };
+    return {
+      video: directDashTrackWithPrimary(video, best.videoUrl),
+      audio: directDashTrackWithPrimary(audio, best.audioUrl)
+    };
+  }
+
+  function maybeEmitDirectDash(value, ctx) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    if (!Array.isArray(value.video) || !Array.isArray(value.audio)) return;
+
+    var audio = chooseDirectDashAudio(value.audio);
+    if (!audio) return;
+
+    // Emit at most one codec per height. Prefer AVC for broad ffmpeg/player
+    // compatibility, then bandwidth. Distinct heights remain separate tiles.
+    var byQuality = Object.create(null);
+    for (var i = 0; i < value.video.length; i++) {
+      var video = normalizeDirectDashTrack(value.video[i], 'video');
+      if (!video) continue;
+      var key = video.height
+        ? 'h:' + video.height
+        : 'id:' + (video.representationId || video.url.split('?')[0]);
+      var score = directDashCodecScore(video) * 1000000000000 + (video.bandwidth || 0);
+      if (!byQuality[key] || score > byQuality[key].score) {
+        byQuality[key] = { score: score, track: video };
+      }
+    }
+
+    var duration = finitePositive(value.duration);
+    var emitted = 0;
+    for (var quality in byQuality) {
+      if (!Object.prototype.hasOwnProperty.call(byQuality, quality)) continue;
+      if (emitted >= 16 || ctx.emitted >= TOTAL_EMIT_BUDGET) break;
+      var paired = pairDirectDashTrackHosts(byQuality[quality].track, audio);
+      var selected = paired.video;
+      var selectedAudio = paired.audio;
+      var stableKey = quality + '|' + selected.url.split('?')[0]
+        + '|' + selectedAudio.url.split('?')[0];
+      if (ctx.dash_seen[stableKey]) continue;
+      ctx.dash_seen[stableKey] = true;
+      ctx.emitted++;
+      emitted++;
+      notifyDirectDash(selected, selectedAudio, duration);
+    }
+  }
+
+  function scanParsedValueForDirectDash(value) {
+    var ctx = {
+      nodes: 0,
+      emitted: 0,
+      dash_seen: Object.create(null)
+    };
+    function walk(node, depth) {
+      if (depth > SCAN_MAX_DEPTH || ctx.nodes >= SCAN_MAX_NODES) return;
+      if (!node || typeof node !== 'object') return;
+      ctx.nodes++;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1);
+        return;
+      }
+      maybeEmitDirectDash(node, ctx);
+      for (var key in node) {
+        if (Object.prototype.hasOwnProperty.call(node, key)) walk(node[key], depth + 1);
+      }
+    }
+    try { walk(value, 0); } catch (_) {}
+  }
+
   // Bounded fallback for oversized JSON: regex once over the raw string,
   // capped by total matches. NO recursive walk, NO substring allocation —
   // just a single pass through the source text. Backstop the page-jank
@@ -347,6 +585,7 @@
       }
       return;
     }
+    maybeEmitDirectDash(value, ctx);
     for (var key in value) {
       if (ctx.aborted) return;
       if (Object.prototype.hasOwnProperty.call(value, key)) {
@@ -379,6 +618,7 @@
         aborted: false,
         emitted: 0,
         seen: Object.create(null),
+        dash_seen: Object.create(null),
         string_truncated: false
       };
       if (typeof raw === 'string' && raw.length > SCAN_MAX_RAW_BYTES) {

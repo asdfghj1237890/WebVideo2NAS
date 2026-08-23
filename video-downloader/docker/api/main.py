@@ -931,6 +931,47 @@ def _enforce_plan_url_safety(plan: Dict) -> None:
     )
 
 
+def _planned_segment_lengths(track_data: Dict) -> Dict[int, int]:
+    """Return declared byte-range lengths keyed by sequence number.
+
+    HLS byte-range and manifest-less DASH plans both carry an exact length
+    for each segment. Treat malformed/missing entries as unspecified so
+    ordinary non-range HLS keeps its existing behavior.
+    """
+    lengths: Dict[int, int] = {}
+    try:
+        for index, segment in enumerate(track_data.get("segments") or []):
+            if not isinstance(segment, dict):
+                continue
+            byte_range = segment.get("byte_range")
+            if not isinstance(byte_range, dict):
+                continue
+            seq = int(segment.get("seq", index))
+            length = int(byte_range.get("length"))
+            if seq >= 0 and length > 0:
+                lengths[seq] = length
+    except (TypeError, ValueError):
+        return {}
+    return lengths
+
+
+def _expected_segment_shape_for_track(
+    staging_root: Path, track: str,
+) -> tuple[Optional[int], Dict[int, int]]:
+    """Read one track's count and exact byte-range lengths in one pass."""
+    try:
+        plan_path = staging_root / "manifest.json"
+        if not plan_path.is_file():
+            return None, {}
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        track_data = (plan.get("tracks") or {}).get(track) or {}
+        count = track_data.get("segment_count")
+        expected_count = int(count) if count else None
+        return expected_count, _planned_segment_lengths(track_data)
+    except Exception:
+        return None, {}
+
+
 def _expected_segment_count_for_track(staging_root: Path, track: str) -> Optional[int]:
     """Read the staged plan's per-track segment_count. Used by uploads
     to bound seq strictly to that track's range — Codex review #10
@@ -942,16 +983,8 @@ def _expected_segment_count_for_track(staging_root: Path, track: str) -> Optiona
     Returns None when the plan is unreadable or has no entry for this
     track — caller falls back to the job-wide bound.
     """
-    try:
-        plan_path = staging_root / "manifest.json"
-        if not plan_path.is_file():
-            return None
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        track_data = (plan.get("tracks") or {}).get(track) or {}
-        count = track_data.get("segment_count")
-        return int(count) if count else None
-    except Exception:
-        return None
+    count, _lengths = _expected_segment_shape_for_track(staging_root, track)
+    return count
 
 
 def _staging_total_bytes(staging_root: Path) -> int:
@@ -1090,10 +1123,26 @@ def _get_browser_job_meta(db: Session, job_id: str):
 
 # Pydantic models -----------------------------------------------------------
 
+class DirectDashTrackRequest(BaseModel):
+    url: HttpUrl
+    content_length: int = Field(gt=0)
+    mime_type: Optional[str] = Field(default=None, max_length=200)
+    codecs: Optional[str] = Field(default=None, max_length=200)
+    width: Optional[int] = Field(default=None, ge=1, le=32768)
+    height: Optional[int] = Field(default=None, ge=1, le=32768)
+    bandwidth: Optional[int] = Field(default=None, ge=0)
+
+
+class DirectDashRequest(BaseModel):
+    video: DirectDashTrackRequest
+    audio: DirectDashTrackRequest
+    duration: Optional[float] = Field(default=None, ge=0)
+
+
 class JobInitRequest(BaseModel):
-    # One of these two must be provided. URL form: NAS will try to fetch
-    # the manifest itself. Text form: extension already fetched it in
-    # browser session and sends the bytes inline.
+    # A manifest may be supplied by URL or as browser-fetched text + base URL.
+    # direct_dash is mutually exclusive with every manifest field and is used
+    # when player JSON exposes paired complete video/audio tracks without MPD.
     url: Optional[HttpUrl] = None
     manifest_text: Optional[str] = Field(default=None, max_length=10 * 1024 * 1024)
     base_url: Optional[HttpUrl] = None
@@ -1103,11 +1152,14 @@ class JobInitRequest(BaseModel):
     source_page: Optional[str] = None
     output_subdir: Optional[str] = None
     container_hint: Optional[str] = None
+    direct_dash: Optional[DirectDashRequest] = None
 
     @model_validator(mode="after")
     def validate_inputs(self):
-        if not self.url and not self.manifest_text:
-            raise ValueError("Either url or manifest_text is required")
+        if self.direct_dash and (self.url or self.manifest_text or self.base_url):
+            raise ValueError("direct_dash cannot be combined with manifest inputs")
+        if not self.url and not self.manifest_text and not self.direct_dash:
+            raise ValueError("Either url or manifest_text, or direct_dash is required")
         if self.manifest_text and not self.base_url:
             raise ValueError("base_url is required when manifest_text is provided")
         if self.url:
@@ -1151,10 +1203,49 @@ def init_browser_job(
     needs to fetch + decrypt + stream back."""
     # Lazy import — keeps the api role boot path fast and avoids pulling
     # the (curl_cffi) stack into the test fast-path that doesn't need it.
-    from manifest_planner import plan_from_url, plan_from_text, ManifestPlanError
+    from manifest_planner import (
+        ManifestPlanError,
+        plan_direct_dash,
+        plan_from_text,
+        plan_from_url,
+    )
 
     try:
-        if request.manifest_text:
+        if request.direct_dash:
+            direct = request.direct_dash.model_dump(mode="json")
+            staged_bytes = (
+                int(direct["video"]["content_length"])
+                + int(direct["audio"]["content_length"])
+            )
+            if staged_bytes > MAX_JOB_STAGING_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "Direct DASH tracks exceed "
+                        f"MAX_JOB_STAGING_BYTES={MAX_JOB_STAGING_BYTES}"
+                    ),
+                )
+            chunk_bytes = min(8 * 1024 * 1024, MAX_SEGMENT_BYTES)
+            if chunk_bytes <= 0:
+                raise HTTPException(status_code=500, detail="MAX_SEGMENT_BYTES must be positive")
+            projected_segments = sum(
+                (int(direct[name]["content_length"]) + chunk_bytes - 1) // chunk_bytes
+                for name in ("video", "audio")
+            )
+            # Reject before materializing thousands of repeated URL entries in
+            # the JSON plan. This also protects misconfigured tiny chunk caps.
+            if projected_segments > MAX_BROWSER_SEGMENTS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Plan exceeds MAX_BROWSER_SEGMENTS={MAX_BROWSER_SEGMENTS}",
+                )
+            plan = plan_direct_dash(
+                direct["video"],
+                direct["audio"],
+                duration=direct.get("duration"),
+                chunk_bytes=chunk_bytes,
+            )
+        elif request.manifest_text:
             # Codex review (P2): headers must ride through the
             # master→variant fallback. If the extension sent us a
             # master playlist text, NAS still has to fetch the
@@ -1175,6 +1266,8 @@ def init_browser_job(
                 request.headers or {},
                 container_hint=request.container_hint,
             )
+    except HTTPException:
+        raise
     except ManifestPlanError as e:
         raise HTTPException(status_code=422, detail=f"Manifest plan failed: {e}")
     except Exception as e:
@@ -1349,7 +1442,10 @@ async def upload_segment(
     # worker's _segment_files later rejects len(files) != expected_count
     # and the whole job fails AFTER all expected uploads landed.
     staging_root_for_bounds = _staging_path_for(job_id)
-    per_track_count = _expected_segment_count_for_track(staging_root_for_bounds, track)
+    per_track_count, per_track_lengths = _expected_segment_shape_for_track(
+        staging_root_for_bounds, track,
+    )
+    expected_length = per_track_lengths.get(seq)
     if per_track_count is not None:
         if seq >= per_track_count:
             raise HTTPException(
@@ -1393,7 +1489,7 @@ async def upload_segment(
         if _published_target_has_bytes(target):
             return await _stream_segment_to_disk(
                 request=request, db=db, meta=meta, job_id=job_id, track=track,
-                seq=seq, target=target,
+                seq=seq, target=target, expected_length=expected_length,
             )
 
         staging_root = _staging_path_for(job_id)
@@ -1407,7 +1503,7 @@ async def upload_segment(
             if _published_target_has_bytes(target):
                 return await _stream_segment_to_disk(
                     request=request, db=db, meta=meta, job_id=job_id, track=track,
-                    seq=seq, target=target,
+                    seq=seq, target=target, expected_length=expected_length,
                 )
             raise HTTPException(
                 status_code=413,
@@ -1420,7 +1516,7 @@ async def upload_segment(
 
         return await _stream_segment_to_disk(
             request=request, db=db, meta=meta, job_id=job_id, track=track,
-            seq=seq, target=target,
+            seq=seq, target=target, expected_length=expected_length,
         )
     finally:
         _release_upload_slot(job_id)
@@ -1602,7 +1698,7 @@ def _cleanup_stale_parts_for_published_target(target: Path) -> None:
 
 async def _stream_segment_to_disk(
     *, request: Request, db: Session, meta, job_id: str, track: str,
-    seq: int, target: Path,
+    seq: int, target: Path, expected_length: Optional[int] = None,
 ):
     """Inner streaming body — extracted so the slot/quota wrapper above
     stays focused. Same atomic-rename + post-stream re-check as before."""
@@ -1690,6 +1786,16 @@ async def _stream_segment_to_disk(
                     f"Segment {track}/{seq} arrived empty; "
                     f"refusing to publish (likely transient CDN/auth "
                     f"failure — extension should retry)"
+                ),
+            )
+        if expected_length is not None and written != expected_length:
+            part_target.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Segment {track}/{seq} length mismatch: "
+                    f"expected {expected_length} bytes, received {written}; "
+                    f"refusing to publish"
                 ),
             )
         # Codex review #6: re-check status atomically with the rename
@@ -2050,11 +2156,13 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
     missing: Dict[str, list] = {}
     unexpected: Dict[str, list] = {}
     zero_byte: Dict[str, list] = {}
+    size_mismatch: Dict[str, list] = {}
     bad_segment_names: Dict[str, list] = {}
     for track_name, track in tracks.items():
         expected = int(track.get("segment_count") or 0)
         if expected <= 0:
             continue
+        expected_lengths = _planned_segment_lengths(track)
         track_dir = staging_root / track_name
         # Match seg_*.bin (NOT .part files — atomic upload finalises by
         # rename so a `.part` file means an upload still in flight).
@@ -2072,12 +2180,20 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
                 # leave a 0-byte file at the final path. Empty files
                 # would later cause finalize+ffmpeg to fail mid-mux.
                 try:
-                    if p.stat().st_size == 0:
+                    actual_size = p.stat().st_size
+                    if actual_size == 0:
                         zero_byte.setdefault(track_name, []).append(seq)
                         continue
                 except OSError:
                     continue
                 present.append(seq)
+                expected_size = expected_lengths.get(seq)
+                if expected_size is not None and actual_size != expected_size:
+                    size_mismatch.setdefault(track_name, []).append({
+                        "seq": seq,
+                        "expected": expected_size,
+                        "actual": actual_size,
+                    })
         present_set = set(present)
         expected_seqs = set(range(expected))
         missing_seqs = sorted(expected_seqs - present_set)
@@ -2112,7 +2228,7 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
                 except OSError:
                     pass
 
-    if missing or unexpected or zero_byte or bad_segment_names:
+    if missing or unexpected or zero_byte or size_mismatch or bad_segment_names:
         # Truncate per track so a job missing thousands of segments doesn't
         # produce a multi-megabyte error body.
         detail: Dict = {
@@ -2130,6 +2246,11 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
         if zero_byte:
             detail["zero_byte"] = {
                 k: (v[:20] + ["..."] if len(v) > 20 else v) for k, v in zero_byte.items()
+            }
+        if size_mismatch:
+            detail["size_mismatch"] = {
+                k: (v[:20] + ["..."] if len(v) > 20 else v)
+                for k, v in size_mismatch.items()
             }
         if bad_segment_names:
             detail["bad_segment_names"] = {

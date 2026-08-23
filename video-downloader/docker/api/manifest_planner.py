@@ -33,6 +33,7 @@ class ManifestPlanError(ValueError):
 _MAX_REDIRECTS = 5
 _MANIFEST_FETCH_TIMEOUT = 30
 _MAX_MANIFEST_BYTES = 10 * 1024 * 1024  # mirror M3U8Parser cap
+_DIRECT_DASH_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 def _is_trusted_for_captured_headers(target_url: str, trusted_base_url: str) -> bool:
@@ -534,4 +535,96 @@ def _plan_dash_from_text(manifest_text: str, base_url: str) -> Dict:
         "has_encryption": False,  # parse_mpd rejects ContentProtection
         "tracks": tracks,
         "total_segments": total,
+    }
+
+
+def _serialize_direct_dash_track(track: Dict, chunk_bytes: int) -> Dict:
+    """Turn one complete fMP4 track URL into bounded byte-range tasks.
+
+    Some MediaSource players receive DASH metadata as JSON instead of an MPD.
+    Their video/audio ``baseUrl`` values each name one complete ``.m4s`` file.
+    Browser-side mode must not buffer that whole file in one ArrayBuffer, so we
+    split it into deterministic ranges. The worker's DASH finalize path already
+    byte-concatenates every track before muxing, recreating the original file.
+    """
+    try:
+        content_length = int(track["content_length"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ManifestPlanError("Direct DASH track has invalid content_length") from exc
+    if content_length <= 0:
+        raise ManifestPlanError("Direct DASH track content_length must be positive")
+    if chunk_bytes <= 0:
+        raise ManifestPlanError("Direct DASH chunk size must be positive")
+
+    url = str(track.get("url") or "")
+    if not url:
+        raise ManifestPlanError("Direct DASH track URL is required")
+
+    segments = []
+    offset = 0
+    seq = 0
+    while offset < content_length:
+        length = min(chunk_bytes, content_length - offset)
+        segments.append({
+            "seq": seq,
+            "url": url,
+            "byte_range": {"offset": offset, "length": length},
+        })
+        offset += length
+        seq += 1
+
+    out = {
+        "segment_count": len(segments),
+        "segments": segments,
+        "init_segment_url": None,
+        "init_segment_byte_range": None,
+        "is_fmp4": True,
+        "content_length": content_length,
+    }
+    for key in ("mime_type", "codecs", "width", "height", "bandwidth"):
+        value = track.get(key)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def plan_direct_dash(
+    video: Dict,
+    audio: Dict,
+    *,
+    duration: Optional[float] = None,
+    chunk_bytes: int = _DIRECT_DASH_CHUNK_BYTES,
+) -> Dict:
+    """Build the normal browser-side plan for manifest-less DASH JSON.
+
+    URLs and byte lengths come from the extension after it has observed the
+    player's parsed JSON and verified the real CDN lengths with a 0-0 Range
+    request. URL/IP safety is still enforced by the API on the resulting plan.
+    """
+    video_out = _serialize_direct_dash_track(video, chunk_bytes)
+    audio_out = _serialize_direct_dash_track(audio, chunk_bytes)
+    duration_value = float(duration or 0)
+    if duration_value < 0:
+        raise ManifestPlanError("Direct DASH duration cannot be negative")
+
+    resolution = None
+    if video_out.get("width") and video_out.get("height"):
+        resolution = {
+            "width": int(video_out["width"]),
+            "height": int(video_out["height"]),
+        }
+
+    return {
+        "container": "dash",
+        "source_url": str(video["url"]),
+        "selected_variant_url": str(video["url"]),
+        "init_segment_url": None,
+        "init_segment_byte_range": None,
+        "is_fmp4": True,
+        "direct_range_concat": True,
+        "duration": duration_value,
+        "resolution": resolution,
+        "has_encryption": False,
+        "tracks": {"video": video_out, "audio": audio_out},
+        "total_segments": video_out["segment_count"] + audio_out["segment_count"],
     }

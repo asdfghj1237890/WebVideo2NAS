@@ -2,12 +2,12 @@
 
 ## 1. Executive Summary
 
-This document specifies a complete system for capturing web video URLs (M3U8, MPD, MP4, and MOV) from Chrome and downloading them through a Docker stack running on a NAS (Network Attached Storage) device. HLS/DASH jobs can run in browser-side mode, where the extension fetches session-bound media segments in the user's browser context and uploads staged bytes to the NAS for FFmpeg muxing.
+This document specifies a complete system for capturing web video URLs (M3U8, MPD, MP4, and MOV), plus manifest-less DASH video/audio tracks exposed through player JSON, from Chrome and downloading them through a Docker stack running on a NAS (Network Attached Storage) device. HLS/DASH jobs can run in browser-side mode, where the extension fetches session-bound media segments or byte ranges in the user's browser context and uploads staged bytes to the NAS for FFmpeg muxing.
 
 ### 1.1 System Goals
-- Enable one-click web video URL capture from Chrome (M3U8, MPD, MP4, MOV)
+- Enable one-click web video capture from Chrome (M3U8, MPD, MP4, MOV, and paired JSON DASH tracks)
 - Seamless transmission to NAS Docker environment
-- Automated NAS-direct download or browser-side HLS/DASH segment staging
+- Automated NAS-direct download or browser-side HLS/DASH segment/range staging
 - Centralized storage on NAS
 - Status tracking, live browser-side upload progress, and notification
 
@@ -55,10 +55,11 @@ This document specifies a complete system for capturing web video URLs (M3U8, MP
 - **Functionality**:
   - Monitor network requests for M3U8, MPD, MP4, and MOV candidates
   - Intercept disguised HLS manifests via page fetch/XHR inspection
+  - Structurally detect and pair manifest-less DASH video/audio representations from bounded player JSON responses
   - Provide context menu option "Send to NAS"
   - Display detected URLs, recent NAS jobs, and browser-side live progress in the side panel
   - Configure NAS endpoint (IP/hostname + port)
-  - Browser-side HLS/DASH fetch/upload via service worker + offscreen document
+  - Browser-side HLS/DASH segment or byte-range fetch/upload via service worker + offscreen document
   - Trusted cross-site CDN suffix allowlist; one-click add stores the exact URL host
 
 #### B. NAS Docker Container
@@ -105,7 +106,7 @@ This document specifies a complete system for capturing web video URLs (M3U8, MP
 {
   "manifest_version": 3,
   "name": "WebVideo2NAS",
-  "version": "3.1.10",
+  "version": "3.3.2",
   "description": "Send web videos (m3u8, mpd, mp4, mov) to your NAS for download",
   "permissions": [
     "storage",
@@ -136,6 +137,7 @@ This document specifies a complete system for capturing web video URLs (M3U8, MP
 1. **URL Detection**
    - Listen to `webRequest.onBeforeRequest`
    - Filter video URL candidates and manifest content types
+   - Receive bounded MAIN-world JSON DASH detections; require paired video/audio tracks and keep one representation per quality
    - Store detected URLs per tab in the background service worker
    - Capture request headers/cookies for the exact source tab
 
@@ -143,13 +145,13 @@ This document specifies a complete system for capturing web video URLs (M3U8, MP
    - Context menu: "Send to NAS"
    - Side panel interface:
       - List detected video URLs
-      - Filter/search many detected items
+      - Filter/search detected items; mixed known resolutions expose quality filters regardless of whether the list has more than six items
       - Add exact host to trusted-CDN list when needed
       - View recent jobs and live browser-side progress
 
 3. **Communication**
    - NAS-direct POST request to NAS API: `https://{NAS_IP}:{PORT}/api/download`
-   - Browser-side HLS/DASH requests: `POST /api/jobs/init`, `PUT /api/jobs/{id}/segments/...`, `POST /api/jobs/{id}/finalize`
+   - Browser-side HLS/DASH requests: `POST /api/jobs/init`, `PUT /api/jobs/{id}/segments/...`, `POST /api/jobs/{id}/finalize`; init accepts either manifest input or mutually exclusive paired `direct_dash` tracks
    - NAS-direct payload:
      ```json
      {
@@ -163,6 +165,29 @@ This document specifies a complete system for capturing web video URLs (M3U8, MP
        "source_page": "https://example.com/watch?v=123"
      }
      ```
+   - Manifest-less JSON DASH init payload (abridged):
+     ```json
+     {
+       "direct_dash": {
+         "video": {
+           "url": "https://media.example.com/video.m4s?token=...",
+           "content_length": 734003200,
+           "mime_type": "video/mp4",
+           "height": 1080
+         },
+         "audio": {
+           "url": "https://media.example.com/audio.m4s?token=...",
+           "content_length": 52428800,
+           "mime_type": "audio/mp4"
+         },
+         "duration": 2432.0
+       },
+       "title": "Video Title",
+       "source_page": "https://example.com/watch/123"
+     }
+     ```
+
+     `direct_dash` is mutually exclusive with `url`, `manifest_text`, and `base_url`. Both tracks and positive lengths from an authoritative one-byte `206 Content-Range` probe are required. The API rejects total staging size or projected chunk counts above the configured caps before constructing the range plan, verifies each uploaded range length before publish, and rechecks staged file sizes at finalize.
 
 ### 3.2 NAS Docker Service
 
@@ -205,8 +230,8 @@ services:
 | GET | `/api/jobs/{id}` | Get job details |
 | DELETE | `/api/jobs/{id}` | Cancel/delete job |
 | GET | `/api/status` | System status |
-| POST | `/api/jobs/init` | Browser-side: create job and return segment plan |
-| PUT | `/api/jobs/{id}/segments/{track}/{seq}` | Browser-side: upload staged media segment |
+| POST | `/api/jobs/init` | Browser-side: create job from manifest input or paired `direct_dash` tracks and return a media plan |
+| PUT | `/api/jobs/{id}/segments/{track}/{seq}` | Browser-side: upload a staged media segment or direct-DASH byte-range chunk |
 | PUT | `/api/jobs/{id}/init/{label}` | Browser-side: upload init segment |
 | POST | `/api/jobs/{id}/finalize` | Browser-side: queue FFmpeg mux |
 | POST | `/api/jobs/{id}/abort` | Browser-side: fail job and clean staging |
@@ -239,17 +264,20 @@ The Synology compose deploys **3 independent workers** by default, all pulling f
 
 **Browser-side flow**:
 ```
-1. API creates browser job + staging dir from /api/jobs/init
-2. Extension uploads init/media segments from the browser session
-3. Extension calls /api/jobs/{id}/finalize
-4. Worker pops browser finalize queue
-5. Worker muxes staged bytes with FFmpeg
-6. Worker removes staging dir and marks completed
+1. Extension detects a manifest, or pairs complete video/audio tracks from bounded player JSON
+2. API creates browser job + staging dir from /api/jobs/init
+   ├─ manifest_text + base_url (or URL form)
+   └─ direct_dash.video + direct_dash.audio with probed content lengths
+3. Extension uploads init/media segments or contiguous byte ranges from the browser session
+4. Extension calls /api/jobs/{id}/finalize
+5. Worker pops browser finalize queue
+6. Worker reconstructs each DASH track when needed and muxes staged bytes with FFmpeg
+7. Worker removes staging dir and marks completed
 ```
 
 **Error Handling**:
 - Network timeout: Retry 3 times with exponential backoff
-- Invalid m3u8: Mark as failed, log details
+- Invalid manifest/direct-DASH plan: reject or mark as failed, log details
 - Insufficient disk space: Pause queue, alert user
 
 ### 3.3 Data Models
@@ -339,10 +367,10 @@ The Synology compose deploys **3 independent workers** by default, all pulling f
 
 ### 5.2 Download Flow
 1. User browses to video streaming site
-2. Extension detects video URL candidates in the side panel
+2. Extension detects video URL candidates or paired JSON DASH representations in the side panel
 3. User clicks extension icon or right-clicks → "Send to NAS"
 4. For browser-side HLS/DASH, user presses play first so the player issues current session tokens
-5. Extension sends either a NAS-direct URL job or browser-side staged segment job to the NAS API
+5. Extension sends either a NAS-direct URL job or browser-side staged segment/range job to the NAS API
 6. NAS API returns job ID
 7. Extension shows "Job submitted" notification and live progress
 8. Worker downloads or muxes in background
@@ -441,6 +469,7 @@ RATE_LIMIT_PER_MINUTE=10
 ### 9.1 Unit Tests
 - API endpoint handlers
 - M3U8 parser logic
+- JSON DASH structural pairing, range-length probing, and direct-DASH plan generation
 - Download retry mechanism
 - Filename sanitization
 
@@ -450,14 +479,15 @@ RATE_LIMIT_PER_MINUTE=10
 - Error scenarios (network failure, invalid URLs)
 
 ### 9.3 Manual Testing Checklist
-- [ ] Extension detects M3U8/MPD/MP4/MOV candidates on representative pages
+- [ ] Extension detects M3U8/MPD/MP4/MOV candidates and paired manifest-less JSON DASH representations on representative pages
+- [ ] Heartbeat/telemetry XHR and standalone `.m4s` segments do not create false-positive tiles
 - [ ] Download completes successfully
 - [ ] NAS-direct and browser-side progress update accurately
 - [ ] Error notifications work
 - [ ] Multiple simultaneous downloads
 - [ ] Resume after container restart
 - [ ] Disk full scenario handling
-- [ ] Browser-side safety gate rejects localhost/private IP and untrusted cross-site manifest URLs
+- [ ] Browser-side safety gate rejects localhost/private IP and untrusted cross-site manifest or direct-track URLs
 
 ---
 
@@ -493,7 +523,7 @@ webvideo2nas/
 ├── chrome-extension/             # Chrome extension (MV3)
 │   ├── background.js             # Service worker
 │   ├── content.js                # ISOLATED-world content script
-│   ├── inject.js                 # MAIN-world manifest interceptor
+│   ├── inject.js                 # MAIN-world manifest + bounded JSON DASH interceptor
 │   ├── sidepanel.{html,js,css}   # Side panel UI
 │   ├── options/                  # Options page
 │   ├── icons/

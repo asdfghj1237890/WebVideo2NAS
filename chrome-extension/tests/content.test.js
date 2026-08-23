@@ -50,6 +50,29 @@ describe('content.js MAIN-world detection bridge', () => {
     }));
   });
 
+  it('forwards paired JSON DASH tracks without exposing extension credentials', async () => {
+    const sendMessage = vi.fn();
+    loadContent(sendMessage);
+    window.dispatchEvent(new MessageEvent('message', {
+      source: window,
+      data: {
+        type: 'WV2NAS_DIRECT_DASH_DETECTED',
+        video: { url: 'https://cdn.example.com/video.m4s', height: 1080 },
+        audio: { url: 'https://cdn.example.com/audio.m4s' },
+        duration: 120,
+      },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'directDashDetected',
+      video: expect.objectContaining({ url: 'https://cdn.example.com/video.m4s' }),
+      audio: expect.objectContaining({ url: 'https://cdn.example.com/audio.m4s' }),
+      duration: 120,
+      pageUrl: window.location.href,
+    }));
+  });
+
   it('reports video play, pause, and ended lifecycle events', () => {
     const sendMessage = vi.fn();
     const video = document.createElement('video');

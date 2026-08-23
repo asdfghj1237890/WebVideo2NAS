@@ -168,6 +168,52 @@ describe('sidepanel.js helper functions', () => {
     expect(ctx.shouldShowDetectedToolbar([
       { url: 'https://cdn.example.com/video/1080p/a.m3u8' },
     ], '1080')).toBe(true);
+
+    // Manifest-less DASH track filenames often contain only representation
+    // IDs, so filtering must use the structural height captured from JSON.
+    expect(ctx.shouldShowDetectedToolbar([
+      { url: 'https://cdn.example.com/track-100026.m4s', qualityHeight: 1080 },
+      { url: 'https://cdn.example.com/track-100023.m4s', qualityHeight: 720 },
+    ])).toBe(true);
+  });
+
+  it('shows immediate send feedback and surfaces background submission errors', async () => {
+    const events = [];
+    const chrome = makeChromeStub();
+    chrome.storage.sync.get = async () => ({
+      nasEndpoint: 'http://nas.local:52052',
+      apiKey: 'test-key',
+    });
+    chrome.runtime.sendMessage = async () => {
+      events.push('message');
+      return {
+        success: false,
+        error: 'The NAS API does not support JSON DASH yet.',
+      };
+    };
+    const ctx = loadScriptIntoContext('sidepanel.js', {
+      chrome,
+      document: makeDocumentStub(),
+      navigator: { clipboard: { writeText: async () => {} } },
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+      window: {},
+      testEvents: events,
+    });
+    ctx.__eval(`
+      activeTabId = 1;
+      showToast = (message) => testEvents.push('toast:' + message);
+    `);
+
+    const url = 'https://cdn.example.com/video.m4s';
+    ctx.__eval(`selected.add(${JSON.stringify(url)});`);
+    const result = await ctx.flyToNAS(null, url, 'https://example.com/watch');
+
+    expect(result.success).toBe(false);
+    expect(events[0]).toBe('toast:toast.sending');
+    expect(events[1]).toBe('message');
+    expect(events[2]).toContain('toast:toast.failedToSend: The NAS API does not support JSON DASH yet.');
+    expect(ctx.__eval(`sentUrls.has(${JSON.stringify(url)})`)).toBe(false);
+    expect(ctx.__eval(`selected.has(${JSON.stringify(url)})`)).toBe(true);
   });
 
   it('updates the progress bar colour when browser upload leaves pending', () => {

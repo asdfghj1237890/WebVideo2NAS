@@ -2296,7 +2296,7 @@ class DownloadWorker:
             return
 
         meta_row = self.db.execute(text("""
-            SELECT mode, total_segments, staging_dir, output_subdir
+            SELECT mode, total_segments, staging_dir, output_subdir, duration
             FROM job_metadata WHERE job_id = :job_id
         """), {"job_id": job_id}).first()
         if not meta_row or meta_row.mode != "browser":
@@ -2417,6 +2417,11 @@ class DownloadWorker:
 
         # Probe actual duration for the existing suspect-detection pass.
         actual_duration = self._probe_duration_seconds(result["output_path"])
+        suspect_reason = self._compute_suspect_reason(
+            declared_duration=meta_row.duration,
+            actual_duration=actual_duration,
+            file_size_bytes=result["file_size"],
+        )
         completed = self.update_job_status(
             job_id, "completed",
             progress=100,
@@ -2443,14 +2448,12 @@ class DownloadWorker:
             )
             return
 
-        try:
-            self.db.execute(text("""
-                UPDATE job_metadata SET actual_duration = :ad
-                WHERE job_id = :job_id
-            """), {"ad": actual_duration, "job_id": job_id})
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
+        self._save_suspect_metadata(job_id, actual_duration, suspect_reason)
+        if suspect_reason:
+            logger.warning(
+                f"Browser finalize {job_id} completed but was flagged suspect: "
+                f"{suspect_reason}"
+            )
 
         # Best-effort staging wipe; never fails the job over this. Use the
         # containment-guarded helper even on success because staging_dir comes

@@ -105,6 +105,42 @@ def test_job_init_request_accepts_url_and_text_forms(monkeypatch):
     assert text_form.manifest_text.startswith("#EXTM3U")
 
 
+def test_job_init_request_accepts_paired_direct_dash(monkeypatch):
+    api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+    request = api_main.JobInitRequest(direct_dash={
+        "video": {
+            "url": "https://cdn.example.com/video.m4s?sig=1",
+            "content_length": 123456,
+            "mime_type": "video/mp4",
+            "width": 1920,
+            "height": 1080,
+        },
+        "audio": {
+            "url": "https://cdn.example.com/audio.m4s?sig=1",
+            "content_length": 12345,
+            "mime_type": "audio/mp4",
+        },
+        "duration": 120,
+    })
+    assert request.direct_dash.video.height == 1080
+    assert request.direct_dash.audio.content_length == 12345
+
+
+def test_job_init_request_rejects_mixed_or_incomplete_direct_dash(monkeypatch):
+    api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+    paired = {
+        "video": {"url": "https://cdn.example.com/video.m4s", "content_length": 1},
+        "audio": {"url": "https://cdn.example.com/audio.m4s", "content_length": 1},
+    }
+    with pytest.raises(Exception, match="cannot be combined"):
+        api_main.JobInitRequest(
+            url="https://cdn.example.com/manifest.mpd",
+            direct_dash=paired,
+        )
+    with pytest.raises(Exception):
+        api_main.JobInitRequest(direct_dash={"video": paired["video"]})
+
+
 def test_job_init_request_normalizes_output_subdir(monkeypatch):
     api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
     r = api_main.JobInitRequest(
@@ -153,6 +189,45 @@ seg0.ts
     assert "Unsupported HLS encryption" in resp.text
 
 
+def test_init_direct_dash_returns_standard_two_track_browser_plan(monkeypatch, tmp_path):
+    api_main = _reload_api_main(
+        monkeypatch,
+        SSRF_GUARD="false",
+        STAGING_DIR=str(tmp_path),
+    )
+    monkeypatch.setattr(api_main, "_enforce_plan_url_safety", lambda _plan: None)
+    request = api_main.JobInitRequest(**{
+        "direct_dash": {
+            "video": {
+                "url": "https://cdn.example.com/video.m4s?sig=1",
+                "content_length": 17,
+                "mime_type": "video/mp4",
+                "width": 1920,
+                "height": 1080,
+            },
+            "audio": {
+                "url": "https://cdn.example.com/audio.m4s?sig=1",
+                "content_length": 9,
+                "mime_type": "audio/mp4",
+            },
+            "duration": 120,
+        },
+        "title": "paired tracks",
+    })
+    db = MagicMock()
+    body = api_main.init_browser_job(
+        request=request,
+        db=db,
+        api_key="test-key-not-the-default-placeholder",
+    )
+
+    assert body.plan["container"] == "dash"
+    assert set(body.plan["tracks"]) == {"video", "audio"}
+    assert body.plan["total_segments"] == 2
+    assert (tmp_path / body.job_id / "manifest.json").is_file()
+    assert db.commit.call_count == 1
+
+
 # --- Codex review fix #1: finalize completeness check -----------------------
 #
 # Earlier finalize would enqueue the job whether or not all segments had
@@ -185,6 +260,33 @@ def test_verify_staging_complete_passes_when_all_present(monkeypatch, tmp_path):
         (staging / "video" / f"seg_{i:08d}.bin").write_bytes(b"x")
     summary = api_main._verify_staging_complete(staging)
     assert summary == {"video": 3}
+
+
+def test_verify_staging_complete_rejects_byte_range_size_mismatch(monkeypatch, tmp_path):
+    """A present but truncated direct-DASH chunk must not count as complete."""
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    plan = {
+        "container": "dash",
+        "tracks": {"video": {
+            "segment_count": 1,
+            "segments": [{
+                "seq": 0,
+                "byte_range": {"offset": 0, "length": 8},
+            }],
+        }},
+    }
+    _write_plan(staging, plan)
+    (staging / "video").mkdir()
+    (staging / "video" / "seg_00000000.bin").write_bytes(b"short")
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        api_main._verify_staging_complete(staging)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["size_mismatch"] == {
+        "video": [{"seq": 0, "expected": 8, "actual": 5}],
+    }
 
 
 def test_verify_staging_complete_rejects_missing_segments(monkeypatch, tmp_path):
@@ -2566,6 +2668,42 @@ def test_stream_segment_to_disk_accepts_non_empty_body(monkeypatch, tmp_path):
     assert result.get("received") == len(b"REAL-SEGMENT-BYTES")
     assert target.is_file()
     assert target.stat().st_size > 0
+
+
+def test_stream_segment_to_disk_rejects_declared_range_length_mismatch(monkeypatch, tmp_path):
+    """Reject a short 206 body at PUT time so the extension can retry it."""
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+
+    import asyncio
+    from unittest.mock import MagicMock as _MM
+
+    target = tmp_path / "video" / "seg_00000000.bin"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    class _FakeRequest:
+        async def stream(self):
+            yield b"short"
+
+    class _FakeRow:
+        status = "browser_uploading"
+    db = _MM()
+    db.execute = _MM(return_value=_MM(first=lambda: _FakeRow()))
+    meta = _MM()
+    meta.status = "browser_uploading"
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(api_main._stream_segment_to_disk(
+            request=_FakeRequest(),
+            db=db, meta=meta,
+            job_id="11111111-2222-3333-4444-555555555555",
+            track="video", seq=0,
+            target=target,
+            expected_length=8,
+        ))
+    assert exc.value.status_code == 400
+    assert "expected 8 bytes, received 5" in str(exc.value.detail)
+    assert not target.exists()
+    assert list(tmp_path.rglob("*.part")) == []
 
 
 def test_stream_init_to_disk_rejects_empty_body(monkeypatch, tmp_path):

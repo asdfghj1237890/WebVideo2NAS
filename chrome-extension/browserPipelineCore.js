@@ -151,6 +151,11 @@
           responseHeaders: [
             { header: 'access-control-allow-origin', operation: 'set', value: '*' },
             { header: 'access-control-allow-credentials', operation: 'remove' },
+            {
+              header: 'access-control-expose-headers',
+              operation: 'set',
+              value: 'content-range, content-length, accept-ranges',
+            },
           ],
         },
         condition: makeDnrCondition(regexFilter, initiatorDomain),

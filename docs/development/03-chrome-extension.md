@@ -49,7 +49,7 @@ extension 是 MV3 (Manifest v3)，由 4 個 JS context 組成。這份解釋每�
 │  │  - UI render         │  │   ┌─────────────────────────────────┐  │  │
 │  │  - send/cancel/sort  │  │   │ inject.js   (MAIN world)        │  │  │
 │  │  - polls /api/jobs   │  │   │ - patch fetch / XHR             │  │  │
-│  │                      │  │   │ - 偵測 manifest by content       │  │  │
+│  │                      │  │   │ - 偵測 manifest / JSON DASH      │  │  │
 │  └──────────────────────┘  │   └────────────┬────────────────────┘  │  │
 │                            │                │ window.postMessage    │  │
 │                            │   ┌────────────▼────────────────────┐  │  │
@@ -68,9 +68,9 @@ extension 是 MV3 (Manifest v3)，由 4 個 JS context 組成。這份解釋每�
 
 主要職責：
 
-1. **webRequest 攔截**（攔到符合 .m3u8/.mpd/.mp4/.mov 的 URL 就 register 進 `currentTabUrls[tabId]`）
+1. **webRequest 攔截**（攔到符合 .m3u8/.mpd/.mp4/.mov 的 URL 就 register 進 `currentTabUrls[tabId]`；單獨 `.m4s` 不會成為 tile）
 2. **headers capture**（`onSendHeaders` 抓 actual cookies/Referer 存進 `capturedHeaders[url]`）
-3. **訊息路由**（sidepanel / content script 來的 `getDetectedUrls`、`sendToNAS`、`manifestDetected` 等等）
+3. **訊息路由**（sidepanel / content script 來的 `getDetectedUrls`、`sendToNAS`、`manifestDetected`、`directDashDetected` 等等）
 4. **AV-task pipeline**（hidden mode 的 code-based 自動化下載）
 5. **在 sidepanel 開的時候推 `detectedUrlsUpdated` 給它**
 
@@ -95,33 +95,41 @@ let avPendingTabs = {};            // AV-task pipeline 開的 helper tabs
 1. **`loadDetectedUrls()`**：透過 `getDetectedUrls` 訊息問 background 拿目前 active tab 的 URL list，render 成 tile grid
 2. **`sendToNAS(url, pageUrl)`**：用 `sendMessageWithRetry` 把 download request 送給 background（背後再 forward 給 NAS API）
 3. **`loadRecentJobs()`**：每 2 秒 GET `/api/jobs?limit=20` 重 render
-4. **bulk select / quality filter / sort 切換** — 純前端 UI 邏輯
+4. **bulk select / quality filter / sort 切換** — quality 以結構化 `qualityHeight` 為準；只要清單同時有兩種已知解析度就顯示 filter，不再要求偵測數量大於 6
 5. **monitor `chrome.tabs.onActivated`/`onUpdated`** — 切 tab 時重 load detected URLs
 
 完整 UI flow + state 變數說明在 [sidepanel.js 開頭註解](../../chrome-extension/sidepanel.js#L1-L24)。
 
-### 2.3 content.js — DOM scraper + manifest forwarder
+### 2.3 content.js — DOM scraper + media forwarder
 
 注入到每個頁面（document_idle 階段，DOM 已 ready）。MV3 isolated world，看得到 DOM 但不能直接看頁面 JS 變數。
 
 主要職責：
 
 1. **抓 og:image / `<video>.poster` / 第 N 個 video element 的 poster** → `chrome.runtime.sendMessage{action:'pageThumbnails', ...}` → background 存進 `pageThumbnailsByTab[tabId]`，sidepanel 用來顯示縮圖
-2. **接 inject.js 的 `WV2NAS_MANIFEST_DETECTED` 訊息**（透過 `window.postMessage` 跨 world 傳遞），forward 給 background 的 `manifestDetected` handler
+2. **接 inject.js 的媒體訊息**（透過 `window.postMessage` 跨 world 傳遞）：`WV2NAS_MANIFEST_DETECTED` forward 成 `manifestDetected`；`WV2NAS_DIRECT_DASH_DETECTED` forward 成 `directDashDetected`
 3. **偵測 user 點影片（`videoStartedPlaying`）** — 跟單純 webRequest 偵測不同，這是「user 真的看了哪個」的訊號，sidepanel 用來標 "Now Playing"
 
 ### 2.4 inject.js — fetch/XHR interceptor in MAIN world
 
 注入到頁面的 MAIN world（跟頁面 JS 同 context），patch `window.fetch` 跟 `XMLHttpRequest.prototype.open/send`。
 
-為什麼需要：**有些網站把 m3u8/mpd 偽裝**——URL 沒 `.m3u8` 副檔名、Content-Type 寫 `application/octet-stream`、甚至寫 `image/jpeg`。這時 background.js 的 webRequest 攔截（靠 URL pattern 跟 Content-Type）抓不到。
+為什麼需要：**有些網站把 m3u8/mpd 偽裝**——URL 沒 `.m3u8` 副檔名、Content-Type 寫 `application/octet-stream`、甚至寫 `image/jpeg`。另一類 MediaSource player 根本不請求 MPD，而是從 play API JSON 直接取得完整 video/audio `.m4s` URL。這兩種情況都不能只靠 background.js 的 URL pattern / Content-Type。
 
-inject.js patches fetch/XHR：每個 response 抓前 500 byte 看開頭：
+inject.js patches fetch/XHR：文字 response 抓前 500 byte 看開頭：
 
 - `#EXTM3U` → m3u8
 - `<MPD ` 或 `<?xml ... <MPD` → DASH
 
 抓到就 `window.postMessage({type:'WV2NAS_MANIFEST_DETECTED', url, format})`，content.js 收到再 forward 給 background。
+
+JSON response 則走結構化 DASH 掃描（涵蓋頁面呼叫 `JSON.parse`、XHR `responseType='json'`，以及有限大小的 fetch JSON clone）：
+
+- 尋找同一播放資料內的 `video[]` / `audio[]` representation，不把 heartbeat、ping 或統計 XHR 當媒體
+- 每個 height 只保留一個 video codec（優先 AVC），並挑一條最佳 audio
+- 優先把 video/audio backup URL 配成同一個 exact host，降低跨 CDN token / DNR 邊界問題
+- 每個 height 發一個 `WV2NAS_DIRECT_DASH_DETECTED`；background 以結構化 `qualityHeight` 排序與篩選
+- 掃描有深度、節點數與 response 大小上限，避免任意大型 JSON 卡住頁面 main thread
 
 content script 比 inject.js 晚啟動（document_idle vs document_start），所以 inject.js 會 buffer 偵測結果，等 content.js 發 `WV2NAS_CONTENT_READY` 之後 replay。
 
@@ -135,6 +143,7 @@ content script 比 inject.js 晚啟動（document_idle vs document_start），�
 | `sendToNAS` | sidepanel + content menu | `sendToNAS(url, title, pageUrl, sourceTabId)` → forward to NAS API |
 | `pageThumbnails` | content.js | 存進 `pageThumbnailsByTab[tabId]` |
 | `manifestDetected` | content.js (forwarded from inject.js) | 跟 webRequest 偵測同樣的 `registerDetectedUrl()` 路徑 |
+| `directDashDetected` | content.js (forwarded from inject.js) | 驗證 paired video/audio track，建立一個 MPD 類型 tile；保留結構化 `qualityHeight` 與兩軌 URL |
 | `userClickedVideo` / `videoStartedPlaying` | content.js | 記到 `userClickedVideoByTab[tabId]`，下次 sort 時這支會被標 isNowPlaying |
 | `avTaskFetch` | sidepanel (hidden mode) | 用 user 設定的 URL template 開助手 tab → 等 m3u8 偵測到 → 自動 send 到 NAS |
 | `clearDetected` | sidepanel | 清掉 active tab 的 detected URLs |
@@ -233,7 +242,9 @@ UI 文字都過 `t('key', vars)`。語言用 `chrome.storage.sync.uiLanguage` �
 
 v3.0 之前所有下載都是 **NAS-direct**：extension 把 URL 送給 API，worker 從 CDN 拉 segments + cookies。但有些站把 token / cookie / IP 綁在「發 URL 給瀏覽器的那個 session」上，NAS 從不同 IP 帶同一個 token 過去就 403、或拿到 anti-hotlink PNG。
 
-**Browser-side mode** 讓 extension 自己抓 segments：
+**Browser-side mode** 讓 extension 自己抓 staged bytes。`/api/jobs/init` 有兩個前端入口：manifest path 傳 `manifest_text` / `base_url`，manifest-less JSON DASH path 傳成對的 `direct_dash.video` / `direct_dash.audio`。兩者從 API 回傳 plan 之後共用同一套 DNR、offscreen upload、progress、finalize 與復原機制。
+
+Manifest path：
 
 ```
 [Browser SW + offscreen]                    [API]                 [Worker]
@@ -251,10 +262,10 @@ v3.0 之前所有下載都是 **NAS-direct**：extension 把 URL 送給 API，wo
   │                                                                │  rejects private IP)
   │ ◄── 200 {job_id, plan} ───────────────────────────────────────┤
   │
-  │  4. Phase-2 DNR：覆蓋 phase-1，把每段 segment + AES key URI 都加進
+  │  4. Phase-2 DNR：覆蓋 phase-1，把每段 segment / byte range + AES key URI 都加進
   │     CORS-relax / header-spoof scope（cross-site 的不放 CORS-relax）
   │  5. offscreen.js 開 segmentDownloader.runJob：
-  │     - 平行抓 N 段 (concurrency=6 default)
+  │     - 平行抓 N 段或 Range chunk (concurrency=6 default)
   │     - AES-128-CBC decrypt（如果有 key URI）
   │     - PUT 每一段到 /api/jobs/{id}/segments/{track}/{seq}
   │     - onProgress({done, total}) 觸發 BROWSER_JOB_PROGRESS → SW → sidepanel
@@ -268,9 +279,33 @@ v3.0 之前所有下載都是 **NAS-direct**：extension 把 URL 送給 API，wo
   │                                                                                  │ status='completed'
 ```
 
+### Manifest-less JSON DASH alternate input
+
+有些 MediaSource player 的 `video.currentSrc` 永遠是 `blob:`，Network 也沒有 `.mpd` / `.m3u8`；真正的媒體資訊只存在 play API JSON。這條路徑不猜 heartbeat URL，也不把裸 `.m4s` request 各自列成影片：
+
+```
+inject.js: parsed player JSON
+  → group video representations by height (prefer AVC) + choose best audio
+  → emit one paired WV2NAS_DIRECT_DASH_DETECTED per height
+content.js
+  → directDashDetected
+background.js
+  → validate both URLs + same-site/trusted-CDN boundary
+  → Range: bytes=0-0 on each track; require a one-byte 206 and valid Content-Range total
+  → POST /api/jobs/init {direct_dash:{video:{url,content_length,...},audio:{...}}}
+API
+  → reject oversized jobs before plan materialization
+  → split each complete track into contiguous chunks (8 MiB, capped by MAX_SEGMENT_BYTES)
+  → return normal two-track browser plan
+offscreen + worker
+  → upload ranges in order → byte-concat each original track → FFmpeg mux
+```
+
+`direct_dash` 跟 `url` / `manifest_text` / `base_url` 互斥；缺任一軌或不知道正的 `content_length` 就不建立 job。這避免一次把整支影片讀進單一 ArrayBuffer，也避免把不完整的 audio-only / video-only 偵測偽裝成可下載影片。
+
 ### 8.1 為什麼要 same-site gate
 
-extension fetch master URL 用 `credentials: 'include'`，**回應 body 會被 POST 給 NAS 當 `manifest_text`**。如果 master URL 是惡意頁面塞的 `https://internal.corp.example/...`（看起來公開但被 split-horizon DNS 解到內網），extension 就變成「帶 cookie 讀內網內容然後 forward 給 NAS」——比單純下壞影片嚴重。
+extension 會用 browser credentials fetch manifest 或 direct track bytes。Manifest response body 會被 POST 給 NAS 當 `manifest_text`；direct DASH 的兩軌則會被 Range-fetch 後逐塊上傳。如果 URL 是惡意頁面塞的 `https://internal.corp.example/...`（看起來公開但被 split-horizon DNS 解到內網），extension 就可能變成「帶 cookie 讀內網內容然後 forward 給 NAS」——比單純下壞影片嚴重。
 
 Gate 規則（`_wv2nasIsManifestUrlSafeForBrowser` in [`background.js`](../../chrome-extension/background.js)）：
 
@@ -279,7 +314,7 @@ Gate 規則（`_wv2nasIsManifestUrlSafeForBrowser` in [`background.js`](../../ch
 3. **拒絕 localhost / `*.localhost`**
 4. **DNS hostname 必須跟 page 同站**（hostname 等於 page host 或 `.suffix-of-page-host`）
 
-第 4 條會擋住「page 在 brand 域、manifest 在獨立 CDN eTLD+1」這個合法常見模式。v3.1 加了**使用者明示的 trusted CDN allowlist**作為例外口（§8.3）。
+第 4 條會擋住「page 在 brand 域、manifest / media track 在獨立 CDN eTLD+1」這個合法常見模式。v3.1 加了**使用者明示的 trusted CDN allowlist**作為例外口（§8.3）。Direct DASH 的 video/audio URL 都必須各自通過 hard rejection 與 trust boundary；配成同一 exact host 只是優先策略，不會取代驗證。
 
 variant URL 的 trust anchor 是 master URL（不是 page URL），這條**不會被 allowlist 軟化**——是結構性 master→variant 邊界。
 
@@ -317,7 +352,7 @@ masterTrustedForDnr 也諮詢 allowlist — 不然 CORS-relax 沒裝、cross-sit
 NAS API 不追蹤 browser-side 上傳階段的 progress(只有 finalize 之後 worker mux 那段才追)。v3.1 改 extension 自己 push:
 
 ```
-runJob.onProgress({done, total})        ← per media segment in segmentDownloader
+runJob.onProgress({done, total})        ← per media segment / Range chunk in segmentDownloader
   │
 offscreen.js 每 200ms throttle 一次,first/last 強制送
   │ chrome.runtime.sendMessage(BROWSER_JOB_PROGRESS, target=service-worker)

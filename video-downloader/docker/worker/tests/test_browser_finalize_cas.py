@@ -66,7 +66,10 @@ def _setup_test_db():
     return engine, sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def _plant_job(SessionLocal, *, job_id: str, status: str, staging_dir: str):
+def _plant_job(
+    SessionLocal, *, job_id: str, status: str, staging_dir: str,
+    duration: int | None = None,
+):
     db = SessionLocal()
     try:
         db.execute(sa_text(
@@ -75,9 +78,10 @@ def _plant_job(SessionLocal, *, job_id: str, status: str, staging_dir: str):
         ), {"id": job_id, "url": "https://x", "title": "t",
             "status": status, "now": _utcnow_naive()})
         db.execute(sa_text(
-            "INSERT INTO job_metadata (job_id, mode, total_segments, staging_dir) "
-            "VALUES (:id, 'browser', 1, :sd)"
-        ), {"id": job_id, "sd": staging_dir})
+            "INSERT INTO job_metadata "
+            "(job_id, mode, total_segments, staging_dir, duration) "
+            "VALUES (:id, 'browser', 1, :sd, :duration)"
+        ), {"id": job_id, "sd": staging_dir, "duration": duration})
         db.commit()
     finally:
         db.close()
@@ -275,6 +279,56 @@ def _setup_outputs_dir(monkeypatch, worker_module, tmp_path):
     out.mkdir()
     monkeypatch.setattr(worker_module, "resolve_output_dir", lambda _subdir: out)
     return out
+
+
+def test_successful_browser_finalize_persists_suspect_reason(
+    worker_with_test_db, tmp_path, monkeypatch,
+):
+    """Browser-side jobs must run the same duration shortfall check as NAS-direct."""
+    worker_module, SessionLocal, _ = worker_with_test_db
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    monkeypatch.setenv("STAGING_DIR", str(staging_root))
+    _setup_outputs_dir(monkeypatch, worker_module, tmp_path)
+
+    job_id = "44444444-susp-susp-susp-444444444444"
+    staging = _make_browser_job_dirs(staging_root, job_id)
+    _plant_job(
+        SessionLocal,
+        job_id=job_id,
+        status="pending",
+        staging_dir=str(staging),
+        duration=100,
+    )
+
+    import browser_finalize
+
+    def _publish_success(_staging, candidate, **_kwargs):
+        candidate.write_bytes(b"published mp4 bytes")
+        return {
+            "output_path": str(candidate),
+            "file_size": candidate.stat().st_size,
+        }
+
+    monkeypatch.setattr(browser_finalize, "finalize", _publish_success)
+    w = worker_module.DownloadWorker()
+    monkeypatch.setattr(w, "_probe_duration_seconds", lambda _path: 50)
+    try:
+        w.process_browser_finalize(job_id)
+    finally:
+        w.db.close()
+
+    assert _read_status(SessionLocal, job_id) == "completed"
+    db = SessionLocal()
+    try:
+        row = db.execute(sa_text(
+            "SELECT actual_duration, suspect_reason FROM job_metadata "
+            "WHERE job_id = :id"
+        ), {"id": job_id}).first()
+    finally:
+        db.close()
+    assert row.actual_duration == 50
+    assert "only 50% of declared 100s" in row.suspect_reason
 
 
 def test_failed_finalize_releases_staging_browser_finalize_error(

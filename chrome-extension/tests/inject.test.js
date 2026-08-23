@@ -32,7 +32,7 @@ function createSandbox(options) {
     __messages: messages,
     postMessage: (data) => messages.push(data),
     addEventListener: () => {},
-    fetch: () => Promise.resolve({}),
+    fetch: options.fetch || (() => Promise.resolve({})),
   };
   // Simulate hostile-page preconditions where the page has already locked
   // the stats slot before inject.js runs (Codex adversarial review #5).
@@ -49,9 +49,10 @@ function createSandbox(options) {
   // inject.js patches XMLHttpRequest.prototype methods, so we need a real
   // class with the methods present.
   ctx.XMLHttpRequest = class XHR {
+    constructor() { this.__listeners = {}; }
     open() {}
     send() {}
-    addEventListener() {}
+    addEventListener(name, fn) { this.__listeners[name] = fn; }
   };
   vm.createContext(ctx);
   vm.runInContext(INJECT_SRC, ctx);
@@ -64,7 +65,154 @@ function getManifestMessages(ctx) {
   );
 }
 
+function getDirectDashMessages(ctx) {
+  return ctx.window.__messages.filter(
+    (m) => m && m.type === 'WV2NAS_DIRECT_DASH_DETECTED'
+  );
+}
+
 describe('inject.js deepsearch JSON.parse hook (v2.3.18)', () => {
+  it('detects paired JSON DASH tracks and emits one compatible codec per height', () => {
+    const ctx = createSandbox();
+    ctx.JSON.parse(JSON.stringify({
+      data: {
+        dash: {
+          duration: 321.5,
+          video: [
+            { id: '1080-av1', baseUrl: 'https://cdn.example.com/v-1080-av1.m4s?sig=1', mimeType: 'video/mp4', codecs: 'av01.0', width: 1920, height: 1080, bandwidth: 3000 },
+            { id: '1080-avc', baseUrl: 'https://cdn.example.com/v-1080-avc.m4s?sig=1', mimeType: 'video/mp4', codecs: 'avc1.640028', width: 1920, height: 1080, bandwidth: 2500 },
+            { id: '720-avc', base_url: 'https://cdn.example.com/v-720.m4s?sig=1', mime_type: 'video/mp4', codecs: 'avc1.64001f', width: 1280, height: 720, bandwidth: 1500 },
+          ],
+          audio: [
+            { id: 'audio-low', baseUrl: 'https://cdn.example.com/a-low.m4s?sig=1', mimeType: 'audio/mp4', codecs: 'mp4a.40.2', bandwidth: 64000 },
+            { id: 'audio-high', baseUrl: 'https://cdn.example.com/a-high.m4s?sig=1', mimeType: 'audio/mp4', codecs: 'mp4a.40.2', bandwidth: 128000 },
+          ],
+        },
+      },
+    }));
+
+    const msgs = getDirectDashMessages(ctx);
+    expect(msgs).toHaveLength(2);
+    expect(msgs.map((m) => m.video.height).sort((a, b) => a - b)).toEqual([720, 1080]);
+    expect(msgs.find((m) => m.video.height === 1080).video.url).toContain('v-1080-avc.m4s');
+    expect(msgs.every((m) => m.audio.url.includes('a-high.m4s'))).toBe(true);
+    expect(msgs.every((m) => m.duration === 321.5)).toBe(true);
+  });
+
+  it('keeps query-only DASH qualities distinct', () => {
+    const ctx = createSandbox();
+    ctx.JSON.parse(JSON.stringify({
+      dash: {
+        video: [
+          { baseUrl: 'https://cdn.example.com/video.m4s?qn=80', mimeType: 'video/mp4', height: 1080 },
+          { baseUrl: 'https://cdn.example.com/video.m4s?qn=64', mimeType: 'video/mp4', height: 720 },
+        ],
+        audio: [
+          { baseUrl: 'https://cdn.example.com/audio.m4s?token=1', mimeType: 'audio/mp4' },
+        ],
+      },
+    }));
+
+    const msgs = getDirectDashMessages(ctx);
+    expect(msgs).toHaveLength(2);
+    expect(msgs.map((m) => m.video.height).sort((a, b) => a - b)).toEqual([720, 1080]);
+  });
+
+  it('scans chunked JSON fetch responses without Content-Length', async () => {
+    const payload = new TextEncoder().encode(JSON.stringify({
+      dash: {
+        video: [{ baseUrl: 'https://cdn.example.com/video.m4s', mimeType: 'video/mp4', height: 1080 }],
+        audio: [{ baseUrl: 'https://cdn.example.com/audio.m4s', mimeType: 'audio/mp4' }],
+      },
+    }));
+    const response = {
+      url: 'https://api.example.com/play',
+      headers: {
+        get(name) {
+          if (String(name).toLowerCase() === 'content-type') return 'application/json';
+          return null;
+        },
+      },
+      clone() {
+        let sent = false;
+        return {
+          body: {
+            getReader() {
+              return {
+                async read() {
+                  if (!sent) {
+                    sent = true;
+                    return { done: false, value: payload };
+                  }
+                  return { done: true, value: undefined };
+                },
+                async cancel() {},
+                releaseLock() {},
+              };
+            },
+          },
+        };
+      },
+    };
+    const ctx = createSandbox({ fetch: () => Promise.resolve(response) });
+
+    await ctx.window.fetch('https://api.example.com/play');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(getDirectDashMessages(ctx)).toHaveLength(1);
+  });
+
+  it('scans XHR responseType=json even when browser parsing bypasses JSON.parse', () => {
+    const ctx = createSandbox();
+    const xhr = new ctx.XMLHttpRequest();
+    xhr.responseType = 'json';
+    xhr.response = {
+      dash: {
+        video: [{ baseUrl: 'https://cdn.example.com/video.m4s', mimeType: 'video/mp4', height: 1080 }],
+        audio: [{ baseUrl: 'https://cdn.example.com/audio.m4s', mimeType: 'audio/mp4' }],
+      },
+    };
+    xhr.open('GET', 'https://api.example.com/play');
+    xhr.send();
+    xhr.__listeners.load();
+
+    expect(getDirectDashMessages(ctx)).toHaveLength(1);
+  });
+
+  it('pairs video/audio backup URLs on one host when primary CDNs differ', () => {
+    const ctx = createSandbox();
+    ctx.JSON.parse(JSON.stringify({
+      dash: {
+        video: [{
+          baseUrl: 'https://video-primary.example.com/video.m4s?sig=v1',
+          backupUrl: ['https://shared-cdn.example.com/video.m4s?sig=v2'],
+          mimeType: 'video/mp4',
+          height: 1080,
+        }],
+        audio: [{
+          baseUrl: 'https://audio-primary.example.net/audio.m4s?sig=a1',
+          backupUrl: ['https://shared-cdn.example.com/audio.m4s?sig=a2'],
+          mimeType: 'audio/mp4',
+        }],
+      },
+    }));
+
+    const [message] = getDirectDashMessages(ctx);
+    expect(new URL(message.video.url).hostname).toBe('shared-cdn.example.com');
+    expect(new URL(message.audio.url).hostname).toBe('shared-cdn.example.com');
+    expect(message.video.backupUrls).toContain('https://video-primary.example.com/video.m4s?sig=v1');
+    expect(message.audio.backupUrls).toContain('https://audio-primary.example.net/audio.m4s?sig=a1');
+  });
+
+  it('does not emit standalone m4s URLs without a paired video/audio structure', () => {
+    const ctx = createSandbox();
+    ctx.JSON.parse(JSON.stringify({
+      video: [{ baseUrl: 'https://cdn.example.com/video.m4s', mimeType: 'video/mp4' }],
+    }));
+    expect(getDirectDashMessages(ctx)).toHaveLength(0);
+    expect(getManifestMessages(ctx)).toHaveLength(0);
+  });
+
   it('detects m3u8 URL embedded inside parsed JSON object', () => {
     const ctx = createSandbox();
     ctx.JSON.parse('{"video":{"hls":"https://cdn.example.com/v/master.m3u8"}}');

@@ -274,6 +274,22 @@
     }
   }
 
+  function forwardDirectDash(data) {
+    if (!data || !data.video || !data.audio) return;
+    try {
+      chrome.runtime.sendMessage({
+        action: 'directDashDetected',
+        video: data.video,
+        audio: data.audio,
+        duration: data.duration || null,
+        pageUrl: window.location.href,
+        timestamp: Date.now()
+      });
+    } catch (e) {
+      // Extension context may be invalid
+    }
+  }
+
   function forwardDeepHit(data) {
     if (!data || data.type !== 'WV2NAS_DEEP_DETECTED') return;
     try {
@@ -298,6 +314,8 @@
     if (!event.data) return;
     if (event.data.type === 'WV2NAS_MANIFEST_DETECTED') {
       forwardManifest(event.data);
+    } else if (event.data.type === 'WV2NAS_DIRECT_DASH_DETECTED') {
+      forwardDirectDash(event.data);
     } else if (event.data.type === 'WV2NAS_DEEP_DETECTED') {
       forwardDeepHit(event.data);
     }

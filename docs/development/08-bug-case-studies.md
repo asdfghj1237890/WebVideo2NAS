@@ -429,3 +429,85 @@ ffmpeg -f lavfi -i testsrc=duration=2:size=320x240:rate=30 -c:v libx264 -reset_t
 2. **當 root cause 不明顯時，先加診斷再下藥**。`_diagnose_segment_durations` + key-endpoint hex log 在 v2.3.5 加進去之後，**第二次跑同一支影片**就直接給出夠精準的線索定位 root cause——「個別 segment 都正常但 merge 出來只有一半」這個畫面只用了 3 行 log 就釘死。診斷 log 留著沒拿掉，未來還會用到。
 
 3. **不要假設「沒 error」就是「一切正常」**。這次 bug 在每一層都沒報錯，但結果是錯的。處理 silent corruption 的關鍵是**主動驗證 invariant**（這裡是 `actual_duration ≈ declared_duration`），而不是被動等 exception。
+
+---
+
+## 2. `blob:` player、沒有 manifest：JSON DASH 完全偵測不到
+
+### 2.1 症狀
+
+- 頁面影片正常播放，但 `<video>.currentSrc` 是 `blob:`，不是可下載 URL。
+- Network 面板持續出現 heartbeat / ping / 播放進度 XHR；它們只有觀看統計，沒有媒體 bytes。
+- 找不到 `.m3u8` 或 `.mpd` request，sidepanel 因而顯示沒有可下載影片。
+- 真正的 video/audio CDN URL 是兩條完整 `.m4s`，藏在播放器 play API 的 JSON response 裡。
+
+### 2.2 為什麼舊 detector 必然漏掉
+
+舊路徑只覆蓋：
+
+1. `webRequest` 看到 URL / Content-Type 像 m3u8、mpd、mp4、mov。
+2. `inject.js` 讀 response 前綴，找 `#EXTM3U` 或 XML `<MPD>` signature。
+3. DOM scraper 從 `<video src>` 取可下載 URL。
+
+這類 MediaSource player 三條都不成立：DOM 只有 `blob:`；沒有 manifest；JSON response 也不以 manifest signature 開頭。單看 heartbeat XHR 只能證明「播放器在回報播放」，不能推導媒體 URL。
+
+### 2.3 Root cause
+
+這不是請求攔截時序或 extension 暫停 30 秒造成的，而是**輸入模型少了一種格式**：播放器拿到的不是 manifest URL，而是 JSON 裡的多個 video representation 和一組 audio representation。可下載單位必須是「同一畫質的 video + audio 配對」，不能把任一裸 `.m4s` 當成完整影片。
+
+### 2.4 根治流程
+
+```
+player JSON
+  → bounded structural scan
+  → video 按 height 分組（每 height 選一 codec，優先 AVC）
+  → 選最佳 audio，video/audio backup 優先同 exact host
+  → WV2NAS_DIRECT_DASH_DETECTED（每 height 一筆）
+  → background 建 MPD 類型 tile + qualityHeight
+  → 兩軌各做 Range: bytes=0-0；要求一-byte 206 與有效 Content-Range 總長
+  → POST /api/jobs/init {direct_dash:{video,audio}}
+  → API 先檢查總 bytes / chunk 數 / URL safety
+  → 每軌切成連續 8 MiB Range tasks
+  → browser-side fetch + upload
+  → worker 依 seq byte-concat 每軌，再交給 FFmpeg mux
+```
+
+關鍵 invariant：
+
+- video/audio 缺一不可，兩條 URL 與正的 `content_length` 都必須存在。
+- `.m4s` webRequest 本身不建立 tile，避免每個 segment、audio-only 或廣告軌污染清單。
+- 每個 direct DASH tile 帶結構化 `qualityHeight`，所以即使總數不超過 6 筆，1080p / 720p 混合時仍可篩選。
+- direct track 不跑 manifest metadata probe；binary `.m4s` 不能被當 MPD text 解碼。
+- Range tasks 必須從 offset 0 連續覆蓋到 `content_length - 1`，不能重疊或留洞。
+
+### 2.5 為什麼沒有採用看似簡單的修法
+
+| 修法 | 問題 |
+|---|---|
+| 把 heartbeat URL 當影片 | 只有 telemetry，回應不是媒體 |
+| 所有 `.m4s` 都列成 tile | 會產生大量 segment、audio-only、廣告與重複項目，且無法知道配對 |
+| 一次 fetch 完整 `.m4s` 再上傳 | 大影片會用單一 ArrayBuffer 吃掉大量記憶體，也繞過每 segment / job quota 模型 |
+| 只送 video track | 多數 DASH video representation 沒有音訊，成品會靜音 |
+| 直接信 JSON 內宣稱的大小 | 長度可能缺失或過期；要求 CDN 確實回 one-byte `206` 與有效 `Content-Range` 總長，缺任一項就拒絕，不使用 JSON fallback |
+
+### 2.6 Regression coverage
+
+- inject：`JSON.parse`、XHR JSON、fetch JSON 三種入口（含無 `Content-Length` 的 chunked/HTTP2 response）；codec/height 去重；query-only 畫質不互相吃掉；audio 配對；同 host backup；bounded scan。
+- content/background：event bridge、stable dedupe、結構化畫質、排除裸 `.m4s`、不對 binary track 做 manifest probe。
+- DNR/browser pipeline：Expose `Content-Range` / `Content-Length` / `Accept-Ranges`，並帶 Range request。
+- API/planner：`direct_dash` 與 manifest inputs 互斥、兩軌必填、長度/總 quota/chunk-count cap、連續 byte ranges、每段 PUT/finalize 雙重長度核對、always-on URL safety；worker finalize 會寫入 `actual_duration` 與 `suspect_reason`。
+
+### 2.7 偵測成功，但送出像沒反應
+
+Manifest-less JSON DASH 同時新增 extension payload 與 NAS `/api/jobs/init` contract；開發時若只在 `chrome://extensions` 重新載入 extension、沒有更新 NAS container，舊 API 會忽略未知的 `direct_dash`，再以 `422 Either url or manifest_text is required` 拒絕 request。舊的 message handler 又不論 `sendToNAS()` 成敗都回 `{success: true}`，sidepanel 也要等整段 browser-side upload 結束才顯示「送出中」，因此畫面看起來完全沒反應。
+
+修正後的 contract：
+
+- sidepanel 在送 message 前立即顯示「送出中」，不等待 Range probe、init 與 upload 完成。
+- `sendToNAS()` 所有 exit path 都回 `{success, error?, mode?}`；runtime message handler 原樣轉交，不再把 failure 改寫成 success。
+- tile 只有收到 `{success:true}` 才加入 `sentUrls`；失敗會移除 sending/sent 樣式並恢復選取，讓使用者直接重試。
+- URL 對應的 direct-DASH pair 與 page title 都用來源 `tabId` 查找，不會因兩個 tab 出現同 URL 而拿到另一頁的 audio/title。
+- direct DASH 遇到舊 API 的 missing-input `422` 或缺少 init endpoint 的 `404` 時，明確提示要更新 NAS，不進入不安全或無效的 legacy fallback。
+- extension 與 NAS API 必須一起發布；能看到 tile 只證明 detector 已更新，不代表 NAS 已支援新的 init payload。
+
+目前 unit regression 基線：Chrome extension 358 tests / 16 files；API + Worker 539 tests。

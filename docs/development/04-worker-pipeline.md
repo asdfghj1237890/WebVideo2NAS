@@ -264,14 +264,14 @@ docker exec -it video_worker_1 python /app/worker/backfill_suspect.py --report-o
 當 extension 走 [browser-side pipeline](./03-chrome-extension.md#8-browser-side-pipeline-v30),worker 完全不接觸 source CDN。流程:
 
 ```
-extension PUT segments → /api/jobs/{id}/segments/...
+extension PUT manifest segments or direct-DASH Range chunks → /api/jobs/{id}/segments/...
    → API 寫 staging_dir/track/seg_NNNNNNNN.bin
 extension POST /api/jobs/{id}/finalize
    → API: status='browser_finalizing', RPUSH download_queue
 [Worker BLPOP] →
    1. SELECT * FROM job_metadata 看 mode='browser' + staging_dir
-   2. ffmpeg -f mpegts -i pipe:0 -c copy ... < concat(staging_dir/video/seg_*)
-      (audio track 同理,如果有)
+   2a. HLS TS: byte-concat staging_dir/video/seg_* → ffmpeg stdin
+   2b. DASH: 依 seq byte-concat video / audio 軌，再以 ffmpeg -c copy mux
    3. UPDATE jobs SET status='completed', file_path='...'
    4. rmtree staging_dir
 ```
@@ -280,6 +280,7 @@ extension POST /api/jobs/{id}/finalize
 
 - `_process_m3u8_download` 等三條原本的 path **不會跑** — 看 `mode='browser'` 進另一個 branch
 - 沒有 segment fetch、AES decrypt、token retry 那些 — 那段全在 extension 端做完了
+- Manifest-less JSON DASH 的每個 `seg_NNNNNNNN.bin` 是同一完整 `.m4s` 軌道的連續 byte range（預設 8 MiB）；worker 依 seq 串回原始 video/audio 檔再 mux，不把 Range chunk 當獨立 fMP4 segment
 - HostThrottle、anti-hotlink detection 對這條 path 都不適用
 - Stale-browser-job reaper 在啟動時跑(超過 6h 還在 `browser_pending` / `browser_uploading` / `browser_finalizing` → 標 failed,清 staging_dir)
 

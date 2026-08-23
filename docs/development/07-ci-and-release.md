@@ -50,7 +50,7 @@
 - npm test         # = vitest run
 ```
 
-純粹。317 個 vitest test（15 個檔案），~25 秒。
+純粹。358 個 vitest test（16 個檔案）；實際時間依 runner 負載而定。
 
 ### 2.3 `api-smoke` job
 

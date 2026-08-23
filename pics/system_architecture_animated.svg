@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="720" viewBox="0 0 1440 720" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
   <title id="title">WebVideo2NAS current animated architecture diagram</title>
-  <desc id="desc">Current WebVideo2NAS v3 architecture with browser-side HLS and DASH staging, NAS-direct fallback, FastAPI, Redis, PostgreSQL, workers, FFmpeg, and NAS storage.</desc>
+  <desc id="desc">Current WebVideo2NAS v3 architecture with browser-side HLS and DASH staging, including manifest-less JSON DASH video and audio tracks split into byte ranges, plus NAS-direct fallback, FastAPI, Redis, PostgreSQL, workers, FFmpeg, and NAS storage.</desc>
   <defs>
     <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
       <stop offset="0%" stop-color="#0f172a"/>
@@ -230,7 +230,7 @@
 
   <g class="node-enter">
     <text x="62" y="63" class="heading">WebVideo2NAS Current Architecture</text>
-    <text x="64" y="95" class="subheading">v3 browser-side HLS/DASH staging by default, with NAS-direct download as the fallback path.</text>
+    <text x="64" y="95" class="subheading">Browser-side HLS/DASH staging, including paired JSON DASH tracks; NAS-direct remains available.</text>
   </g>
 
   <g class="node-enter delay-1">
@@ -251,7 +251,7 @@
     <text x="220" y="339" text-anchor="middle" class="small">MV3 side panel + service worker</text>
 
     <rect x="120" y="370" width="200" height="46" rx="14" class="mini"/>
-    <text x="220" y="390" text-anchor="middle" class="tiny">Deep detection</text>
+    <text x="220" y="390" text-anchor="middle" class="tiny">Manifest + JSON detection</text>
     <text x="220" y="408" text-anchor="middle" class="tiny muted">webRequest, fetch, XHR</text>
 
     <rect x="120" y="432" width="200" height="46" rx="14" class="mini"/>
@@ -266,13 +266,13 @@
   <g class="node node-enter delay-1">
     <rect x="92" y="194" width="256" height="54" rx="20" fill="#0f172a" stroke="#334155" stroke-width="1.6"/>
     <text x="220" y="216" text-anchor="middle" class="small" font-weight="800">Source Website / CDN</text>
-    <text x="220" y="236" text-anchor="middle" class="tiny muted">manifests, segments, MP4/MOV</text>
+    <text x="220" y="236" text-anchor="middle" class="tiny muted">manifests, paired .m4s, MP4/MOV</text>
   </g>
 
   <g class="node-enter delay-2">
     <rect x="440" y="206" width="566" height="176" rx="24" class="lane" stroke="#22d3ee"/>
     <text x="468" y="237" class="section-title" fill="#67e8f9">Browser-side HLS/DASH path (default)</text>
-    <text x="468" y="262" class="tiny muted">Browser fetches and uploads staged bytes; API validates the plan.</text>
+    <text x="468" y="262" class="tiny muted">Manifest segments or JSON DASH ranges are staged; API validates every URL.</text>
   </g>
 
   <g class="node-enter delay-3">
@@ -300,9 +300,9 @@
 
   <g class="node node-enter delay-2">
     <rect x="468" y="286" width="166" height="72" rx="20" fill="url(#stageGrad)" stroke="#67e8f9" class="card"/>
-    <text x="551" y="314" text-anchor="middle" class="small" font-weight="800">Manifest Plan</text>
+    <text x="551" y="314" text-anchor="middle" class="small" font-weight="800">Media Plan</text>
     <text x="551" y="336" text-anchor="middle" class="tiny">/api/jobs/init</text>
-    <text x="551" y="352" text-anchor="middle" class="tiny muted">manifest text</text>
+    <text x="551" y="352" text-anchor="middle" class="tiny muted">manifest / direct_dash</text>
   </g>
 
   <g class="node node-enter delay-2">
@@ -315,8 +315,8 @@
   <g class="node node-enter delay-3">
     <rect x="858" y="286" width="120" height="72" rx="20" fill="#0f766e" stroke="#5eead4" class="card"/>
     <text x="918" y="314" text-anchor="middle" class="small" font-weight="800">Staging</text>
-    <text x="918" y="336" text-anchor="middle" class="tiny">PUT segments</text>
-    <text x="918" y="352" text-anchor="middle" class="tiny muted">.staging/job</text>
+    <text x="918" y="336" text-anchor="middle" class="tiny">PUT chunks</text>
+    <text x="918" y="352" text-anchor="middle" class="tiny muted">segments + ranges</text>
   </g>
 
   <g aria-hidden="true">

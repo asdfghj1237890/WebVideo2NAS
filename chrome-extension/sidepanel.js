@@ -673,8 +673,8 @@ function loadDetectedUrls() {
 
 function sortedDetectedUrls() {
   return detectedUrls.slice().sort((a, b) => {
-    const aQ = getMaxQualityNumber(a && a.url);
-    const bQ = getMaxQualityNumber(b && b.url);
+    const aQ = getDetectedQualityNumber(a);
+    const bQ = getDetectedQualityNumber(b);
     if (aQ !== bQ) return bQ - aQ;
     const aScore = Number(a && a.score) || 0;
     const bScore = Number(b && b.score) || 0;
@@ -743,8 +743,8 @@ function hashHue(str) {
   return Math.abs(h) % 360;
 }
 
-function thumbColorForUrl(url) {
-  const fmt = classifyVideoType(url);
+function thumbColorForUrl(url, detectedFormat) {
+  const fmt = String(detectedFormat || classifyVideoType(url)).toUpperCase();
   const isLight = theme === 'light';
   if (FORMAT_HUE[fmt] != null) {
     const hue = FORMAT_HUE[fmt];
@@ -754,8 +754,17 @@ function thumbColorForUrl(url) {
   return isLight ? 'oklch(80% 0.005 250)' : 'oklch(32% 0.005 250)';
 }
 
-function topQualityLabel(url) {
-  const qs = extractQualitiesFromUrl(url);
+function getDetectedQualityNumber(item) {
+  const explicit = Number(item && item.qualityHeight);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  return getMaxQualityNumber(item && item.url);
+}
+
+function topQualityLabel(item) {
+  const explicit = Number(item && item.qualityHeight);
+  const qs = Number.isFinite(explicit) && explicit > 0
+    ? [`${Math.round(explicit)}p`]
+    : extractQualitiesFromUrl(item && item.url);
   if (!qs.length) return null;
   const top = qs[0]; // sorted desc
   if (top === '2160p') return '4K';
@@ -765,7 +774,7 @@ function topQualityLabel(url) {
 function uniqueQualityLabels(items) {
   const set = new Set();
   for (const it of items) {
-    const top = topQualityLabel(it.url);
+    const top = topQualityLabel(it);
     if (top) set.add(top);
   }
   // Stable order: 4K, 1440p, 1080p, 720p, others
@@ -810,7 +819,7 @@ function visibleDetectedUrls() {
   normalizeQualityFilter();
   let items = sortedDetectedUrls();
   if (qualityFilter !== 'all') {
-    items = items.filter(it => topQualityLabel(it.url) === qualityFilter);
+    items = items.filter(it => topQualityLabel(it) === qualityFilter);
   }
   if (searchQuery) {
     items = items.filter(it => String(it.url || '').toLowerCase().includes(searchQuery));
@@ -918,8 +927,8 @@ function renderDetectedUrls(opts) {
     const sentClass = isSent ? ' sent' : '';
     const interactClass = isMany ? ' selectable' : '';
     const title = deriveTitle(urlInfo, index);
-    const tone = thumbColorForUrl(url);
-    const top = topQualityLabel(url);
+    const tone = thumbColorForUrl(url, urlInfo.detectedFormat);
+    const top = topQualityLabel(urlInfo);
     const isNowPlaying = !!urlInfo.isNowPlaying || !!urlInfo.isLive;
 
     // Browser-side play-first gate: keep the candidate visible, but
@@ -1095,7 +1104,7 @@ function renderQualityChips() {
 
   el.innerHTML = all.map(q => {
     const count = q === 'all' ? detectedUrls.length :
-      detectedUrls.filter(d => topQualityLabel(d.url) === q).length;
+      detectedUrls.filter(d => topQualityLabel(d) === q).length;
     const active = qualityFilter === q ? ' active' : '';
     const label = q === 'all' ? t('chip.all') : q;
     const countMarkup = q === 'all' ? '' : `<span class="chip-count">${count}</span>`;
@@ -1170,7 +1179,7 @@ function updateBulkBar() {
 }
 
 // ---------- Send to NAS (single + bulk + flight ghost) ----------
-function flyToNAS(tileEl, url, pageUrl) {
+async function flyToNAS(tileEl, url, pageUrl) {
   // Fire the actual NAS submission FIRST, before any visuals. Previously
   // sendToNAS lived inside a 700 ms setTimeout (the fly-ghost animation),
   // which created a window where the request could be lost: if the user
@@ -1178,16 +1187,24 @@ function flyToNAS(tileEl, url, pageUrl) {
   // and the queued setTimeout never fired → silent drop. Same for the
   // bulkSend path where the LAST tile's real send was ~1.4 s after the
   // click. Fire-then-animate guarantees the request is in flight by the
-  // time the animation even starts. Bookkeeping (sentUrls / selected) is
-  // also moved up so a `loadDetectedUrls()` triggered by a new
-  // background-detected URL during the animation re-renders the tile in
-  // the correct .sent state instead of as a fresh untouched tile.
-  sentUrls.add(url);
+  // time the animation even starts. Do not mark the URL as sent until the
+  // background confirms that NAS accepted it: submission errors used to
+  // leave a permanent green/sent tile even though no task existed.
+  const sendPromise = sendToNAS(url, pageUrl);
   selected.delete(url);
   updateBulkBar();
-  sendToNAS(url, pageUrl);
 
-  if (!tileEl) return;
+  if (!tileEl) {
+    const result = await sendPromise;
+    if (result && result.success) {
+      sentUrls.add(url);
+    } else {
+      sentUrls.delete(url);
+      selected.add(url);
+      updateBulkBar();
+    }
+    return result;
+  }
 
   const target = document.getElementById('recentHeader');
   const a = tileEl.getBoundingClientRect();
@@ -1219,13 +1236,31 @@ function flyToNAS(tileEl, url, pageUrl) {
     ghost.style.opacity = '0';
   }
 
-  setTimeout(() => {
-    ghost.remove();
+  const animationDone = new Promise((resolve) => {
+    setTimeout(() => {
+      ghost.remove();
+      resolve();
+    }, 700);
+  });
+
+  const result = await sendPromise;
+  await animationDone;
+  if (result && result.success) {
+    sentUrls.add(url);
     if (tileEl && tileEl.parentNode) {
       tileEl.classList.remove('sending');
       tileEl.classList.add('sent');
     }
-  }, 700);
+  } else {
+    sentUrls.delete(url);
+    selected.add(url);
+    if (tileEl && tileEl.parentNode) {
+      tileEl.classList.remove('sending');
+      tileEl.classList.remove('sent');
+    }
+    updateBulkBar();
+  }
+  return result;
 }
 
 function bulkSend(items) {
@@ -1304,10 +1339,15 @@ async function sendToNAS(url, pageUrl) {
   if (!settings.nasEndpoint || !settings.apiKey) {
     showToast(t('alert.configureFirst'));
     chrome.runtime.openOptionsPage();
-    return;
+    return { success: false, error: t('alert.configureFirst') };
   }
 
   try {
+    // Immediate feedback: browser-side JSON DASH first installs DNR rules,
+    // probes both track lengths, initializes NAS staging, and may then upload
+    // for minutes. Waiting for the background response before showing any UI
+    // made a valid click look dead.
+    showToast(t('toast.sending'));
     // Don't pass the active tab's title — in a multi-tab session the active
     // tab may not be the tab this URL came from, leading to mismatched titles.
     // Background looks up the title that was captured when this URL was first
@@ -1317,19 +1357,27 @@ async function sendToNAS(url, pageUrl) {
     // tabId anchors the captured-header substitution to this exact tab.
     // Without it, sending from tab B/C in a same-site multi-tab session
     // could rewrite the URL to tab A's video (origin-prefix scoring leak).
-    await sendMessageWithRetry({
+    const response = await sendMessageWithRetry({
       action: 'sendToNAS',
       url: url,
       title: t('video.untitled'),
       pageUrl: pageUrl || '',
       tabId: activeTabId
     });
-
-    showToast(t('toast.sending'));
+    if (!response || response.success !== true) {
+      throw new Error((response && response.error) || t('toast.failedToSend'));
+    }
     setTimeout(loadRecentJobs, 2000);
+    return { success: true, response };
   } catch (error) {
     console.error('sendToNAS message failed after retries:', error);
-    showToast(t('toast.failedToSend'));
+    const detail = error && error.message && error.message !== t('toast.failedToSend')
+      ? `: ${error.message}` : '';
+    showToast(`${t('toast.failedToSend')}${detail}`);
+    return {
+      success: false,
+      error: error && error.message ? error.message : String(error),
+    };
   }
 }
 

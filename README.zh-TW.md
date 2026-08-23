@@ -2,7 +2,7 @@
 
 **English**: `README.md`
 
-> 透過 Chrome 擷取網頁影片（M3U8 / MPD / MP4 / MOV）URL，一鍵送到 NAS；HLS/DASH 可走 browser-side 模式處理綁定瀏覽器 session 的串流。
+> 透過 Chrome 擷取網頁影片（M3U8 / MPD / MP4 / MOV）URL，以及沒有 manifest、只存在播放器 JSON 裡的 DASH 視訊／音訊雙軌，一鍵送到 NAS；HLS/DASH 可走 browser-side 模式處理綁定瀏覽器 session 的串流。
 
 > [!IMPORTANT]
 > 本專案**不保證**所有影片都能下載。部分網站可能有 DRM、URL 失效、防盜連、IP 限制或隨時調整傳輸邏輯。
@@ -20,8 +20,8 @@
 
 ## Overview（概覽）
 整體流程很簡單：
-1. Chrome Extension 偵測到影片 URL（M3U8/MPD/MP4/MOV）
-2. 一鍵送到 NAS 的 API；HLS/DASH 可由瀏覽器端抓 segment 再上傳 staging
+1. Chrome Extension 偵測到影片 URL（M3U8/MPD/MP4/MOV），或從播放器 JSON 配對完整的 DASH 視訊／音訊 `.m4s` 軌道
+2. 一鍵送到 NAS 的 API；HLS/DASH 可由瀏覽器端抓 segment 或 Range chunk 再上傳 staging
 3. NAS 背後的 Worker 下載或 mux（必要時用 FFmpeg）並放到 `/downloads/`（可在 profile 設定子資料夾）
 
 ## 📦 安裝（Installation）
@@ -127,7 +127,7 @@ Synology UI：在 Project 點 **Action → Pull**，再 **Restart**。
 
 ## 使用方式（Usage）
 1. 打開你要下載的影片網站並播放影片
-2. Extension 看到 URL 後，圖示/列表會出現可下載項目
+2. Extension 看到 URL 或成對的 JSON DASH 軌道後，圖示/列表會出現可下載項目；不同解析度可個別篩選
 3. 點 **Send to NAS**（或類似按鈕）送出下載
 4. 在 Extension 介面看進度；完成後到 NAS 的 `/downloads/` 找檔案（若 profile 設了 `subdir`，則在 `/downloads/<subdir>/`）
 
@@ -160,6 +160,8 @@ Synology UI：在 Project 點 **Action → Pull**，再 **Restart**。
 - 看 worker logs（在 Container Manager / Docker logs）
 - 確認 NAS 磁碟空間足夠
 - 站點可能有防盜連/URL 失效/DRM（這類通常無法下載）
+- 若頁面只看到 heartbeat／播放進度 XHR，不代表那是影片；無 manifest 的 DASH 必須等播放器回應中同時出現完整 video/audio 軌道 URL 才能建立下載項目
+- 若 JSON DASH 項目能顯示、送出時卻提示 NAS API 不支援，代表本機重新載入的 extension 比 NAS container 新；更新並重啟 NAS 服務後再試
 
 ## 安全建議（Security）
 - **不要把服務直接公開到網際網路**

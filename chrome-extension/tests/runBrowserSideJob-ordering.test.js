@@ -117,6 +117,16 @@ describe('runBrowserSideJob: DNR install precedes manifest fetch', () => {
           headers: new Map(),
         };
       }
+      if (u.includes('.m4s')) {
+        return {
+          ok: true, status: 206,
+          headers: new Map([
+            ['content-length', '1'],
+            ['content-range', 'bytes 0-0/100'],
+          ]),
+          arrayBuffer: async () => new Uint8Array([0]).buffer,
+        };
+      }
       // /api/jobs/init: return a minimal plan
       if (u.endsWith('/api/jobs/init')) {
         return {
@@ -697,6 +707,18 @@ describe('runBrowserSideJob: init failure fallback policy (Codex adversarial-rev
           headers: new Map(),
         };
       }
+      if (u.endsWith('.m4s')) {
+        return {
+          ok: true,
+          status: 206,
+          headers: {
+            get: (name) => String(name).toLowerCase() === 'content-range'
+              ? 'bytes 0-0/1024'
+              : (String(name).toLowerCase() === 'content-length' ? '1' : null),
+          },
+          arrayBuffer: async () => new Uint8Array([0]).buffer,
+        };
+      }
       if (u.endsWith('/api/jobs/init')) {
         return {
           ok: false, status: initStatus,
@@ -753,6 +775,19 @@ describe('runBrowserSideJob: init failure fallback policy (Codex adversarial-rev
   it('init 422 (non-public host safety) is TERMINAL — NOT fallbackable', async () => {
     setupCtx(422, "Plan URL host '192.168.1.1' resolves to non-public IP");
     const caught = await runJobAndCatch();
+    expect(caught.fallbackable).toBeFalsy();
+  });
+
+  it('marks the legacy missing-url validator response as direct-DASH API incompatibility', async () => {
+    setupCtx(422, 'Value error, Either url or manifest_text is required');
+    const caught = await runJobAndCatch({
+      direct_dash: {
+        video: { url: 'https://cdn.example.com/video.m4s', mimeType: 'video/mp4' },
+        audio: { url: 'https://cdn.example.com/audio.m4s', mimeType: 'audio/mp4' },
+      },
+    });
+    expect(caught).not.toBeNull();
+    expect(caught.directDashUnsupported).toBe(true);
     expect(caught.fallbackable).toBeFalsy();
   });
 
@@ -941,11 +976,12 @@ describe('sendToNAS: routes URLs that would 422 directly to NAS-direct', () => {
       useBrowserSide: true,
     });
 
-    await ctx.sendToNAS(
+    const result = await ctx.sendToNAS(
       'https://localhost/internal.m3u8',
       'Internal', 'https://localhost/page', 1,
     );
 
+    expect(result).toEqual(expect.objectContaining({ success: false }));
     expect(fetchCalls.some((u) => u.endsWith('/api/download'))).toBe(false);
     expect(fetchCalls.some((u) => u.endsWith('/api/jobs/init'))).toBe(false);
   });
@@ -1089,11 +1125,12 @@ describe('sendToNAS: routes URLs that would 422 directly to NAS-direct', () => {
       useBrowserSide: true,
     });
 
-    await ctx.sendToNAS(
+    const result = await ctx.sendToNAS(
       'https://cdn.example.com/video.mp4',
       'MP4', 'https://cdn.example.com/watch', 1,
     );
 
+    expect(result).toEqual(expect.objectContaining({ success: true, mode: 'nas_direct' }));
     expect(fetchCalls.some((u) => u.endsWith('/api/download'))).toBe(true);
     expect(fetchCalls.some((u) => u.endsWith('/api/jobs/init'))).toBe(false);
   });

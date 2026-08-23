@@ -25,7 +25,7 @@ downloads, it requests broad Chrome permissions including host access,
 
 Depending on the workflow, the extension may handle:
 
-- Media URLs, manifest URLs, segment URLs, and source page URLs.
+- Media URLs, manifest URLs, segment URLs, paired manifest-less DASH video/audio track URLs, and source page URLs.
 - Request metadata such as Referer, Origin, User-Agent, and selected custom
   request headers needed to reproduce the media request.
 - Cookie headers for NAS-direct jobs when Chrome cookies are needed by the NAS
@@ -44,9 +44,10 @@ The configured NAS API may receive:
 
 - Download job metadata: URL, title, source page, referer, selected headers,
   output subdirectory, and format hints.
-- For browser-side HLS/DASH jobs: the manifest text or manifest URL, segment
-  plan, init segments, media segments, AES key responses when required by the
-  stream, and finalize/abort messages.
+- For browser-side HLS/DASH jobs: the manifest text or manifest URL, or paired
+  direct-DASH track metadata (URLs, probed byte lengths, codec/resolution hints);
+  the resulting segment/range plan, init segments, media segments or byte-range
+  chunks, AES key responses when required by the stream, and finalize/abort messages.
 - Authentication to the NAS API via `Authorization: Bearer <API_KEY>`.
 
 The NAS service stores job rows in Postgres, queue state in Redis, temporary
@@ -110,11 +111,11 @@ Browser-side mode exists because some authorized streams are bound to the
 browser's cookies, IP, or short-lived signed URLs. This mode is intentionally
 restricted:
 
-- Manifest fetches are HTTPS-only.
+- Manifest and direct-track fetches are HTTPS-only.
 - Localhost, private, link-local, reserved, and special-use IP literals are
   rejected.
-- Cross-site manifests/segments require same-site trust or an explicit trusted
-  CDN suffix.
+- Cross-site manifests, direct tracks, and segments require same-site trust or
+  an explicit trusted CDN suffix.
 - DNR rules are scoped to the extension initiator and only apply to trusted URL
   groups.
 - The API revalidates browser-side plans before accepting staged uploads.
