@@ -362,6 +362,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### [Unreleased]
 
+### [3.4.1] - 2026-08-24
+
+#### Fixed
+- Linux API deployments now import the platform module used by the no-hard-link NAS publish fallback. This restores fallback segment/init publishing on filesystems that reject `link(2)` and fixes the Linux-only Python CI failure missed by the Windows test run.
+
 ### [3.4.0] - 2026-08-24
 
 #### Added

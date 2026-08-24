@@ -15,6 +15,7 @@ import hmac
 import os
 import re
 import stat
+import sys
 import logging
 import threading
 import time
