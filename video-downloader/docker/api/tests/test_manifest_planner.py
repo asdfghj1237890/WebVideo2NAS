@@ -6,6 +6,7 @@ the manifest in browser session, then POSTs the text). The plan_from_url
 path delegates to the same parsers and is covered indirectly.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -91,6 +92,40 @@ seg0.ts
 """
         with pytest.raises(ManifestPlanError, match="HLS parse failed: .*Invalid AES-128 IV"):
             plan_from_text(media, "https://cdn.example.com/v/playlist.m3u8")
+
+
+@pytest.mark.parametrize("ciphertext_length", [1, 15, 17, 31])
+def test_plan_from_text_hls_aes_byte_range_requires_full_cipher_blocks(
+    ciphertext_length,
+):
+    media = f"""#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-KEY:METHOD=AES-128,URI="key.bin"
+#EXT-X-BYTERANGE:{ciphertext_length}@0
+#EXTINF:10,
+media.bin
+#EXT-X-ENDLIST
+"""
+    with pytest.raises(
+        ManifestPlanError,
+        match="ciphertext length must be a positive multiple of 16",
+    ):
+        plan_from_text(media, "https://cdn.example.com/v/playlist.m3u8")
+
+
+def test_plan_from_text_hls_aes_byte_range_accepts_aligned_ciphertext():
+    media = """#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-KEY:METHOD=AES-128,URI="key.bin"
+#EXT-X-BYTERANGE:32@0
+#EXTINF:10,
+media.bin
+#EXT-X-ENDLIST
+"""
+    plan = plan_from_text(media, "https://cdn.example.com/v/playlist.m3u8")
+    segment = plan["tracks"]["video"]["segments"][0]
+    assert segment["byte_range"]["length"] == 32
+    assert segment["key"]["method"] == "AES-128"
 
 
 HLS_FMP4 = """#EXTM3U
@@ -186,6 +221,93 @@ def test_plan_from_text_dash_raw_parser_errors_are_plan_errors():
         plan_from_text(malformed, "https://cdn.example.com/dash/manifest.mpd")
 
 
+@pytest.mark.parametrize(
+    ("timescale", "duration", "repeat", "message"),
+    [
+        ("-1", "1", "0", "timescale must be positive"),
+        ("1", "0", "0", "S@d must be positive"),
+        ("1", "1", "-2", "S@r must be greater than or equal to -1"),
+    ],
+)
+def test_dash_budget_mirror_rejects_invalid_timeline_numeric_domains(
+    monkeypatch, timescale, duration, repeat, message,
+):
+    manifest = f"""<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT2S">
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="v" bandwidth="1">
+      <SegmentTemplate media="seg-$Number$.m4s" timescale="{timescale}">
+        <SegmentTimeline><S d="{duration}" r="{repeat}"/></SegmentTimeline>
+      </SegmentTemplate>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+    monkeypatch.setattr(
+        manifest_planner,
+        "parse_mpd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "numeric domain rejection must happen in the API mirror"
+        ),
+    )
+
+    with pytest.raises(ManifestPlanError, match=message):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://e.test/m.mpd",
+            max_plan_bytes=1_000_000,
+        )
+
+
+@pytest.mark.parametrize(
+    ("duration_attr", "timeline"),
+    [
+        (
+            "",
+            '<S t="0" d="2"/><S d="2" r="-1"/>',
+        ),
+        (
+            'mediaPresentationDuration="PT10S"',
+            '<S t="5" d="2" r="-1"/><S t="4" d="2"/>',
+        ),
+        (
+            'mediaPresentationDuration="PT10S"',
+            '<S t="0" d="2" r="-1"/><S d="2"/><S t="8" d="2"/>',
+        ),
+    ],
+)
+def test_dash_budget_mirror_rejects_unbounded_negative_repeat(
+    monkeypatch, duration_attr, timeline,
+):
+    manifest = f"""<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" {duration_attr}>
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="v" bandwidth="1">
+      <SegmentTemplate media="$Time$.m4s" timescale="1">
+        <SegmentTimeline>{timeline}</SegmentTimeline>
+      </SegmentTemplate>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+    monkeypatch.setattr(
+        manifest_planner,
+        "parse_mpd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "negative-repeat boundary rejection must happen in API preflight"
+        ),
+    )
+
+    with pytest.raises(
+        ManifestPlanError,
+        match="S@r=-1 has no finite increasing boundary",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://e.test/m.mpd",
+            max_plan_bytes=1_000_000,
+        )
+
+
 DASH_DRM = """<?xml version="1.0"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT30S">
   <Period>
@@ -212,6 +334,371 @@ def test_plan_from_text_unrecognised_format_rejected():
 def test_plan_from_text_empty_input_rejected():
     with pytest.raises(ManifestPlanError):
         plan_from_text("", "https://example.com/x")
+
+
+@pytest.mark.parametrize(
+    "newline",
+    [
+        "\n", "\r\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e",
+        "\x85", "\u2028", "\u2029",
+    ],
+)
+def test_hls_segment_cap_rejects_before_m3u8_object_materialization(
+    monkeypatch, newline,
+):
+    media = f"#EXTM3U{newline}" + "".join(
+        f"#EXTINF:1,{newline}seg-{index}.ts{newline}" for index in range(4)
+    )
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized HLS must be rejected before m3u8.loads"
+        ),
+    )
+
+    with pytest.raises(manifest_planner.ManifestSegmentLimitError):
+        manifest_planner.plan_from_text(
+            media,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=3,
+        )
+
+
+@pytest.mark.parametrize(
+    "tag_line",
+    [
+        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"',
+        '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1,URI="iframe.m3u8"',
+        '#EXT-X-IMAGE-STREAM-INF:BANDWIDTH=1,URI="images.m3u8"',
+        '#EXT-X-TILES:RESOLUTION=1x1,LAYOUT="1x1",DURATION=1',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="a",URI="a.m3u8"',
+        '#EXT-X-MAP:URI="init.mp4"',
+        '#EXT-X-RENDITION-REPORT:URI="next.m3u8",LAST-MSN=1',
+        '#EXT-X-PART:DURATION=0.1,URI="part.m4s"',
+        '#EXT-X-SESSION-DATA:DATA-ID="id",VALUE="value"',
+        '#EXT-X-SESSION-KEY:METHOD=AES-128,URI="key.bin"',
+        '#EXT-X-DATERANGE:ID="id",START-DATE="2026-01-01T00:00:00Z"',
+        # m3u8 dispatches with startswith(), so malformed suffixes can still
+        # enter an object-appending parser and must not bypass the raw cap.
+        '#EXT-X-PART-UNKNOWN:URI="part.m4s"',
+    ],
+)
+def test_hls_auxiliary_object_cap_rejects_before_parser_allocation(
+    monkeypatch, tag_line,
+):
+    manifest = "#EXTM3U\n" + f"{tag_line}\n" * 2
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "auxiliary HLS objects must be capped before m3u8.loads"
+        ),
+    )
+
+    with pytest.raises(manifest_planner.ManifestSegmentLimitError):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=1,
+        )
+
+
+def test_hls_auxiliary_object_cap_is_aggregate_across_tag_families(monkeypatch):
+    manifest = """#EXTM3U
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1,URI="iframe.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="a",URI="a.m3u8"
+#EXT-X-MAP:URI="init.mp4"
+#EXT-X-PART:DURATION=0.1,URI="part.m4s"
+"""
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "mixed auxiliary HLS objects must share one raw cap"
+        ),
+    )
+
+    with pytest.raises(manifest_planner.ManifestSegmentLimitError):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=3,
+        )
+
+
+def test_hls_retained_object_cap_combines_segments_and_parts(monkeypatch):
+    manifest = """#EXTM3U
+#EXT-X-PART:DURATION=0.1,URI="part-1.m4s"
+#EXTINF:1,
+seg-1.ts
+#EXT-X-PART:DURATION=0.1,URI="part-2.m4s"
+#EXTINF:1,
+seg-2.ts
+"""
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "segment and auxiliary objects must share one retained-object cap"
+        ),
+    )
+
+    with pytest.raises(manifest_planner.ManifestSegmentLimitError):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=2,
+        )
+
+
+def test_hls_raw_line_cap_rejects_comment_amplification_before_parser(
+    monkeypatch,
+):
+    # With max_segments=1 the raw-line ceiling is 1040. Comments retain no
+    # segment objects, but an eager splitlines() would still allocate one
+    # Python string per line before the semantic counters see them.
+    manifest = "#EXTM3U\n" + "#\n" * 1040
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "comment-amplified HLS must be rejected before m3u8.loads"
+        ),
+    )
+
+    with pytest.raises(
+        manifest_planner.ManifestSegmentLimitError,
+        match="raw line count exceeds",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=1,
+        )
+
+
+def test_iter_hls_lines_matches_python_splitlines_semantics():
+    text = "a\r\nb\rc\nd\ve\ff\x1cg\x1dh\x1ei\x85j\u2028k\u2029"
+    assert list(manifest_planner._iter_hls_lines(text)) == text.splitlines()
+
+
+def test_hls_raw_line_cap_allows_legal_multi_tag_segments():
+    segment_count = 600
+    body = ["#EXTM3U", "#EXT-X-VERSION:4"]
+    for index in range(segment_count):
+        body.extend([
+            "#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z",
+            "#EXT-X-DISCONTINUITY",
+            "#EXT-X-GAP",
+            f"#EXT-X-BYTERANGE:16@{index * 16}",
+            "#EXTINF:1,",
+            "media.bin",
+        ])
+    body.append("#EXT-X-ENDLIST")
+
+    plan = manifest_planner.plan_from_text(
+        "\n".join(body) + "\n",
+        "https://cdn.example.com/media.m3u8",
+        max_segments=segment_count,
+    )
+    assert plan["total_segments"] == segment_count
+
+
+def test_hls_preflight_rejects_attribute_line_amplification_before_parser(
+    monkeypatch,
+):
+    manifest = (
+        "#EXTM3U\n"
+        + "#EXT-X-KEY:METHOD=NONE,"
+        + "A=1," * 20_000
+        + "\n#EXTINF:1,\nseg.ts\n"
+    )
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized attribute line must be rejected before m3u8.loads"
+        ),
+    )
+
+    with pytest.raises(
+        manifest_planner.ManifestSegmentLimitError,
+        match="line length exceeds",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=1,
+        )
+
+
+def test_hls_preflight_caps_unique_keys_before_quadratic_dependency_scan(
+    monkeypatch,
+):
+    manifest = "#EXTM3U\n" + "".join(
+        f'#EXT-X-KEY:METHOD=AES-128,URI="key-{index}.bin"\n'
+        for index in range(manifest_planner._MAX_HLS_UNIQUE_KEYS + 1)
+    ) + "#EXTINF:1,\nseg.ts\n"
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "quadratic unique-key input must be rejected before m3u8.loads"
+        ),
+    )
+
+    with pytest.raises(
+        manifest_planner.ManifestSegmentLimitError,
+        match="unique EXT-X-KEY count exceeds",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=100_000,
+        )
+
+
+def test_hls_preflight_caps_repeated_key_comparison_work(monkeypatch):
+    monkeypatch.setattr(
+        manifest_planner, "_MAX_HLS_KEY_COMPARISON_WORK", 8,
+    )
+    manifest = """#EXTM3U
+#EXT-X-KEY:METHOD=AES-128,URI="key-1.bin"
+#EXT-X-KEY:METHOD=AES-128,URI="key-2.bin"
+#EXT-X-KEY:METHOD=AES-128,URI="key-2.bin"
+#EXT-X-KEY:METHOD=AES-128,URI="key-2.bin"
+#EXT-X-KEY:METHOD=AES-128,URI="key-2.bin"
+#EXTINF:1,
+seg.ts
+"""
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "repeated key comparison amplification must reject before parser"
+        ),
+    )
+
+    with pytest.raises(
+        manifest_planner.ManifestSegmentLimitError,
+        match="comparison work exceeds",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=100,
+        )
+
+
+def test_hls_preflight_caps_key_segment_cross_product(monkeypatch):
+    monkeypatch.setattr(
+        manifest_planner, "_MAX_HLS_KEY_SEGMENT_PRODUCT", 4,
+    )
+    manifest = """#EXTM3U
+#EXT-X-KEY:METHOD=AES-128,URI="key-1.bin"
+#EXT-X-KEY:METHOD=AES-128,URI="key-2.bin"
+#EXT-X-KEY:METHOD=AES-128,URI="key-3.bin"
+#EXTINF:1,
+seg-1.ts
+#EXTINF:1,
+seg-2.ts
+"""
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "key×segment CPU amplification must reject before m3u8.loads"
+        ),
+    )
+    with pytest.raises(
+        manifest_planner.ManifestSegmentLimitError,
+        match="key×segment expansion",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/media.m3u8",
+            max_segments=100,
+        )
+
+
+@pytest.mark.parametrize("family", ["variant", "media", "media_malformed"])
+def test_hls_preflight_caps_master_cross_product_before_parser(
+    monkeypatch, family,
+):
+    if family == "variant":
+        limit = manifest_planner._MAX_HLS_MASTER_VARIANTS
+        entries = "".join(
+            f"#EXT-X-STREAM-INF:BANDWIDTH={index + 1}\nvariant-{index}.m3u8\n"
+            for index in range(limit + 1)
+        )
+        expected = "master variant count exceeds"
+    elif family == "media":
+        limit = manifest_planner._MAX_HLS_MEDIA_RENDITIONS
+        entries = "".join(
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="g",NAME="a-{index}",'
+            f'URI="audio-{index}.m3u8"\n'
+            for index in range(limit + 1)
+        )
+        expected = "rendition count exceeds"
+    else:
+        limit = manifest_planner._MAX_HLS_MEDIA_RENDITIONS
+        entries = "#EXT-X-MEDIA-FOO\n" * (limit + 1)
+        expected = "rendition count exceeds"
+    manifest = "#EXTM3U\n" + entries
+    monkeypatch.setattr(
+        manifest_planner._m3u8_lib,
+        "loads",
+        lambda *_args, **_kwargs: pytest.fail(
+            "master cross-product input must be rejected before m3u8.loads"
+        ),
+    )
+
+    with pytest.raises(
+        manifest_planner.ManifestSegmentLimitError,
+        match=expected,
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/master.m3u8",
+            max_segments=100_000,
+        )
+
+
+def test_hls_segment_cap_is_propagated_to_fetched_master_variant(monkeypatch):
+    master = """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1000
+variant.m3u8
+"""
+    oversized_variant = "#EXTM3U\n" + "".join(
+        f"#EXTINF:1,\nseg-{index}.ts\n" for index in range(3)
+    )
+    real_loads = manifest_planner._m3u8_lib.loads
+    loads_calls = []
+
+    def tracked_loads(*args, **kwargs):
+        loads_calls.append(1)
+        return real_loads(*args, **kwargs)
+
+    monkeypatch.setattr(manifest_planner._m3u8_lib, "loads", tracked_loads)
+    monkeypatch.setattr(
+        manifest_planner,
+        "_safe_fetch",
+        lambda *_args, **_kwargs: (
+            oversized_variant,
+            "https://cdn.example.com/variant.m3u8",
+        ),
+    )
+
+    with pytest.raises(manifest_planner.ManifestSegmentLimitError):
+        manifest_planner.plan_from_text(
+            master,
+            "https://cdn.example.com/master.m3u8",
+            max_segments=2,
+        )
+
+    # Only the small master was parsed; fetched media failed raw preflight.
+    assert len(loads_calls) == 1
 
 
 # Codex review #15: master playlist with variant pointing at private
@@ -979,4 +1466,509 @@ def test_plan_direct_dash_rejects_invalid_lengths():
         manifest_planner.plan_direct_dash(
             {"url": "https://cdn.example.com/video.m4s", "content_length": 0},
             {"url": "https://cdn.example.com/audio.m4s", "content_length": 1},
+        )
+
+
+def test_dash_rejects_selected_audio_track_with_zero_segments():
+    mpd = """<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT10S">
+  <Period duration="PT10S">
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="v" bandwidth="1000">
+        <SegmentTemplate media="v-$Number$.m4s" duration="2" timescale="1" />
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4">
+      <Representation id="a" bandwidth="128">
+        <SegmentTemplate media="a-$Time$.m4s" timescale="1">
+          <SegmentTimeline/>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"""
+    with pytest.raises(
+        ManifestPlanError,
+        match="selected audio track produced zero segments",
+    ):
+        manifest_planner.plan_from_text(
+            mpd,
+            "https://cdn.example.com/manifest.mpd",
+        )
+
+
+def test_dash_total_segment_cap_rejects_two_tracks_before_parse_materialization(
+    monkeypatch,
+):
+    mpd = """<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT4S">
+  <Period duration="PT4S">
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="v" bandwidth="1000">
+        <SegmentTemplate media="v-$Number$.m4s" duration="1" timescale="1" />
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4">
+      <Representation id="a" bandwidth="128">
+        <SegmentTemplate media="a-$Number$.m4s" duration="1" timescale="1" />
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"""
+    monkeypatch.setattr(
+        manifest_planner,
+        "parse_mpd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "two-track cap must reject before parse_mpd materializes segments"
+        ),
+    )
+
+    with pytest.raises(manifest_planner.ManifestSegmentLimitError):
+        manifest_planner.plan_from_text(
+            mpd,
+            "https://cdn.example.com/manifest.mpd",
+            max_segments=7,
+        )
+
+
+def test_dash_preflight_caps_timeline_entries_before_materialization(monkeypatch):
+    monkeypatch.setattr(manifest_planner._dash_parser, "MAX_SEGMENTS_PER_TRACK", 3)
+    entries = "".join(
+        f'<S t="{index}" d="1" r="-1" />' for index in range(4)
+    )
+    mpd = f"""<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT4S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="v" bandwidth="100">
+        <SegmentTemplate media="$Time$.m4s" timescale="1">
+          <SegmentTimeline>{entries}</SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"""
+    parser_called = False
+
+    def must_not_materialize(*_args, **_kwargs):
+        nonlocal parser_called
+        parser_called = True
+        raise AssertionError("parse_mpd must not run after preflight rejection")
+
+    monkeypatch.setattr(manifest_planner, "parse_mpd", must_not_materialize)
+
+    with pytest.raises(ManifestPlanError, match="entry count 4 exceeds"):
+        plan_from_text(
+            mpd,
+            "https://cdn.example.com/manifest.mpd",
+            max_plan_bytes=1_000_000,
+        )
+    assert parser_called is False
+
+
+def _oversized_dash_manifest(*, timeline=False):
+    timing = (
+        '<SegmentTimeline><S d="1" r="99999"/></SegmentTimeline>'
+        if timeline
+        else ""
+    )
+    duration_attrs = "" if timeline else ' duration="1"'
+    return f"""<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT100000S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="v" bandwidth="1">
+        <SegmentTemplate media="seg-$Number$.m4s" timescale="1"{duration_attrs}>
+          {timing}
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"""
+
+
+def test_hls_budget_stops_before_shared_segment_materialization(monkeypatch):
+    media = "#EXTM3U\n" + "".join(
+        f"#EXTINF:1,\nseg-{index}.ts\n" for index in range(2_000)
+    ) + "#EXT-X-ENDLIST\n"
+    base_url = "https://cdn.example.com/" + ("deep/" * 2_000) + "playlist.m3u8"
+    parser_called = False
+
+    def must_not_materialize(*_args, **_kwargs):
+        nonlocal parser_called
+        parser_called = True
+        raise AssertionError("shared HLS parser materialized an oversized plan")
+
+    monkeypatch.setattr(
+        manifest_planner.M3U8Parser,
+        "_parse_media_playlist",
+        must_not_materialize,
+    )
+
+    with pytest.raises(
+        manifest_planner.ManifestPlanTooLargeError,
+        match="max_plan_bytes=4096",
+    ):
+        manifest_planner.plan_from_text(
+            media,
+            base_url,
+            max_plan_bytes=4096,
+        )
+
+    assert parser_called is False
+
+
+@pytest.mark.parametrize("timeline", [False, True])
+def test_dash_budget_stops_before_parse_mpd_materialization(monkeypatch, timeline):
+    parse_called = False
+
+    def must_not_materialize(*_args, **_kwargs):
+        nonlocal parse_called
+        parse_called = True
+        raise AssertionError("parse_mpd materialized an oversized plan")
+
+    monkeypatch.setattr(manifest_planner, "parse_mpd", must_not_materialize)
+    base_url = "https://cdn.example.com/" + ("deep/" * 2_000) + "manifest.mpd"
+
+    with pytest.raises(manifest_planner.ManifestPlanTooLargeError):
+        manifest_planner.plan_from_text(
+            _oversized_dash_manifest(timeline=timeline),
+            base_url,
+            max_plan_bytes=4096,
+        )
+
+    assert parse_called is False
+
+
+def test_dash_budget_applies_shared_template_cap_before_parse_mpd(monkeypatch):
+    monkeypatch.setattr(
+        manifest_planner._dash_parser, "MAX_DASH_TEMPLATE_BYTES", 32,
+    )
+    monkeypatch.setattr(
+        manifest_planner,
+        "parse_mpd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "API budget mirror must reject before shared materialization"
+        ),
+    )
+    manifest = f"""<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT100S">
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="" bandwidth="1">
+      <SegmentTemplate media="{'x' * 33}$Number$.m4s" duration="1"/>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+
+    with pytest.raises(
+        manifest_planner.ManifestPlanError,
+        match="SegmentTemplate",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/manifest.mpd",
+            max_plan_bytes=32 * 1024 * 1024,
+        )
+
+
+def test_dash_budget_mirror_caps_pre_normalization_url_work(monkeypatch):
+    """The API preflight must share the parser's urljoin input-work cap."""
+    real_budget = manifest_planner._dash_parser._ExpandedUrlBudget
+    monkeypatch.setattr(
+        manifest_planner._dash_parser,
+        "_ExpandedUrlBudget",
+        lambda: real_budget(limit=10_000, work_limit=250),
+    )
+    monkeypatch.setattr(
+        manifest_planner,
+        "parse_mpd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "API work-budget rejection must happen before parse_mpd"
+        ),
+    )
+    shrinking_representation_id = "x/../" * 20
+    manifest = f"""<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT5S">
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="{shrinking_representation_id}" bandwidth="1">
+      <SegmentTemplate media="$RepresentationID$s-$Number$.m4s"
+                       duration="1"/>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+
+    with pytest.raises(
+        ManifestPlanError,
+        match="URL resolution work.*MAX_DASH_URL_RESOLUTION_WORK_BYTES",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://e.test/m.mpd",
+            max_plan_bytes=1_000_000,
+        )
+
+
+def test_dash_budget_mirror_charges_init_url_before_parse_mpd(monkeypatch):
+    real_budget = manifest_planner._dash_parser._ExpandedUrlBudget
+    monkeypatch.setattr(
+        manifest_planner._dash_parser,
+        "_ExpandedUrlBudget",
+        lambda: real_budget(limit=80, work_limit=10_000),
+    )
+    monkeypatch.setattr(
+        manifest_planner,
+        "parse_mpd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "init URL budget rejection must happen before parse_mpd"
+        ),
+    )
+    manifest = f"""<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT1S">
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="v" bandwidth="1">
+      <SegmentTemplate media="s-$Number$.m4s"
+                       initialization="{'i' * 50}" duration="1"/>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+
+    with pytest.raises(
+        ManifestPlanError,
+        match="MAX_EXPANDED_DASH_URL_BYTES",
+    ):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://e.test/m.mpd",
+            max_plan_bytes=1_000_000,
+        )
+
+
+def test_dash_budget_mirror_charges_plan_shell_before_parse_mpd(monkeypatch):
+    monkeypatch.setattr(
+        manifest_planner,
+        "parse_mpd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "plan shell budget rejection must happen before parse_mpd"
+        ),
+    )
+    monkeypatch.setattr(
+        manifest_planner,
+        "_iter_dash_budget_segments",
+        lambda *_args, **_kwargs: pytest.fail(
+            "plan shell budget rejection must happen before media expansion"
+        ),
+    )
+    manifest = f"""<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT1S">
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="v" bandwidth="1" codecs="{'c' * 100}">
+      <SegmentTemplate media="s-$Number$.m4s" duration="1"/>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+
+    with pytest.raises(manifest_planner.ManifestPlanTooLargeError):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://e.test/m.mpd",
+            max_plan_bytes=400,
+        )
+
+
+def test_dash_budget_static_template_work_is_not_per_segment(monkeypatch):
+    real_substitute = manifest_planner._dash_parser._substitute_template
+    calls = []
+
+    def counting_substitute(*args, **kwargs):
+        calls.append(args[0])
+        return real_substitute(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manifest_planner._dash_parser,
+        "_substitute_template",
+        counting_substitute,
+    )
+    manifest = """<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT100S">
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="" bandwidth="1">
+      <SegmentTemplate
+        media="$RepresentationID$$RepresentationID$$Number%099999999d$.m4s"
+        duration="1"/>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+
+    plan = manifest_planner.plan_from_text(
+        manifest,
+        "https://cdn.example.com/manifest.mpd",
+        max_plan_bytes=32 * 1024 * 1024,
+    )
+
+    assert plan["total_segments"] == 100
+    # Once in the API budget mirror, once in the real shared parser. The
+    # 100-segment loops use _expand_repeated_template instead.
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("container_hint", "manifest"),
+    [
+        (
+            "hls",
+            "#EXTM3U\n#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n",
+        ),
+        ("dash", _oversized_dash_manifest()),
+    ],
+)
+def test_plan_from_url_applies_budget_after_fetch(
+    monkeypatch, container_hint, manifest,
+):
+    final_url = "https://cdn.example.com/" + ("deep/" * 2_000) + "manifest"
+    monkeypatch.setattr(
+        manifest_planner,
+        "_safe_fetch",
+        lambda *_args, **_kwargs: (manifest, final_url),
+    )
+
+    with pytest.raises(manifest_planner.ManifestPlanTooLargeError):
+        manifest_planner.plan_from_url(
+            "https://cdn.example.com/manifest",
+            container_hint=container_hint,
+            max_plan_bytes=4096,
+        )
+
+
+def test_hls_master_forwards_budget_to_fetched_variant(monkeypatch):
+    master = """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1000
+variant.m3u8
+"""
+    media = "#EXTM3U\n#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n"
+    final_url = "https://cdn.example.com/" + ("deep/" * 2_000) + "variant.m3u8"
+    monkeypatch.setattr(
+        manifest_planner,
+        "_safe_fetch",
+        lambda *_args, **_kwargs: (media, final_url),
+    )
+
+    with pytest.raises(manifest_planner.ManifestPlanTooLargeError):
+        manifest_planner.plan_from_text(
+            master,
+            "https://cdn.example.com/master.m3u8",
+            max_plan_bytes=4096,
+        )
+
+
+def test_plan_byte_limit_matches_persisted_json_size_exactly():
+    unlimited = manifest_planner.plan_from_text(
+        HLS_BASIC,
+        "https://cdn.example.com/v/playlist.m3u8",
+    )
+    exact_size = len(
+        json.dumps(
+            unlimited,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+
+    plan = manifest_planner.plan_from_text(
+        HLS_BASIC,
+        "https://cdn.example.com/v/playlist.m3u8",
+        max_plan_bytes=exact_size,
+    )
+    assert plan == unlimited
+    with pytest.raises(manifest_planner.ManifestPlanTooLargeError):
+        manifest_planner.plan_from_text(
+            HLS_BASIC,
+            "https://cdn.example.com/v/playlist.m3u8",
+            max_plan_bytes=exact_size - 1,
+        )
+
+
+def test_dash_plan_with_budget_matches_unlimited_plan(monkeypatch):
+    unlimited = manifest_planner.plan_from_text(
+        DASH_BASIC,
+        "https://cdn.example.com/dash/manifest.mpd",
+    )
+    exact_size = len(
+        json.dumps(
+            unlimited,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+
+    budgeted = manifest_planner.plan_from_text(
+        DASH_BASIC,
+        "https://cdn.example.com/dash/manifest.mpd",
+        max_plan_bytes=exact_size,
+    )
+    assert budgeted == unlimited
+    monkeypatch.setattr(
+        manifest_planner,
+        "parse_mpd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "exact DASH budget rejection must happen before parse_mpd"
+        ),
+    )
+    with pytest.raises(manifest_planner.ManifestPlanTooLargeError):
+        manifest_planner.plan_from_text(
+            DASH_BASIC,
+            "https://cdn.example.com/dash/manifest.mpd",
+            max_plan_bytes=exact_size - 1,
+        )
+
+
+def test_dash_budget_mirror_preserves_literal_dollar_escape():
+    manifest = """<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT1S">
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="v" bandwidth="1">
+      <SegmentTemplate media="cost-$$-$Number$.m4s"
+                       initialization="init-$$.mp4" duration="1"/>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+    plan = manifest_planner.plan_from_text(
+        manifest,
+        "https://cdn.example.com/manifest.mpd",
+        max_plan_bytes=32 * 1024 * 1024,
+    )
+
+    assert plan["tracks"]["video"]["init_segment_url"].endswith(
+        "init-$.mp4"
+    )
+    assert plan["tracks"]["video"]["segments"][0]["url"].endswith(
+        "cost-$-1.m4s"
+    )
+
+
+def test_dash_budget_mirror_checks_work_cap_before_fixed_time_gap():
+    manifest = """<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT1000000H">
+  <Period><AdaptationSet mimeType="video/mp4">
+    <Representation id="v" bandwidth="1">
+      <SegmentTemplate media="seg-$Time$.m4s" duration="1"/>
+    </Representation>
+  </AdaptationSet></Period>
+</MPD>"""
+
+    with pytest.raises(ManifestPlanError, match="Computed segment count"):
+        manifest_planner.plan_from_text(
+            manifest,
+            "https://cdn.example.com/manifest.mpd",
+            max_plan_bytes=32 * 1024 * 1024,
         )

@@ -64,15 +64,17 @@ def _build_test_engine():
 
 
 def _plant(engine, *, job_id, status, mode, created_at, staging_dir,
-           finalize_started_at=None, last_activity=None):
+           finalize_started_at=None, last_activity=None, completed_at=None):
     Sess = sessionmaker(bind=engine)
     db = Sess()
     try:
         db.execute(sa_text(
-            "INSERT INTO jobs (id, url, title, status, progress, created_at) "
-            "VALUES (:id, :url, :title, :status, 0, :ca)"
+            "INSERT INTO jobs "
+            "(id, url, title, status, progress, created_at, completed_at) "
+            "VALUES (:id, :url, :title, :status, 0, :ca, :completed_at)"
         ), {"id": job_id, "url": "https://x", "title": "t",
-            "status": status, "ca": created_at})
+            "status": status, "ca": created_at,
+            "completed_at": completed_at})
         db.execute(sa_text(
             "INSERT INTO job_metadata "
             "(job_id, mode, total_segments, staging_dir, finalize_started_at, last_activity) "
@@ -148,6 +150,74 @@ def test_reaper_marks_old_browser_pending_failed(worker_module, tmp_path):
     assert status == "failed"
     assert "Stale browser job" in (err or "")
     assert not staging.exists()  # staging wiped
+
+
+def test_reaper_retries_failed_terminal_cancel_cleanup(
+    worker_module, monkeypatch, tmp_path,
+):
+    """A cancel/abort rmtree can lose to an already-open NAS upload handle.
+    Terminal rows must remain eligible for later periodic cleanup attempts.
+    """
+    mod, engine = worker_module
+    staging_root = Path(os.environ["STAGING_DIR"])
+    staging_root.mkdir(parents=True, exist_ok=True)
+    job_id = "10101010-aaaa-bbbb-cccc-101010101010"
+    staging = staging_root / job_id
+    staging.mkdir()
+    (staging / "orphan.part").write_bytes(b"partial")
+    _plant(
+        engine,
+        job_id=job_id,
+        status="cancelled",
+        mode="browser",
+        created_at=_utcnow_naive() - timedelta(hours=24),
+        completed_at=_utcnow_naive() - timedelta(hours=12),
+        staging_dir=str(staging),
+    )
+
+    real_rmtree = shutil.rmtree
+    monkeypatch.setattr(
+        mod.shutil,
+        "rmtree",
+        MagicMock(side_effect=OSError("file handle still open")),
+    )
+    mod._reap_stale_browser_jobs()
+    assert staging.exists()
+    assert _read_status(engine, job_id)[0] == "cancelled"
+
+    monkeypatch.setattr(mod.shutil, "rmtree", real_rmtree)
+    mod._reap_stale_browser_jobs()
+    assert not staging.exists()
+    mod.redis_client.delete.assert_called_with(
+        f"wv2nas:staged_bytes:{job_id}",
+        f"wv2nas:staged_bytes_dirty:{job_id}",
+        f"wv2nas:upload_leases:{job_id}",
+    )
+
+
+def test_reaper_does_not_clean_fresh_terminal_browser_job(
+    worker_module, tmp_path,
+):
+    mod, engine = worker_module
+    staging_root = Path(os.environ["STAGING_DIR"])
+    staging_root.mkdir(parents=True, exist_ok=True)
+    job_id = "20202020-aaaa-bbbb-cccc-202020202020"
+    staging = staging_root / job_id
+    staging.mkdir()
+    _plant(
+        engine,
+        job_id=job_id,
+        status="failed",
+        mode="browser",
+        created_at=_utcnow_naive() - timedelta(minutes=5),
+        completed_at=_utcnow_naive() - timedelta(minutes=5),
+        staging_dir=str(staging),
+    )
+
+    mod._reap_stale_browser_jobs()
+
+    assert staging.exists()
+    assert _read_status(engine, job_id)[0] == "failed"
 
 
 def test_reaper_skips_uploading_job_with_fresh_last_activity(worker_module, tmp_path):

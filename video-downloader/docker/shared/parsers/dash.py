@@ -62,6 +62,7 @@ import math
 import re
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
+from xml.parsers import expat
 from xml.etree import ElementTree as ET
 
 from defusedxml import ElementTree as DefusedET
@@ -82,6 +83,56 @@ _NS = {'mpd': 'urn:mpeg:dash:schema:mpd:2011'}
 # every realistic case (24h livestream-as-VOD at 1s segments = 86,400)
 # while making memory exhaustion attacks infeasible.
 MAX_SEGMENTS_PER_TRACK = 100_000
+# ElementTree retains every parsed element, including unused AdaptationSets and
+# metadata.  Keep a small allowance above the selected-track segment ceiling
+# so a legal 100k-entry SegmentTimeline still fits, while a compact 10 MiB MPD
+# containing millions of `<S/>` nodes is stopped by a streaming preflight
+# before a tree can amplify it into hundreds of MiB of Python objects.
+MAX_MPD_XML_ELEMENTS = MAX_SEGMENTS_PER_TRACK + 1024
+MAX_MPD_XML_DEPTH = 64
+MAX_MPD_XML_TOKEN_CHARS = 64 * 1024
+# Unsupported SegmentList/multi-Period manifests may be delegated to ffmpeg
+# when the operator disables the SSRF guard.  Count their potentially
+# actionable shape before ElementTree/fallback so a feature fallback cannot
+# bypass the same finite-work policy as the native SegmentTemplate path.
+MAX_MPD_SEGMENT_URLS = MAX_SEGMENTS_PER_TRACK
+MAX_MPD_PERIODS = 256
+# A manifest body is capped separately by the API/worker, but urljoin can
+# transiently allocate many times the size of a slash-heavy input.  Reject a
+# single URL component before urljoin and keep repeated templates small enough
+# that expanding up to 100k segments remains bounded CPU work.
+MAX_DASH_URL_BYTES = 64 * 1024
+MAX_DASH_TEMPLATE_BYTES = 4 * 1024
+# Bound the aggregate UTF-8 bytes retained in expanded init/media URLs. A
+# short template or BaseURL can otherwise be copied into 100k segment dicts,
+# and token substitution can multiply a long Representation@id before the
+# first segment reaches any post-allocation counter.
+MAX_EXPANDED_DASH_URL_BYTES = 32 * 1024 * 1024
+# Retained URL bytes alone do not bound the work performed before ``urljoin``
+# returns.  A long input can collapse to a short URL (for example thousands of
+# ``x/../`` path components injected through Representation@id), or an
+# absolute media template can discard a long base URL.  Charging only the
+# resolved string would then allow 100k segments to rescan tens of GiB while
+# retaining only a few MiB.  Keep a separate aggregate input-work budget for
+# all URL resolutions in one MPD.  Two times the retained budget comfortably
+# covers realistic base+reference pairs while bounding normalization work.
+MAX_DASH_URL_RESOLUTION_WORK_BYTES = 64 * 1024 * 1024
+
+
+def _next_explicit_t_boundaries(s_elements: List[ET.Element]) -> List[Optional[int]]:
+    """Return the immediately following S@t when it is explicit.
+
+    A negative repeat is bounded by the *next S element*, not an arbitrary
+    later element.  Skipping an intervening S without ``@t`` can first expand
+    to the later timestamp and then emit the intervening entry at that same
+    timestamp, producing overlapping/duplicate media references.
+    """
+    boundaries: List[Optional[int]] = [None] * len(s_elements)
+    for index in range(len(s_elements) - 1):
+        t_attr = s_elements[index + 1].attrib.get('t')
+        if t_attr is not None:
+            boundaries[index] = int(t_attr)
+    return boundaries
 
 
 class MPDParseError(Exception):
@@ -92,9 +143,244 @@ class MPDParseError(Exception):
     """
 
 
+class MPDFallbackUnsafeError(MPDParseError):
+    """A parse rejection that native ffmpeg fallback must not bypass.
+
+    Resource ceilings and selected-track integrity checks are policy
+    boundaries, not parser feature gaps.  A caller may delegate unsupported
+    SegmentList/SegmentBase shapes to another parser, but must fail closed for
+    this subclass.
+    """
+
+
+def _malformed_numeric_domain(detail: str) -> MPDParseError:
+    return MPDParseError(f"Malformed MPD numeric or schema attribute: {detail}")
+
+
+def _validate_segment_template_timescale(timescale: int) -> None:
+    if timescale <= 0:
+        raise _malformed_numeric_domain(
+            "SegmentTemplate timescale must be positive"
+        )
+
+
+def _validate_segment_timeline_values(duration: int, repeat: int) -> None:
+    if duration <= 0:
+        raise _malformed_numeric_domain(
+            "SegmentTimeline S@d must be positive"
+        )
+    if repeat < -1:
+        raise _malformed_numeric_domain(
+            "SegmentTimeline S@r must be greater than or equal to -1"
+        )
+
+
+def _negative_repeat_count(
+    current_time: int, duration: int, boundary: int,
+) -> int:
+    """Resolve S@r=-1 only when its end boundary is finite and increasing."""
+    if boundary <= current_time:
+        raise MPDFallbackUnsafeError(
+            "SegmentTimeline S@r=-1 has no finite increasing boundary "
+            f"(current_time={current_time}, boundary={boundary})"
+        )
+    span = boundary - current_time
+    return max(1, (span + duration - 1) // duration)
+
+
+def _negative_repeat_boundary(
+    next_explicit_t: Optional[int], *, has_following_s: bool,
+    period_end_units: int,
+) -> int:
+    """Choose the only unambiguous finite boundary for ``S@r=-1``."""
+    if has_following_s:
+        if next_explicit_t is None:
+            raise MPDFallbackUnsafeError(
+                "SegmentTimeline S@r=-1 has no finite increasing boundary "
+                "because the following S lacks explicit @t"
+            )
+        return next_explicit_t
+    return period_end_units
+
+
+def _preflight_mpd_xml(mpd_xml: str) -> None:
+    """Validate/count XML with constant retained memory before ElementTree.
+
+    ``DefusedET.fromstring`` protects against entity attacks, but it still
+    builds the complete tree before callers can count ``SegmentTimeline``
+    entries.  Expat's event callbacks let us enforce a total element ceiling
+    first without retaining an element list.  DTD/entity declarations are
+    rejected here as well so the preflight itself never expands them.
+    """
+    # Expat constructs an attribute dict before StartElementHandler fires.
+    # Reject a single pathological token first so one start tag with hundreds
+    # of thousands of attributes cannot amplify inside the preflight parser
+    # itself.  This small lexer must distinguish comments, processing
+    # instructions and CDATA: quote characters have no delimiter semantics in
+    # those constructs. Treating them like start-tag quotes can both poison the
+    # scanner across later elements and let a `>` inside a real attribute value
+    # terminate a desynchronised token early.
+    def reject_oversized_token(token_chars: int) -> None:
+        if token_chars > MAX_MPD_XML_TOKEN_CHARS:
+            raise MPDFallbackUnsafeError(
+                f"MPD XML token exceeds MAX_MPD_XML_TOKEN_CHARS="
+                f"{MAX_MPD_XML_TOKEN_CHARS}"
+            )
+
+    cursor = 0
+    xml_length = len(mpd_xml)
+    while cursor < xml_length:
+        token_start = mpd_xml.find("<", cursor)
+        if token_start < 0:
+            break
+
+        if mpd_xml.startswith("<!DOCTYPE", token_start):
+            # Reject before Expat has to buffer an internal subset. The event
+            # handler below remains as defense in depth for malformed variants.
+            raise MPDFallbackUnsafeError(
+                "MPD XML DTD/entity declarations are forbidden"
+            )
+
+        terminator: Optional[str] = None
+        content_start = token_start + 1
+        if mpd_xml.startswith("<!--", token_start):
+            terminator = "-->"
+            content_start = token_start + 4
+        elif mpd_xml.startswith("<![CDATA[", token_start):
+            terminator = "]]>"
+            content_start = token_start + 9
+        elif mpd_xml.startswith("<?", token_start):
+            terminator = "?>"
+            content_start = token_start + 2
+
+        if terminator is not None:
+            token_end = mpd_xml.find(terminator, content_start)
+            if token_end < 0:
+                # Let Expat report the malformed/unterminated token when it is
+                # small, but retain the resource ceiling for a long remainder.
+                reject_oversized_token(xml_length - token_start)
+                break
+            next_cursor = token_end + len(terminator)
+            reject_oversized_token(next_cursor - token_start)
+            cursor = next_cursor
+            continue
+
+        quote: Optional[str] = None
+        token_end = content_start
+        while token_end < xml_length:
+            char = mpd_xml[token_end]
+            if quote is not None:
+                if char == quote:
+                    quote = None
+            elif char in ('"', "'"):
+                quote = char
+            elif char == ">":
+                token_end += 1
+                break
+            token_end += 1
+            if token_end - token_start > MAX_MPD_XML_TOKEN_CHARS:
+                reject_oversized_token(token_end - token_start)
+        reject_oversized_token(token_end - token_start)
+        cursor = token_end
+
+    element_count = 0
+    segment_url_count = 0
+    period_count = 0
+    depth = 0
+    parser = expat.ParserCreate()
+
+    def on_start_element(_name, _attrs) -> None:
+        nonlocal element_count, segment_url_count, period_count, depth
+        element_count += 1
+        depth += 1
+        if element_count > MAX_MPD_XML_ELEMENTS:
+            raise MPDFallbackUnsafeError(
+                f"MPD XML element count exceeds MAX_MPD_XML_ELEMENTS="
+                f"{MAX_MPD_XML_ELEMENTS}; refusing to build ElementTree"
+            )
+        if depth > MAX_MPD_XML_DEPTH:
+            raise MPDFallbackUnsafeError(
+                f"MPD XML nesting exceeds MAX_MPD_XML_DEPTH="
+                f"{MAX_MPD_XML_DEPTH}"
+            )
+        local_name = str(_name).rsplit(":", 1)[-1]
+        if local_name == "SegmentURL":
+            segment_url_count += 1
+            if segment_url_count > MAX_MPD_SEGMENT_URLS:
+                raise MPDFallbackUnsafeError(
+                    f"MPD SegmentURL count exceeds MAX_MPD_SEGMENT_URLS="
+                    f"{MAX_MPD_SEGMENT_URLS}"
+                )
+        elif local_name == "Period":
+            period_count += 1
+            if period_count > MAX_MPD_PERIODS:
+                raise MPDFallbackUnsafeError(
+                    f"MPD Period count exceeds MAX_MPD_PERIODS="
+                    f"{MAX_MPD_PERIODS}"
+                )
+
+    def on_end_element(_name) -> None:
+        nonlocal depth
+        depth -= 1
+
+    def reject_doctype(*_args) -> None:
+        # This is a parser safety policy, not an unsupported DASH feature.
+        # ffmpeg fallback would reparse/refetch the rejected XML and bypass it.
+        raise MPDFallbackUnsafeError(
+            "MPD XML DTD/entity declarations are forbidden"
+        )
+
+    parser.StartElementHandler = on_start_element
+    parser.EndElementHandler = on_end_element
+    parser.StartDoctypeDeclHandler = reject_doctype
+    parser.EntityDeclHandler = reject_doctype
+    parser.ExternalEntityRefHandler = reject_doctype
+    try:
+        parser.Parse(mpd_xml, True)
+    except MPDParseError:
+        raise
+    except expat.ExpatError as exc:
+        raise MPDParseError(f"MPD is not valid XML: {exc}") from exc
+
+
 def _strip_ns(tag: str) -> str:
     """Drop the namespace prefix from an ElementTree tag."""
     return tag.split('}', 1)[1] if '}' in tag else tag
+
+
+def _bounded_utf8_size(value: str, *, label: str, limit: int) -> int:
+    """Return UTF-8 size while rejecting oversized text before encoding it.
+
+    UTF-8 uses at least one byte per Python character, so the character check
+    prevents ``encode`` itself from making a large attacker-controlled copy.
+    The exact byte check then catches non-ASCII strings that fit by character
+    count but not by encoded size.
+    """
+    if len(value) > limit:
+        raise MPDFallbackUnsafeError(
+            f"{label} exceeds byte limit {limit} before URL resolution"
+        )
+    size = len(value.encode("utf-8"))
+    if size > limit:
+        raise MPDFallbackUnsafeError(
+            f"{label} exceeds byte limit {limit} before URL resolution"
+        )
+    return size
+
+
+def _bounded_urljoin(base_url: str, relative_url: str, *, label: str) -> str:
+    """Resolve one DASH URL without allowing slash-normalisation blow-up."""
+    _bounded_utf8_size(
+        base_url, label=f"{label} base URL", limit=MAX_DASH_URL_BYTES,
+    )
+    _bounded_utf8_size(
+        relative_url, label=f"{label} reference", limit=MAX_DASH_URL_BYTES,
+    )
+    resolved = urljoin(base_url, relative_url)
+    _bounded_utf8_size(
+        resolved, label=f"{label} resolved URL", limit=MAX_DASH_URL_BYTES,
+    )
+    return resolved
 
 
 def extract_all_mpd_urls(mpd_xml: str, manifest_url: str) -> List[str]:
@@ -131,18 +417,20 @@ def extract_all_mpd_urls(mpd_xml: str, manifest_url: str) -> List[str]:
     """
     out: List[str] = []
     try:
+        _preflight_mpd_xml(mpd_xml)
         root = DefusedET.fromstring(mpd_xml)
-    except (ET.ParseError, DefusedXmlException):
+    except (MPDParseError, ET.ParseError, DefusedXmlException):
         return out
 
     url_attrs = ('media', 'initialization', 'sourceURL', 'index')
+    budget = _ExpandedUrlBudget()
 
     for elem in root.iter():
         tag = _strip_ns(elem.tag)
         if tag == 'BaseURL':
             text = (elem.text or '').strip()
             if text:
-                out.append(urljoin(manifest_url, text))
+                out.append(budget.resolve(manifest_url, text))
         for attr_name in url_attrs:
             v = elem.attrib.get(attr_name, '')
             if not v:
@@ -154,7 +442,7 @@ def extract_all_mpd_urls(mpd_xml: str, manifest_url: str) -> List[str]:
             # base URL.
             if '$' in v and '://' not in v and not v.startswith('//'):
                 continue
-            out.append(urljoin(manifest_url, v))
+            out.append(budget.resolve(manifest_url, v))
     return out
 
 
@@ -211,6 +499,9 @@ def _resolve_base_url(parents: List[ET.Element], manifest_url: str) -> str:
     levels. Each level's BaseURL is resolved against the previous via
     urljoin. The MPD URL itself acts as the initial base.
     """
+    _bounded_utf8_size(
+        manifest_url, label="DASH manifest URL", limit=MAX_DASH_URL_BYTES,
+    )
     base = manifest_url
     for el in parents:
         for child in el:
@@ -218,7 +509,7 @@ def _resolve_base_url(parents: List[ET.Element], manifest_url: str) -> str:
                 # Strip whitespace; some manifests pad them awkwardly
                 txt = (child.text or '').strip()
                 if txt:
-                    base = urljoin(base, txt)
+                    base = _bounded_urljoin(base, txt, label="DASH BaseURL")
                 # Only the first BaseURL per element matters for our purposes;
                 # fail-safe is to ignore alternates.
                 break
@@ -233,6 +524,86 @@ def _resolve_base_url(parents: List[ET.Element], manifest_url: str) -> str:
 # covers any legitimate uint64 value without truncation; real manifests
 # never pad beyond a handful of digits.
 _MAX_TEMPLATE_PAD_WIDTH = 20
+# XML 1.0 forbids NUL, so this cannot collide with an MPD-provided template
+# or Representation@id. Keep escaped dollars protected across the two-phase
+# (static prepare -> per-segment expansion) path.
+_DASH_DOLLAR_SENTINEL = "\x00"
+_DASH_FORMAT_PATTERN = r'%[0-9]*[diuoxX]'
+_DASH_NUMBER_TOKEN_RE = re.compile(
+    rf'\$Number({_DASH_FORMAT_PATTERN})?\$'
+)
+_DASH_TIME_TOKEN_RE = re.compile(
+    rf'\$Time({_DASH_FORMAT_PATTERN})?\$'
+)
+_DASH_BANDWIDTH_TOKEN_RE = re.compile(
+    rf'\$Bandwidth({_DASH_FORMAT_PATTERN})?\$'
+)
+_DASH_DYNAMIC_TOKEN_RE = re.compile(
+    rf'\$(Number|Time)({_DASH_FORMAT_PATTERN})?\$'
+)
+# Broad token recognizer used by the escape lexer and the fail-closed check.
+# It deliberately recognizes unsupported identifiers (for example SubNumber)
+# and invalid format suffixes too. Besides rejecting URLs we cannot expand,
+# token-first matching preserves adjacent closing/opening dollars so malformed
+# tokens cannot be reinterpreted as a `$$` literal-dollar escape.
+_DASH_IDENTIFIER_TOKEN_RE = re.compile(
+    r'\$([A-Za-z][A-Za-z0-9]*)(?:%[^$]*)?\$'
+)
+
+
+def _protect_dollar_escapes(template: str) -> str:
+    """Protect literal `$$` without confusing adjacent template tokens."""
+    parts: List[str] = []
+    index = 0
+    while index < len(template):
+        if template[index] != '$':
+            parts.append(template[index])
+            index += 1
+            continue
+        token = _DASH_IDENTIFIER_TOKEN_RE.match(template, index)
+        if token is not None:
+            parts.append(token.group(0))
+            index = token.end()
+            continue
+        if index + 1 < len(template) and template[index + 1] == '$':
+            parts.append(_DASH_DOLLAR_SENTINEL)
+            index += 2
+            continue
+        parts.append('$')
+        index += 1
+    return ''.join(parts)
+
+
+def _reject_unexpanded_identifiers(
+    template: str,
+    *,
+    allow_number: bool = False,
+    allow_time: bool = False,
+) -> None:
+    """Fail closed on a known DASH identifier we did not consume."""
+    for match in _DASH_IDENTIFIER_TOKEN_RE.finditer(template):
+        token = match.group(0)
+        kind = match.group(1)
+        if allow_number and kind == 'Number' and _DASH_NUMBER_TOKEN_RE.fullmatch(token):
+            continue
+        if allow_time and kind == 'Time' and _DASH_TIME_TOKEN_RE.fullmatch(token):
+            continue
+        raise MPDParseError(
+            f"Unsupported or unexpanded DASH template token {token!r}"
+        )
+
+
+def _clamped_pad_width(digits: str) -> int:
+    """Parse a printf width without converting an attacker-sized integer."""
+    if not digits:
+        return 0
+    # Any decimal with more digits than the cap is certainly >= the cap for
+    # our purpose (leading-zero hostile forms may clamp unnecessarily, which
+    # is safe and does not affect real-world one/two-digit widths).
+    cap_digits = str(_MAX_TEMPLATE_PAD_WIDTH)
+    if len(digits) > len(cap_digits):
+        return _MAX_TEMPLATE_PAD_WIDTH
+    return min(int(digits), _MAX_TEMPLATE_PAD_WIDTH)
 
 
 def _apply_index_spec(spec: str, value: int) -> str:
@@ -242,27 +613,117 @@ def _apply_index_spec(spec: str, value: int) -> str:
     ``%d`` with no digits). We re-parse the width and cap it so a malicious
     width cannot blow up memory, while preserving legitimate zero-padding.
     """
-    digits = spec[1:-1]  # strip leading '%' and trailing 'd'
+    digits = spec[1:-1]  # strip leading '%' and conversion character
+    conversion = spec[-1]
+    if conversion in ('d', 'i', 'u'):
+        rendered = str(value)
+    elif conversion == 'o':
+        rendered = format(value, 'o')
+    elif conversion == 'x':
+        rendered = format(value, 'x')
+    elif conversion == 'X':
+        rendered = format(value, 'X')
+    else:  # regex callers should make this unreachable
+        raise MPDParseError(f"Unsupported DASH template format {spec!r}")
     if not digits:
-        return spec % value  # bare "%d"
+        return rendered
     zero_pad = digits.startswith('0')
-    width = min(int(digits), _MAX_TEMPLATE_PAD_WIDTH)
-    clamped = f"%{'0' if zero_pad else ''}{width}d"
-    return clamped % value
+    width = _clamped_pad_width(digits)
+    if len(rendered) >= width:
+        return rendered
+    if zero_pad and rendered.startswith('-'):
+        return '-' + rendered[1:].zfill(width - 1)
+    return rendered.zfill(width) if zero_pad else rendered.rjust(width)
 
 
 def _substitute_template(
     template: str, *, representation_id: str, bandwidth: int,
     number: Optional[int] = None, time_value: Optional[int] = None,
+    max_output_bytes: int = MAX_EXPANDED_DASH_URL_BYTES,
+    _preserve_dollar_escapes: bool = False,
 ) -> str:
     """Apply $RepresentationID$ / $Bandwidth$ / $Number[$%0Nd$]$ substitutions.
 
     Supports the printf-style format spec: $Number%05d$ → zero-padded width.
     $Time$ is supported for completeness but we don't use timeline mode yet.
     """
+    # DASH uses `$$` for one literal dollar. Protect it before matching tokens
+    # so e.g. `$$Number$$` never becomes a real Number placeholder midway.
+    template = _protect_dollar_escapes(template)
+
+    # Compute the expanded UTF-8 size on the protected template before any
+    # replace/re.sub can allocate it. In particular, N occurrences of a long
+    # $RepresentationID$ must not materialize an N×ID string first.
+    estimated = len(template.encode("utf-8"))
+
+    def charge_literal(token: str, replacement: str) -> None:
+        nonlocal estimated
+        count = template.count(token)
+        if count:
+            estimated += count * (
+                len(replacement.encode("utf-8")) - len(token)
+            )
+
+    bandwidth_text = str(bandwidth)
+    if '$RepresentationID$' in template:
+        charge_literal('$RepresentationID$', representation_id)
+    for match in _DASH_BANDWIDTH_TOKEN_RE.finditer(template):
+        replacement = (
+            _apply_index_spec(match.group(1), bandwidth)
+            if match.group(1)
+            else bandwidth_text
+        )
+        estimated += len(replacement.encode('utf-8')) - len(match.group(0))
+
+    def replacement_size(match: re.Match, value: Optional[int]) -> int:
+        if value is None:
+            return len(match.group(0))
+        value_size = len(str(value).encode("utf-8"))
+        spec = match.group(1)
+        if not spec:
+            return value_size
+        width = _clamped_pad_width(spec[1:-1])
+        return max(width, value_size)
+
+    for marker, pattern, value in (
+        ('$Number', _DASH_NUMBER_TOKEN_RE, number),
+        ('$Time', _DASH_TIME_TOKEN_RE, time_value),
+    ):
+        if marker not in template:
+            continue
+        for match in re.finditer(pattern, template):
+            estimated += replacement_size(match, value) - len(match.group(0))
+            if estimated > max_output_bytes:
+                raise MPDFallbackUnsafeError(
+                    f"Expanded DASH URL bytes exceed "
+                    f"MAX_EXPANDED_DASH_URL_BYTES before substitution "
+                    f"(remaining budget {max_output_bytes})"
+                )
+    if estimated > max_output_bytes:
+        raise MPDFallbackUnsafeError(
+            f"Expanded DASH URL bytes exceed MAX_EXPANDED_DASH_URL_BYTES "
+            f"before substitution (remaining budget {max_output_bytes})"
+        )
+
     out = template
-    out = out.replace('$RepresentationID$', representation_id)
-    out = out.replace('$Bandwidth$', str(bandwidth))
+    if '$RepresentationID$' in out:
+        # Replacement values are data, not another template pass. Protect any
+        # dollar signs in Representation@id so an id such as "$Number$" is
+        # inserted literally instead of being re-tokenized by the later
+        # per-segment substitution phase.
+        protected_representation_id = representation_id.replace(
+            '$', _DASH_DOLLAR_SENTINEL,
+        )
+        out = out.replace('$RepresentationID$', protected_representation_id)
+    if '$Bandwidth' in out:
+        out = _DASH_BANDWIDTH_TOKEN_RE.sub(
+            lambda match: (
+                _apply_index_spec(match.group(1), bandwidth)
+                if match.group(1)
+                else bandwidth_text
+            ),
+            out,
+        )
 
     def _sub_number(match: re.Match) -> str:
         spec = match.group(1)
@@ -273,7 +734,8 @@ def _substitute_template(
             return _apply_index_spec(spec, number)
         return str(number)
 
-    out = re.sub(r'\$Number(%[0-9]*d)?\$', _sub_number, out)
+    if '$Number' in out:
+        out = _DASH_NUMBER_TOKEN_RE.sub(_sub_number, out)
 
     def _sub_time(match: re.Match) -> str:
         spec = match.group(1)
@@ -283,8 +745,179 @@ def _substitute_template(
             return _apply_index_spec(spec, time_value)
         return str(time_value)
 
-    out = re.sub(r'\$Time(%[0-9]*d)?\$', _sub_time, out)
+    if '$Time' in out:
+        out = _DASH_TIME_TOKEN_RE.sub(_sub_time, out)
+    _reject_unexpanded_identifiers(
+        out,
+        allow_number=number is None,
+        allow_time=time_value is None,
+    )
+    if not _preserve_dollar_escapes:
+        out = out.replace(_DASH_DOLLAR_SENTINEL, '$')
+    if len(out) > max_output_bytes or len(out.encode("utf-8")) > max_output_bytes:
+        raise MPDFallbackUnsafeError(
+            f"Expanded DASH URL bytes exceed MAX_EXPANDED_DASH_URL_BYTES "
+            f"after substitution (remaining budget {max_output_bytes})"
+        )
     return out
+
+
+def _prepare_repeated_template(
+    template: str,
+    *,
+    representation_id: str,
+    bandwidth: int,
+    max_output_bytes: int,
+) -> str:
+    """Apply invariant substitutions and normalise printf specs once.
+
+    Segment expansion can run 100k times.  Re-scanning thousands of static
+    ``$RepresentationID$`` tokens on every segment made a shrinking template
+    a CPU-amplification vector even though the retained URLs stayed small.
+    """
+    _bounded_utf8_size(
+        template,
+        label="DASH SegmentTemplate",
+        limit=MAX_DASH_TEMPLATE_BYTES,
+    )
+    prepared = _substitute_template(
+        template,
+        representation_id=representation_id,
+        bandwidth=bandwidth,
+        max_output_bytes=min(max_output_bytes, MAX_DASH_URL_BYTES),
+        _preserve_dollar_escapes=True,
+    )
+
+    def normalise_index_spec(match: re.Match) -> str:
+        kind = match.group(1)
+        spec = match.group(2)
+        if not spec:
+            return match.group(0)
+        digits = spec[1:-1]
+        conversion = spec[-1]
+        width = _clamped_pad_width(digits)
+        zero_pad = digits.startswith('0')
+        return (
+            f"${kind}%{'0' if zero_pad else ''}{width}{conversion}$"
+        )
+
+    prepared = _DASH_DYNAMIC_TOKEN_RE.sub(
+        normalise_index_spec,
+        prepared,
+    )
+    _reject_unexpanded_identifiers(
+        prepared, allow_number=True, allow_time=True,
+    )
+    return prepared
+
+
+def _expand_repeated_template(
+    template: str,
+    *,
+    number: Optional[int],
+    time_value: Optional[int] = None,
+    max_output_bytes: int,
+) -> str:
+    """Expand only per-segment tokens from an invariant prepared template."""
+    out = template
+
+    def replace_value(match: re.Match, value: Optional[int]) -> str:
+        if value is None:
+            return match.group(0)
+        spec = match.group(1)
+        return _apply_index_spec(spec, value) if spec else str(value)
+
+    if '$Number' in out:
+        out = _DASH_NUMBER_TOKEN_RE.sub(
+            lambda match: replace_value(match, number),
+            out,
+        )
+    if '$Time' in out:
+        out = _DASH_TIME_TOKEN_RE.sub(
+            lambda match: replace_value(match, time_value),
+            out,
+        )
+    _reject_unexpanded_identifiers(out)
+    out = out.replace(_DASH_DOLLAR_SENTINEL, '$')
+    if len(out) > max_output_bytes or len(out.encode('utf-8')) > max_output_bytes:
+        raise MPDFallbackUnsafeError(
+            f"Expanded DASH URL bytes exceed MAX_EXPANDED_DASH_URL_BYTES "
+            f"after substitution (remaining budget {max_output_bytes})"
+        )
+    return out
+
+
+class _ExpandedUrlBudget:
+    """Shared retained-byte and resolution-work budgets for one parsed MPD."""
+
+    def __init__(
+        self,
+        limit: int = MAX_EXPANDED_DASH_URL_BYTES,
+        work_limit: int = MAX_DASH_URL_RESOLUTION_WORK_BYTES,
+    ):
+        self.limit = int(limit)
+        self.used = 0
+        self.work_limit = int(work_limit)
+        self.work_used = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used)
+
+    @property
+    def work_remaining(self) -> int:
+        return max(0, self.work_limit - self.work_used)
+
+    def resolve(self, base_url: str, relative_url: str) -> str:
+        # urljoin itself can allocate base+relative. A conservative precheck
+        # prevents that allocation when it cannot fit the remaining aggregate
+        # budget. Absolute/network-path references discard most/all of base.
+        relative_bytes = _bounded_utf8_size(
+            relative_url,
+            label="DASH URL reference",
+            limit=MAX_DASH_URL_BYTES,
+        )
+        base_bytes = _bounded_utf8_size(
+            base_url,
+            label="DASH base URL",
+            limit=MAX_DASH_URL_BYTES,
+        )
+        # Charge the inputs that this call must validate/parse, not just the
+        # resolved output retained below.  urljoin can discard the base for an
+        # absolute reference or normalize a slash-heavy reference down to a
+        # few characters, so output-only accounting is not a CPU-work bound.
+        resolution_work = base_bytes + relative_bytes + 1
+        if resolution_work > self.work_remaining:
+            raise MPDFallbackUnsafeError(
+                "DASH URL resolution work exceeds "
+                "MAX_DASH_URL_RESOLUTION_WORK_BYTES="
+                f"{self.work_limit}"
+            )
+        self.work_used += resolution_work
+        if relative_url.startswith(("http://", "https://", "//")):
+            estimated = relative_bytes + 16
+        else:
+            estimated = base_bytes + relative_bytes + 1
+        if estimated > self.remaining:
+            raise MPDFallbackUnsafeError(
+                f"Expanded DASH URL bytes exceed "
+                f"MAX_EXPANDED_DASH_URL_BYTES={self.limit}"
+            )
+        resolved = _bounded_urljoin(
+            base_url, relative_url, label="expanded DASH URL",
+        )
+        size = _bounded_utf8_size(
+            resolved,
+            label="expanded DASH URL",
+            limit=MAX_DASH_URL_BYTES,
+        )
+        if size > self.remaining:
+            raise MPDFallbackUnsafeError(
+                f"Expanded DASH URL bytes exceed "
+                f"MAX_EXPANDED_DASH_URL_BYTES={self.limit}"
+            )
+        self.used += size
+        return resolved
 
 
 def _build_segment_urls_from_template(
@@ -293,6 +926,7 @@ def _build_segment_urls_from_template(
     representation_id: str,
     bandwidth: int,
     period_duration: float,
+    url_budget: Optional[_ExpandedUrlBudget] = None,
 ) -> Tuple[List[Dict], Optional[str]]:
     """Compute segment URL list + init segment URL from a SegmentTemplate.
 
@@ -308,18 +942,41 @@ def _build_segment_urls_from_template(
     init_tpl = template_el.attrib.get('initialization')
     timescale = int(template_el.attrib.get('timescale', '1'))
     start_number = int(template_el.attrib.get('startNumber', '1'))
+    _validate_segment_template_timescale(timescale)
 
     if not media_tpl:
         raise MPDParseError("SegmentTemplate missing 'media' attribute")
 
+    if url_budget is None:
+        url_budget = _ExpandedUrlBudget()
+
+    # Apply RepresentationID/Bandwidth and clamp Number/Time formatting once,
+    # before the 1..100k segment loop.  This also imposes a strict raw
+    # template ceiling before any regex/substitution work.
+    media_tpl = _prepare_repeated_template(
+        media_tpl,
+        representation_id=representation_id,
+        bandwidth=bandwidth,
+        max_output_bytes=url_budget.remaining,
+    )
+
     init_url: Optional[str] = None
     if init_tpl:
+        _bounded_utf8_size(
+            init_tpl,
+            label="DASH initialization template",
+            limit=MAX_DASH_TEMPLATE_BYTES,
+        )
         init_resolved = _substitute_template(
             init_tpl,
             representation_id=representation_id,
             bandwidth=bandwidth,
+            max_output_bytes=min(url_budget.remaining, MAX_DASH_URL_BYTES),
+            _preserve_dollar_escapes=True,
         )
-        init_url = urljoin(base_url, init_resolved)
+        _reject_unexpanded_identifiers(init_resolved)
+        init_resolved = init_resolved.replace(_DASH_DOLLAR_SENTINEL, '$')
+        init_url = url_budget.resolve(base_url, init_resolved)
 
     segments: List[Dict] = []
     timeline_el = None
@@ -341,6 +998,13 @@ def _build_segment_urls_from_template(
         # parser's first cut treated it as range(0) — silently produced 0
         # segments for that S. Codex review #1 caught this.
         s_elements = [s for s in timeline_el if _strip_ns(s.tag) == 'S']
+        if len(s_elements) > MAX_SEGMENTS_PER_TRACK:
+            raise MPDFallbackUnsafeError(
+                f"SegmentTimeline entry count {len(s_elements)} exceeds "
+                f"MAX_SEGMENTS_PER_TRACK={MAX_SEGMENTS_PER_TRACK}; refusing "
+                f"pathological timeline input"
+            )
+        next_explicit_t = _next_explicit_t_boundaries(s_elements)
         number = start_number
         current_time = 0
         # Period end in template timescale units. Used as the boundary when
@@ -353,48 +1017,46 @@ def _build_segment_urls_from_template(
                 current_time = int(t_attr)
             d = int(s.attrib['d'])  # required
             r = int(s.attrib.get('r', '0'))
+            _validate_segment_timeline_values(d, r)
 
             if r < 0:
                 # Find boundary: next S@t, or period end if no such S exists.
-                boundary = None
-                for next_s in s_elements[idx + 1:]:
-                    nt = next_s.attrib.get('t')
-                    if nt is not None:
-                        boundary = int(nt)
-                        break
-                if boundary is None:
-                    boundary = period_end_units
-                if boundary <= current_time or d <= 0:
-                    # Pathological: no time left or zero-duration segment.
-                    # Emit nothing rather than loop forever.
-                    repeats = 0
-                else:
-                    # Emit segments while they fit; the LAST one is allowed
-                    # to overshoot slightly (typical of MPDs that round).
-                    span = boundary - current_time
-                    repeats = max(1, (span + d - 1) // d)
+                boundary = _negative_repeat_boundary(
+                    next_explicit_t[idx],
+                    has_following_s=idx + 1 < len(s_elements),
+                    period_end_units=period_end_units,
+                )
+                # Emit segments while they fit; the LAST one is allowed to
+                # overshoot slightly (typical of MPDs that round). A missing or
+                # non-increasing boundary is not a zero-length entry: silently
+                # skipping it can publish a truncated but non-empty track.
+                repeats = _negative_repeat_count(current_time, d, boundary)
             else:
                 repeats = r + 1
+
+            if repeats <= 0:
+                continue
 
             for _ in range(repeats):
                 # Codex review #8: bail before materializing so an
                 # attacker-controlled @r value can't OOM us.
                 if len(segments) >= MAX_SEGMENTS_PER_TRACK:
-                    raise MPDParseError(
+                    raise MPDFallbackUnsafeError(
                         f"SegmentTimeline expansion exceeded "
                         f"MAX_SEGMENTS_PER_TRACK={MAX_SEGMENTS_PER_TRACK}; "
                         f"refusing to materialize unbounded segment list "
                         f"(possible malformed/hostile MPD)"
                     )
-                url_resolved = _substitute_template(
+                url_resolved = _expand_repeated_template(
                     media_tpl,
-                    representation_id=representation_id,
-                    bandwidth=bandwidth,
                     number=number,
                     time_value=current_time,
+                    max_output_bytes=min(
+                        url_budget.remaining, MAX_DASH_URL_BYTES,
+                    ),
                 )
                 segments.append({
-                    'url': urljoin(base_url, url_resolved),
+                    'url': url_budget.resolve(base_url, url_resolved),
                     'duration': d / timescale,
                     'index': len(segments),
                     'sequence': number,
@@ -405,14 +1067,18 @@ def _build_segment_urls_from_template(
         # Fixed-duration mode: compute count from period duration / segment duration
         seg_duration_attr = template_el.attrib.get('duration')
         if not seg_duration_attr:
-            raise MPDParseError(
+            raise MPDFallbackUnsafeError(
                 "SegmentTemplate has no SegmentTimeline and no @duration — "
                 "cannot determine segment count"
             )
         seg_duration_units = int(seg_duration_attr)
         seg_duration_s = seg_duration_units / timescale
         if seg_duration_s <= 0 or period_duration <= 0:
-            raise MPDParseError(
+            # A static fixed-duration template without a usable Period/MPD
+            # duration has no finite $Number$ boundary.  Native ffmpeg may
+            # keep probing numbers indefinitely, so this is a fail-closed
+            # safety rejection rather than an unsupported-shape fallback.
+            raise MPDFallbackUnsafeError(
                 f"Invalid duration: seg={seg_duration_s}s, period={period_duration}s"
             )
         # Use ceil so the last partial segment is included
@@ -421,22 +1087,32 @@ def _build_segment_urls_from_template(
         # MPD with mediaPresentationDuration="PT100000H" duration="1" would
         # otherwise compute billions of segments and OOM the worker.
         if segment_count > MAX_SEGMENTS_PER_TRACK:
-            raise MPDParseError(
+            raise MPDFallbackUnsafeError(
                 f"Computed segment count {segment_count} exceeds "
                 f"MAX_SEGMENTS_PER_TRACK={MAX_SEGMENTS_PER_TRACK} "
                 f"(period={period_duration}s, seg_duration={seg_duration_s}s); "
                 f"refusing to materialize (possible malformed/hostile MPD)"
             )
+        if _DASH_TIME_TOKEN_RE.search(media_tpl):
+            # Validate the finite work bound before classifying this as a
+            # parser feature gap. Otherwise a huge fixed-duration manifest can
+            # put $Time$ in its URL and bypass MAX_SEGMENTS via native ffmpeg.
+            # Correct expansion also depends on presentationTimeOffset, so do
+            # not silently guess the timestamps for a normally bounded MPD.
+            raise MPDParseError(
+                "Fixed-duration SegmentTemplate with $Time$ is not supported"
+            )
         for i in range(segment_count):
             number = start_number + i
-            url_resolved = _substitute_template(
+            url_resolved = _expand_repeated_template(
                 media_tpl,
-                representation_id=representation_id,
-                bandwidth=bandwidth,
                 number=number,
+                max_output_bytes=min(
+                    url_budget.remaining, MAX_DASH_URL_BYTES,
+                ),
             )
             segments.append({
-                'url': urljoin(base_url, url_resolved),
+                'url': url_budget.resolve(base_url, url_resolved),
                 'duration': seg_duration_s,
                 'index': i,
                 'sequence': number,
@@ -535,6 +1211,7 @@ def _parse_one_track(
     parents_for_base: List[ET.Element],
     manifest_url: str,
     period_duration: float,
+    url_budget: Optional[_ExpandedUrlBudget] = None,
 ) -> Optional[Dict]:
     """Parse one AdaptationSet (video or audio) into the output dict shape."""
     rep = _pick_best_representation(adapt_set)
@@ -575,6 +1252,7 @@ def _parse_one_track(
         representation_id=rep_id,
         bandwidth=bandwidth,
         period_duration=period_duration,
+        url_budget=url_budget,
     )
 
     # mimeType / codecs can live on either AdaptationSet or Representation
@@ -606,7 +1284,7 @@ def _parse_one_track(
     }
 
 
-def parse_mpd(mpd_xml: str, manifest_url: str) -> Dict:
+def _parse_mpd_impl(mpd_xml: str, manifest_url: str) -> Dict:
     """Parse an MPD XML string and return the structured manifest info.
 
     Args:
@@ -621,6 +1299,7 @@ def parse_mpd(mpd_xml: str, manifest_url: str) -> Dict:
     Raises:
         MPDParseError: On unsupported structure or DRM detection.
     """
+    _preflight_mpd_xml(mpd_xml)
     try:
         root = DefusedET.fromstring(mpd_xml)
     except (ET.ParseError, DefusedXmlException) as e:
@@ -643,7 +1322,11 @@ def parse_mpd(mpd_xml: str, manifest_url: str) -> Dict:
     if not periods:
         raise MPDParseError("MPD has no Period elements")
     if len(periods) > 1:
-        raise MPDParseError(
+        # We cannot conservatively apply the selected-track expansion budget
+        # to every unsupported Period before delegating to ffmpeg. Treat the
+        # whole shape as unsafe rather than letting a second empty Period turn
+        # an otherwise over-limit template into a native-fallback bypass.
+        raise MPDFallbackUnsafeError(
             f"MPD has {len(periods)} periods — multi-period not supported. "
             "Only single-Period VOD MPDs work."
         )
@@ -714,6 +1397,16 @@ def parse_mpd(mpd_xml: str, manifest_url: str) -> Dict:
 
     parents = [root, period]
 
+    expanded_url_budget = _ExpandedUrlBudget()
+    video_track = _parse_one_track(
+        video_set, parents, manifest_url, period_duration,
+        url_budget=expanded_url_budget,
+    )
+    if video_track is None or int(video_track.get('segment_count') or 0) <= 0:
+        raise MPDFallbackUnsafeError(
+            "selected video track produced zero segments"
+        )
+
     result: Dict = {
         # Codex review #19 (round 10): ceil to avoid truncating ~half a
         # second of content when the MPD declares a fractional duration
@@ -721,7 +1414,7 @@ def parse_mpd(mpd_xml: str, manifest_url: str) -> Dict:
         # passes this straight to `ffmpeg -t`, and ffmpeg honours the cap
         # even after all segments have been streamed.
         'duration': math.ceil(total_duration or period_duration),
-        'video': _parse_one_track(video_set, parents, manifest_url, period_duration),
+        'video': video_track,
     }
 
     if audio_set is not None:
@@ -733,8 +1426,31 @@ def parse_mpd(mpd_xml: str, manifest_url: str) -> Dict:
         # instead of SegmentTemplate), that produces a successful-looking
         # silent file. Fail-closed: re-raise so the worker fails the job
         # instead of silently degrading.
-        result['audio'] = _parse_one_track(audio_set, parents, manifest_url, period_duration)
+        audio_track = _parse_one_track(
+            audio_set, parents, manifest_url, period_duration,
+            url_budget=expanded_url_budget,
+        )
+        if audio_track is None or int(audio_track.get('segment_count') or 0) <= 0:
+            raise MPDFallbackUnsafeError(
+                "selected audio track produced zero segments"
+            )
+        result['audio'] = audio_track
     else:
         result['audio'] = None
 
     return result
+
+
+def parse_mpd(mpd_xml: str, manifest_url: str) -> Dict:
+    """Public parser boundary with deterministic schema-error normalization."""
+    try:
+        return _parse_mpd_impl(mpd_xml, manifest_url)
+    except MPDParseError:
+        raise
+    except (ValueError, ArithmeticError, KeyError, TypeError) as exc:
+        # Numeric and required schema attributes are untrusted MPD input. Keep
+        # malformed values in the parser's typed contract so worker retry
+        # classification does not re-fetch/re-parse the same document 3 times.
+        raise MPDParseError(
+            f"Malformed MPD numeric or schema attribute: {exc}"
+        ) from exc

@@ -90,6 +90,71 @@ describe('offscreen completion delivery', () => {
     });
   });
 
+  it('retries completion when the service worker returns a negative ack', async () => {
+    vi.useFakeTimers();
+    let doneAttempts = 0;
+    const { chrome, listeners } = await loadOffscreen({
+      runJobImpl: async () => ({ totalSegments: 2 }),
+      sendMessageImpl: async (msg) => {
+        if (msg.type !== 'BROWSER_JOB_DONE') return undefined;
+        doneAttempts += 1;
+        return doneAttempts === 1
+          ? { ok: false, error: 'snapshot write failed' }
+          : { ok: true };
+      },
+    });
+
+    expect(sendStart(listeners, {
+      jobId: 'job-negative-ack',
+      nasEndpoint: 'http://nas.local',
+      apiKey: 'k',
+      plan: { tracks: { video: { segments: [] } } },
+    })).toEqual({ ok: true });
+
+    await vi.runOnlyPendingTimersAsync();
+    const doneMessages = chrome.runtime.sendMessage.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg && msg.type === 'BROWSER_JOB_DONE');
+    expect(doneMessages).toHaveLength(2);
+  });
+
+  it('forwards separate CDN/NAS timings and selected concurrency in progress', async () => {
+    let resolveProgress;
+    const progressMessage = new Promise((resolve) => { resolveProgress = resolve; });
+    const transferTimings = {
+      cdn: { bytes: 1024, requestMs: 90, activeMs: 50, mbPerSecond: 0.02 },
+      nas: { bytes: 1024, requestMs: 10, activeMs: 5, mbPerSecond: 0.2 },
+    };
+    const { listeners } = await loadOffscreen({
+      runJobImpl: async ({ onProgress }) => {
+        onProgress({ done: 1, total: 2, concurrency: 12, transferTimings });
+        return { totalSegments: 2, concurrency: 12, transferTimings };
+      },
+      sendMessageImpl: async (msg) => {
+        if (msg.type === 'BROWSER_JOB_PROGRESS') resolveProgress(msg);
+        return undefined;
+      },
+    });
+
+    expect(sendStart(listeners, {
+      jobId: 'job-progress-timing',
+      nasEndpoint: 'http://nas.local',
+      apiKey: 'k',
+      plan: { tracks: { video: { segments: [] } } },
+    })).toEqual({ ok: true });
+
+    await expect(progressMessage).resolves.toMatchObject({
+      type: 'BROWSER_JOB_PROGRESS',
+      payload: {
+        jobId: 'job-progress-timing',
+        done: 1,
+        total: 2,
+        concurrency: 12,
+        transferTimings,
+      },
+    });
+  });
+
   it('keeps liveness and retries DONE delivery after the first retry burst fails', async () => {
     vi.useFakeTimers();
     let doneAttempts = 0;
@@ -169,6 +234,10 @@ describe('offscreen completion delivery', () => {
     vi.useFakeTimers();
     const err = new Error('finalize ambiguous');
     err.finalizeAttempted = true;
+    err.done = 7;
+    err.total = 8;
+    err.concurrency = 4;
+    err.transferTimings = { cdn: { failures: 1 }, nas: { failures: 0 } };
     let failedAttempts = 0;
     const { chrome, listeners } = await loadOffscreen({
       runJobImpl: async () => { throw err; },
@@ -201,6 +270,10 @@ describe('offscreen completion delivery', () => {
       jobId: 'job-retry-failed',
       error: 'finalize ambiguous',
       finalizeAttempted: true,
+      done: 7,
+      total: 8,
+      concurrency: 4,
+      transferTimings: err.transferTimings,
     });
   });
 });

@@ -11,8 +11,60 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 import shutil
+from collections import deque
 
 logger = logging.getLogger(__name__)
+
+
+# Copy-mode's deadline must cover both feeding stdin and waiting for ffmpeg.
+# Module constants keep the supervisor deterministic and make the blocking-pipe
+# edge cases testable without waiting for the production timeout.
+_COPY_MERGE_TIMEOUT_SECONDS = 900.0
+_COPY_MERGE_POLL_SECONDS = 0.25
+_STDIN_COPY_CHUNK_BYTES = 1024 * 1024
+_PIPE_THREAD_JOIN_SECONDS = 5.0
+
+
+def _start_bounded_drain(stream, *, max_chunks: int = 64):
+    """Drain a pipe without retaining unbounded ffmpeg diagnostics."""
+    tail = deque(maxlen=max_chunks)
+
+    def _drain():
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                tail.append(chunk)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_drain, daemon=True)
+    thread.start()
+    return tail, thread
+
+
+def _kill_and_wait_bounded(process) -> None:
+    """Best-effort child termination without an unbounded reap wait."""
+    if process is None:
+        return
+    should_kill = True
+    try:
+        should_kill = process.poll() is None
+    except Exception:
+        # If state inspection itself failed, conservatively attempt kill. A
+        # kill on an already-exited Popen is harmless; skipping it could leave
+        # a live child behind after the supervisor has abandoned the merge.
+        should_kill = True
+    if should_kill:
+        try:
+            process.kill()
+        except Exception:
+            pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        pass
 
 
 class FFmpegMerger:
@@ -52,6 +104,12 @@ class FFmpegMerger:
         # for the full 900s merge timeout.
         self.cancel_check = cancel_check
         self.cancelled = False
+        # merge_segments() enables this only when a copy failure will be
+        # followed by re-encode. In that case the O_EXCL-reserved pathname
+        # must remain present between attempts; unlinking it would let another
+        # worker claim the name and then be overwritten by our `ffmpeg -y`.
+        self._preserve_output_on_copy_failure = False
+        self._copy_failure_reservation_ready = True
         self.ffmpeg_path: Optional[str] = None
 
         # Verify FFmpeg is available
@@ -72,6 +130,34 @@ class FFmpegMerger:
                 output_path.unlink()
         except Exception as e:
             logger.warning(f"Failed to remove partial output {self.output_file}: {e}")
+
+    def _cleanup_copy_failure(self) -> None:
+        """Discard copy output without releasing a pending fallback's name."""
+        if not self._preserve_output_on_copy_failure:
+            self._remove_partial_output()
+            return
+
+        output_path = Path(self.output_file)
+        try:
+            # Truncate the existing reservation in place. If ffmpeg failed
+            # before creating/opening it, atomically recreate the reservation;
+            # never truncate a pathname another worker won in the gap.
+            try:
+                fd = os.open(str(output_path), os.O_WRONLY | os.O_TRUNC)
+            except FileNotFoundError:
+                fd = os.open(
+                    str(output_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o644,
+                )
+            os.close(fd)
+            self._copy_failure_reservation_ready = True
+        except Exception as exc:
+            self._copy_failure_reservation_ready = False
+            logger.error(
+                f"Failed to preserve empty output reservation "
+                f"{self.output_file}: {exc}"
+            )
     
     def _create_concat_file(self, concat_file_path: str):
         """Create concat demuxer file for FFmpeg"""
@@ -143,96 +229,135 @@ class FFmpegMerger:
         logger.debug(f"FFmpeg command: {' '.join(command)}")
 
         process = None
+        feed_thread = None
+        t_err = None
         try:
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
 
             # ffmpeg writes progress to stderr. If we don't drain it, a full
             # pipe blocks ffmpeg → it stops reading our stdin → we block
             # writing → deadlock. Drain in background threads.
-            stderr_chunks: List[bytes] = []
-            stdout_chunks: List[bytes] = []
+            stderr_chunks, t_err = _start_bounded_drain(process.stderr)
 
-            def _drain(stream, sink):
+            # Feeding a pipe can block forever if a live ffmpeg process stops
+            # reading stdin. Keep the writer in a daemon thread so this thread
+            # can continue enforcing cancellation and the *total* merge
+            # deadline. Killing ffmpeg closes the pipe's read end and releases
+            # a blocked writer with BrokenPipeError.
+            feed_done = threading.Event()
+            feed_stop = threading.Event()
+            cancel_seen = threading.Event()
+            cancel_lock = threading.Lock()
+            feed_errors = []
+
+            def _cancellation_requested() -> bool:
+                if self.cancel_check is None:
+                    return False
+                # The feeder preserves the historical per-segment checks while
+                # the supervisor checks during a blocking write. Serialize the
+                # callback so callers never see overlapping invocations.
+                with cancel_lock:
+                    requested = bool(self.cancel_check())
+                if requested:
+                    cancel_seen.set()
+                return requested
+
+            def _feed_stdin() -> None:
                 try:
-                    while True:
-                        chunk = stream.read(65536)
-                        if not chunk:
+                    for seg in self.segment_files:
+                        if feed_stop.is_set() or _cancellation_requested():
                             break
-                        sink.append(chunk)
-                except Exception:
-                    pass
+                        with open(seg, 'rb') as segment_file:
+                            while not feed_stop.is_set():
+                                chunk = segment_file.read(_STDIN_COPY_CHUNK_BYTES)
+                                if not chunk:
+                                    break
+                                process.stdin.write(chunk)
+                except BrokenPipeError:
+                    logger.warning(
+                        "FFmpeg closed stdin before all segments were piped — "
+                        "merge will likely fail; collecting stderr"
+                    )
+                except Exception as exc:
+                    feed_errors.append(exc)
+                finally:
+                    try:
+                        process.stdin.close()
+                    except Exception:
+                        pass
+                    feed_done.set()
 
-            t_err = threading.Thread(target=_drain, args=(process.stderr, stderr_chunks), daemon=True)
-            t_out = threading.Thread(target=_drain, args=(process.stdout, stdout_chunks), daemon=True)
-            t_err.start()
-            t_out.start()
+            started_at = time.monotonic()
+            feed_thread = threading.Thread(
+                target=_feed_stdin,
+                name="ffmpeg-stdin-feeder",
+                daemon=True,
+            )
+            feed_thread.start()
 
-            # Stream segments into ffmpeg's stdin in order. shutil.copyfileobj
-            # uses an internal 1MB buffer — bounded memory regardless of
-            # total segment size.
             cancelled = False
-            try:
-                for seg in self.segment_files:
-                    if self.cancel_check is not None and self.cancel_check():
-                        logger.info("FFmpeg merge cancelled while streaming segments")
-                        cancelled = True
-                        self.cancelled = True
-                        break
-                    with open(seg, 'rb') as f:
-                        shutil.copyfileobj(f, process.stdin, length=1024 * 1024)
-            except BrokenPipeError:
-                logger.warning("FFmpeg closed stdin before all segments were piped — merge will likely fail; collecting stderr")
-            finally:
+            timed_out = False
+            feed_failed = False
+            while True:
+                if cancel_seen.is_set() or _cancellation_requested():
+                    cancelled = True
+                    self.cancelled = True
+                    break
+                if feed_errors:
+                    feed_failed = True
+                    break
+                if time.monotonic() - started_at >= _COPY_MERGE_TIMEOUT_SECONDS:
+                    timed_out = True
+                    break
                 try:
-                    process.stdin.close()
-                except Exception:
-                    pass
+                    process.wait(timeout=_COPY_MERGE_POLL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
 
-            if cancelled:
-                # Cancellation observed mid-stream — kill ffmpeg, drop
-                # partial output, return False so caller can clean up.
+            # Even a fake/early-exiting child can report completion before the
+            # feeder observes the closed pipe. Give the feeder a short bounded
+            # chance to finish, then treat a stuck writer as a failed merge.
+            if not (cancelled or timed_out or feed_failed):
+                feed_thread.join(timeout=_PIPE_THREAD_JOIN_SECONDS)
+                if cancel_seen.is_set():
+                    cancelled = True
+                    self.cancelled = True
+                elif feed_errors:
+                    feed_failed = True
+                elif feed_thread.is_alive():
+                    feed_failed = True
+                    feed_errors.append(RuntimeError("ffmpeg stdin feeder did not stop after process exit"))
+
+            if cancelled or timed_out or feed_failed:
+                feed_stop.set()
                 try:
-                    process.kill()
+                    # Preserve cancellation semantics even if the child raced
+                    # to exit just before the cancellation observation.
+                    if cancelled or process.poll() is None:
+                        process.kill()
                     process.wait(timeout=5)
                 except Exception:
                     pass
-                self._remove_partial_output()
+                feed_thread.join(timeout=_PIPE_THREAD_JOIN_SECONDS)
+                if cancelled:
+                    self._remove_partial_output()
+                else:
+                    self._cleanup_copy_failure()
+                if cancelled:
+                    logger.info("FFmpeg merge cancelled while feeding stdin or waiting for exit")
+                elif timed_out:
+                    logger.error("FFmpeg merge timed out after 15 minutes")
+                else:
+                    logger.error(f"FFmpeg stdin feeder failed: {feed_errors[-1]}")
                 return False
 
-            # Wait for ffmpeg to finish, polling cancellation every second
-            # so a user-cancelled long merge doesn't block for 900s.
-            poll_interval = 1.0
-            elapsed = 0.0
-            poll_timeout = 900.0
-            while True:
-                try:
-                    process.wait(timeout=poll_interval)
-                    break  # process exited cleanly
-                except subprocess.TimeoutExpired:
-                    elapsed += poll_interval
-                    if self.cancel_check is not None and self.cancel_check():
-                        logger.info("FFmpeg merge cancelled while waiting for ffmpeg exit")
-                        self.cancelled = True
-                        try:
-                            process.kill()
-                            process.wait(timeout=5)
-                        except Exception:
-                            pass
-                        self._remove_partial_output()
-                        return False
-                    if elapsed >= poll_timeout:
-                        process.kill()
-                        process.wait()
-                        logger.error("FFmpeg merge timed out after 15 minutes")
-                        return False
-
-            t_err.join(timeout=5)
-            t_out.join(timeout=5)
+            t_err.join(timeout=_PIPE_THREAD_JOIN_SECONDS)
 
             stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
@@ -245,6 +370,7 @@ class FFmpegMerger:
                     return True
                 else:
                     logger.error("Output file is empty or doesn't exist")
+                    self._cleanup_copy_failure()
                     return False
             else:
                 logger.error(f"FFmpeg failed with return code {process.returncode}")
@@ -252,20 +378,30 @@ class FFmpegMerger:
                 # version banners, the useful failure is at the end.
                 tail = stderr_text[-3000:] if len(stderr_text) > 3000 else stderr_text
                 logger.error(f"FFmpeg stderr (tail): {tail}")
+                self._cleanup_copy_failure()
                 return False
 
         except Exception as e:
             logger.error(f"Merge failed: {e}")
-            if process and process.poll() is None:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+            _kill_and_wait_bounded(process)
+            self._cleanup_copy_failure()
             return False
         finally:
             if process is not None:
-                for stream in (process.stdin, process.stdout, process.stderr):
-                    if stream is None:
+                # Buffered pipe objects hold an internal lock while a read or
+                # write blocks. Calling close() from this supervisor thread can
+                # therefore block forever if kill() itself failed to release a
+                # feeder/drain thread. Those helpers are daemons; leave their
+                # stream open in that rare case so the deadline remains real.
+                streams = (
+                    (process.stdin, feed_thread),
+                    (process.stdout, None),
+                    (process.stderr, t_err),
+                )
+                for stream, owner_thread in streams:
+                    if stream is None or (
+                        owner_thread is not None and owner_thread.is_alive()
+                    ):
                         continue
                     try:
                         stream.close()
@@ -283,6 +419,7 @@ class FFmpegMerger:
         if self.cancel_check is not None and self.cancel_check():
             logger.info("Re-encode skipped because merge was cancelled")
             self.cancelled = True
+            self._remove_partial_output()
             return False
 
         # The concat demuxer treats each input as an independent decodable
@@ -302,7 +439,9 @@ class FFmpegMerger:
         
         # Use same concat file location as merge()
         concat_file = Path(self.concat_dir) / "concat_list.txt"
-        
+        process = None
+        t_err = None
+
         try:
             self._create_concat_file(str(concat_file))
             
@@ -330,23 +469,18 @@ class FFmpegMerger:
 
             process = subprocess.Popen(
                 command,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
 
             started_at = time.monotonic()
             poll_interval = 1.0
             poll_timeout = 1800.0
-            stdout_chunks: List[bytes] = []
-            stderr_chunks: List[bytes] = []
+            stderr_chunks, t_err = _start_bounded_drain(process.stderr)
 
             while True:
                 try:
-                    stdout, stderr = process.communicate(timeout=poll_interval)
-                    if stdout:
-                        stdout_chunks.append(stdout)
-                    if stderr:
-                        stderr_chunks.append(stderr)
+                    process.wait(timeout=poll_interval)
                     break
                 except subprocess.TimeoutExpired:
                     if self.cancel_check is not None and self.cancel_check():
@@ -354,40 +488,56 @@ class FFmpegMerger:
                         self.cancelled = True
                         try:
                             process.kill()
-                            stdout, stderr = process.communicate(timeout=5)
-                            if stdout:
-                                stdout_chunks.append(stdout)
-                            if stderr:
-                                stderr_chunks.append(stderr)
+                            process.wait(timeout=5)
                         except Exception:
                             pass
+                        t_err.join(timeout=5)
                         self._remove_partial_output()
                         return False
                     if time.monotonic() - started_at >= poll_timeout:
                         try:
                             process.kill()
-                            stdout, stderr = process.communicate(timeout=5)
-                            if stdout:
-                                stdout_chunks.append(stdout)
-                            if stderr:
-                                stderr_chunks.append(stderr)
+                            process.wait(timeout=5)
                         except Exception:
                             pass
+                        t_err.join(timeout=5)
                         logger.error("FFmpeg re-encode timed out after 30 minutes")
+                        self._remove_partial_output()
                         return False
 
+            t_err.join(timeout=5)
             stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
             if process.returncode == 0:
-                logger.info("Re-encode successful")
-                return True
+                output_path = Path(self.output_file)
+                if output_path.exists() and output_path.stat().st_size > 0:
+                    logger.info("Re-encode successful")
+                    return True
+                logger.error("Re-encode exited successfully but output is empty or missing")
+                self._remove_partial_output()
+                return False
             else:
                 logger.error(f"Re-encode failed: {stderr_text}")
+                self._remove_partial_output()
                 return False
         
         except Exception as e:
             logger.error(f"Re-encode failed: {e}")
+            _kill_and_wait_bounded(process)
+            if t_err is not None:
+                t_err.join(timeout=_PIPE_THREAD_JOIN_SECONDS)
+            self._remove_partial_output()
             return False
+        finally:
+            if (
+                process is not None
+                and getattr(process, "stderr", None) is not None
+                and (t_err is None or not t_err.is_alive())
+            ):
+                try:
+                    process.stderr.close()
+                except Exception:
+                    pass
 
 
 def merge_segments(
@@ -434,12 +584,22 @@ def merge_segments(
     
     try:
         # Try copy mode first (fast)
+        merger._preserve_output_on_copy_failure = bool(
+            try_re_encode and not is_fmp4
+        )
         success = merger.merge()
         
         # If failed and re-encode is enabled, try re-encoding
         if not success and try_re_encode:
             if merger.cancelled or (cancel_check is not None and cancel_check()):
                 logger.info("Copy mode stopped after cancellation; skipping re-encode")
+                merger._remove_partial_output()
+                return False
+            if not merger._copy_failure_reservation_ready:
+                logger.error(
+                    "Copy mode failed and the output reservation could not be "
+                    "preserved; refusing re-encode to avoid overwriting another job"
+                )
                 return False
             logger.info("Copy mode failed, attempting re-encode")
             success = merger.merge_with_re_encode()

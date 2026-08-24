@@ -40,6 +40,16 @@ let userClickedVideoByTab = {};
 let videoPlaybackStateByTab = {};
 const MAX_TRACKED_MEDIA_PER_TAB = 32;
 
+// JSON DASH discovery and the first .m4s request race each other. The page
+// can start the selected track while inject.js is still cloning/parsing the
+// play-info response, so there may be no registered direct-DASH row when
+// onBeforeRequest first sees the media request. Retain a small, tab-scoped
+// window of those requests and backfill playback evidence when the JSON row
+// arrives a moment later.
+let recentDirectDashTrackRequestsByTab = {};
+const DIRECT_DASH_TRACK_REQUEST_WINDOW_MS = 2 * 60_000;
+const MAX_RECENT_DIRECT_DASH_TRACK_REQUESTS_PER_TAB = 64;
+
 // Cached thumbnails per tab from content.js
 // Key: tabId, Value: { pageUrl, pageThumbnail, posters: [{ poster, src, index }] }
 let pageThumbnailsByTab = {};
@@ -863,6 +873,151 @@ function directDashResourceKey(rawUrl) {
   }
 }
 
+function directDashExactResourceKey(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    // Fragments never reach the network. Preserve the query because some
+    // players distinguish representations only by query parameters.
+    return `${parsed.origin}${parsed.pathname}${parsed.search}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+function pruneRecentDirectDashTrackRequests(tabId, now = Date.now()) {
+  const rows = Array.isArray(recentDirectDashTrackRequestsByTab[tabId])
+    ? recentDirectDashTrackRequestsByTab[tabId]
+    : [];
+  const fresh = rows
+    .filter((row) => {
+      const timestamp = Number(row && row.timestamp) || 0;
+      const age = now - timestamp;
+      return row && row.resourceKey && row.exactKey && timestamp > 0 && age >= 0
+        && age <= DIRECT_DASH_TRACK_REQUEST_WINDOW_MS;
+    })
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(-MAX_RECENT_DIRECT_DASH_TRACK_REQUESTS_PER_TAB);
+  if (fresh.length > 0) {
+    recentDirectDashTrackRequestsByTab[tabId] = fresh;
+  } else {
+    delete recentDirectDashTrackRequestsByTab[tabId];
+  }
+  return fresh;
+}
+
+function rememberRecentDirectDashTrackRequest(details, now = Date.now()) {
+  const tabId = details && details.tabId;
+  if (tabId == null || typeof tabId !== 'number' || tabId < 0) return null;
+  const rawUrl = details && details.url;
+  if (!/\.m4s(?:[?#]|$)/i.test(String(rawUrl || ''))) return null;
+  const resourceKey = directDashResourceKey(rawUrl);
+  const exactKey = directDashExactResourceKey(rawUrl);
+  if (!resourceKey || !exactKey) return null;
+
+  const rows = pruneRecentDirectDashTrackRequests(tabId, now);
+  const existing = rows.find((row) => row.exactKey === exactKey);
+  if (existing) {
+    existing.url = rawUrl;
+    existing.resourceKey = resourceKey;
+    existing.timestamp = now;
+  } else {
+    rows.push({ resourceKey, exactKey, url: rawUrl, timestamp: now });
+  }
+  recentDirectDashTrackRequestsByTab[tabId] = rows
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(-MAX_RECENT_DIRECT_DASH_TRACK_REQUESTS_PER_TAB);
+  return existing || recentDirectDashTrackRequestsByTab[tabId]
+    .find((row) => row.exactKey === exactKey) || null;
+}
+
+function uniqueDirectDashCandidates(tabId, extraDirectDash = null) {
+  const candidates = (currentTabUrls[tabId] || [])
+    .filter((item) => item && item.directDash);
+  if (extraDirectDash) candidates.push({ directDash: extraDirectDash });
+  const unique = new Map();
+  for (const item of candidates) {
+    const video = item.directDash && item.directDash.video;
+    const key = directDashDedupeKey(video)
+      || directDashExactResourceKey(video && video.url);
+    if (key && !unique.has(key)) unique.set(key, item);
+  }
+  return Array.from(unique.values());
+}
+
+function findRecentDirectDashTrackRequest(tabId, directDash, now = Date.now()) {
+  if (tabId == null || typeof tabId !== 'number' || tabId < 0) return null;
+  const candidate = { directDash };
+  const videoKeys = directDashTrackResourceKeys(candidate, 'video');
+  if (videoKeys.size === 0) return null;
+
+  const recentRequests = pruneRecentDirectDashTrackRequests(tabId, now);
+  const newestMatching = (resourceKeys, field) => {
+    let newest = null;
+    for (const row of recentRequests) {
+      if (!resourceKeys.has(row[field])) continue;
+      if (!newest || row.timestamp > newest.timestamp) newest = row;
+    }
+    return newest;
+  };
+
+  // Only a video-track request identifies a representation/quality strongly.
+  const videoExactKeys = directDashTrackExactResourceKeys(candidate, 'video');
+  const videoMatch = newestMatching(videoExactKeys, 'exactKey');
+  if (videoMatch) return { ...videoMatch, evidenceKind: 'video' };
+
+  // Signed query tokens may refresh between the request and JSON parsing. A
+  // path-only fallback remains safe when exactly one logical representation
+  // in the tab uses that video path.
+  const allCandidates = uniqueDirectDashCandidates(tabId, directDash);
+  const videoPathMatch = newestMatching(videoKeys, 'resourceKey');
+  if (videoPathMatch) {
+    const pathOwners = allCandidates.filter((item) => (
+      directDashTrackResourceKeys(item, 'video').has(videoPathMatch.resourceKey)
+    ));
+    if (pathOwners.length === 1) {
+      return { ...videoPathMatch, evidenceKind: 'video-path' };
+    }
+  }
+
+  // Audio is commonly shared by every quality. Treat it as weak evidence only
+  // when this tab has exactly one logical direct-DASH video candidate,
+  // including the candidate currently being registered.
+  // In particular, an audio request that races ahead of a multi-quality JSON
+  // response must not select whichever representation happens to register first.
+  if (allCandidates.length !== 1) return null;
+
+  const audioKeys = directDashTrackResourceKeys(candidate, 'audio');
+  const audioExactKeys = directDashTrackExactResourceKeys(candidate, 'audio');
+  if (audioKeys.size === 0 || audioExactKeys.size === 0) return null;
+  const audioMatch = newestMatching(audioExactKeys, 'exactKey')
+    || newestMatching(audioKeys, 'resourceKey');
+  return audioMatch ? { ...audioMatch, evidenceKind: 'audio' } : null;
+}
+
+function directDashTrackResourceKeys(item, kind) {
+  const direct = item && item.directDash;
+  const track = direct && direct[kind];
+  const keys = new Set();
+  if (!track) return keys;
+  for (const rawUrl of [track.url, ...(track.backupUrls || [])]) {
+    const resourceKey = directDashResourceKey(rawUrl);
+    if (resourceKey) keys.add(resourceKey);
+  }
+  return keys;
+}
+
+function directDashTrackExactResourceKeys(item, kind) {
+  const direct = item && item.directDash;
+  const track = direct && direct[kind];
+  const keys = new Set();
+  if (!track) return keys;
+  for (const rawUrl of [track.url, ...(track.backupUrls || [])]) {
+    const resourceKey = directDashExactResourceKey(rawUrl);
+    if (resourceKey) keys.add(resourceKey);
+  }
+  return keys;
+}
+
 function directDashDedupeKey(track) {
   const resource = directDashResourceKey(track && track.url);
   if (!resource) return null;
@@ -891,17 +1046,98 @@ function findDirectDashCandidatesForTrack(tabId, rawUrl) {
   ));
 }
 
+function resolveDirectDashPlaybackForTrack(tabId, rawUrl) {
+  if (tabId == null || typeof tabId !== 'number' || tabId < 0) {
+    return { matches: [], evidenceKind: null };
+  }
+  const requestKey = directDashResourceKey(rawUrl);
+  const exactKey = directDashExactResourceKey(rawUrl);
+  if (!requestKey || !exactKey) return { matches: [], evidenceKind: null };
+  const candidates = (currentTabUrls[tabId] || [])
+    .filter((item) => item && item.directDash);
+
+  const exactVideoMatches = candidates.filter((item) => (
+    directDashTrackExactResourceKeys(item, 'video').has(exactKey)
+  ));
+  if (exactVideoMatches.length > 0) {
+    return { matches: exactVideoMatches, evidenceKind: 'video' };
+  }
+
+  // Exact audio wins over the path fallback: a rare CDN may reuse one path
+  // for audio/video and distinguish them in the query string.
+  if (candidates.length === 1
+      && directDashTrackExactResourceKeys(candidates[0], 'audio').has(exactKey)) {
+    return { matches: candidates, evidenceKind: 'audio' };
+  }
+
+  const pathVideoMatches = candidates.filter((item) => (
+    directDashTrackResourceKeys(item, 'video').has(requestKey)
+  ));
+  if (pathVideoMatches.length === 1) {
+    return { matches: pathVideoMatches, evidenceKind: 'video-path' };
+  }
+
+  // A shared audio track cannot identify a quality. It is usable only as weak
+  // playback evidence when the tab has a single direct-DASH video candidate.
+  if (candidates.length === 1
+      && directDashTrackResourceKeys(candidates[0], 'audio').has(requestKey)) {
+    return { matches: candidates, evidenceKind: 'audio' };
+  }
+  return { matches: [], evidenceKind: null };
+}
+
+function findDirectDashPlaybackCandidatesForTrack(tabId, rawUrl) {
+  return resolveDirectDashPlaybackForTrack(tabId, rawUrl).matches;
+}
+
 function markExistingDirectDashPlaybackFromTrack(details) {
-  const matches = findDirectDashCandidatesForTrack(details && details.tabId, details && details.url);
+  const resolution = resolveDirectDashPlaybackForTrack(
+    details && details.tabId,
+    details && details.url,
+  );
+  const matches = resolution.matches;
   if (matches.length === 0) return [];
   const now = Date.now();
   for (const item of matches) {
     item.playbackObserved = true;
+    if (
+      resolution.evidenceKind === 'video'
+      || item.directDashPlaybackEvidence !== 'video'
+    ) {
+      item.directDashPlaybackEvidence = resolution.evidenceKind;
+    }
     item.lastSegmentAt = now;
     item.timestamp = now;
   }
   notifyDetectedUrlsUpdated(details.tabId);
   return matches;
+}
+
+function revokeAmbiguousDirectDashPlayback(tabId) {
+  const candidates = (currentTabUrls[tabId] || [])
+    .filter((item) => item && item.directDash);
+  if (candidates.length <= 1) return false;
+
+  let changed = false;
+  for (const item of candidates) {
+    const evidence = item.directDashPlaybackEvidence;
+    let ambiguous = evidence === 'audio';
+    if (evidence === 'video-path') {
+      const itemPaths = directDashTrackResourceKeys(item, 'video');
+      const owners = candidates.filter((candidate) => (
+        [...directDashTrackResourceKeys(candidate, 'video')]
+          .some((key) => itemPaths.has(key))
+      ));
+      ambiguous = owners.length > 1;
+    }
+    if (!ambiguous) continue;
+    delete item.playbackObserved;
+    delete item.directDashPlaybackEvidence;
+    item.lastSegmentAt = 0;
+    changed = true;
+  }
+  if (changed) notifyDetectedUrlsUpdated(tabId);
+  return changed;
 }
 
 function registerDirectDashDetection(tabId, request) {
@@ -919,6 +1155,10 @@ function registerDirectDashDetection(tabId, request) {
   }
 
   const duration = Number(request && request.duration);
+  const recentPlayback = findRecentDirectDashTrackRequest(
+    tabId,
+    { video, audio },
+  );
   registerDetectedUrl({
     url: video.url,
     tabId,
@@ -933,7 +1173,15 @@ function registerDirectDashDetection(tabId, request) {
     qualityHeight: video.height || null,
     duration: Number.isFinite(duration) && duration > 0 ? duration : null,
     directDash: { video, audio },
+    playbackObserved: !!recentPlayback,
+    directDashPlaybackEvidence: recentPlayback
+      ? recentPlayback.evidenceKind
+      : null,
+    lastSegmentAt: recentPlayback ? recentPlayback.timestamp : 0,
   });
+  // A sole candidate may temporarily use audio as weak evidence. If another
+  // quality registers later, that evidence is no longer unambiguous.
+  revokeAmbiguousDirectDashPlayback(tabId);
   return true;
 }
 
@@ -1049,6 +1297,16 @@ function mergeDetectedUrlExtra(existing, extra) {
   }
   if (extra.playbackObserved) {
     existing.playbackObserved = true;
+  }
+  if (
+    extra.directDashPlaybackEvidence === 'video'
+    || (
+      (extra.directDashPlaybackEvidence === 'audio'
+        || extra.directDashPlaybackEvidence === 'video-path')
+      && existing.directDashPlaybackEvidence !== 'video'
+    )
+  ) {
+    existing.directDashPlaybackEvidence = extra.directDashPlaybackEvidence;
   }
   const lastSegmentAt = Number(extra.lastSegmentAt) || 0;
   if (lastSegmentAt > (Number(existing.lastSegmentAt) || 0)) {
@@ -1202,6 +1460,9 @@ chrome.webRequest.onBeforeRequest.addListener(
       // Manifest-less DASH JSON exposes complete video/audio .m4s tracks.
       // A matching request proves the player has started and the signed URLs
       // belong to this tab; it must never create a standalone .m4s tile.
+      // Remember the request first: inject.js may not finish registering its
+      // JSON candidates until after this one-shot request has already begun.
+      rememberRecentDirectDashTrackRequest(details);
       markExistingDirectDashPlaybackFromTrack(details);
       markExistingHlsPlaybackFromSegment(details);
     } else if (/\.ts(?:[?#]|$)/i.test(details.url)) {
@@ -1371,6 +1632,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete deepHitsByTab[tabId];
   delete userClickedVideoByTab[tabId];
   delete videoPlaybackStateByTab[tabId];
+  delete recentDirectDashTrackRequestsByTab[tabId];
   delete pageThumbnailsByTab[tabId];
 });
 
@@ -1383,6 +1645,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
     deepHitsByTab[details.tabId] = [];
     delete userClickedVideoByTab[details.tabId];
     delete videoPlaybackStateByTab[details.tabId];
+    delete recentDirectDashTrackRequestsByTab[details.tabId];
     delete pageThumbnailsByTab[details.tabId];
     updateBadge(details.tabId);
     chrome.storage.local.set({ detectedUrls: Array.from(detectedUrls) });
@@ -3087,6 +3350,15 @@ async function _wv2nasInstallVariantDnrRule(variantUrl, dnrContext, trusted = fa
 // ---------------------------------------------------------------------------
 
 const _BROWSER_JOB_PERSIST_KEY = 'wv2nasBrowserJobs';
+// Live browser-transfer counters belong to the browser session rather than
+// durable job recovery. Keeping a small, bounded snapshot map in
+// storage.session lets a reopened sidepanel (or a restarted MV3 service
+// worker) restore both transfer-stage timers without writing high-frequency
+// progress events to disk-backed storage.local.
+const _BROWSER_TRANSFER_SNAPSHOT_KEY = 'wv2nasBrowserTransferSnapshots';
+const _BROWSER_TRANSFER_SNAPSHOT_MAX = 30;
+const _BROWSER_TRANSFER_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
+const _BROWSER_JOB_ABORT_TIMEOUT_MS = 15_000;
 // Codex review #16: jobs are only reaped if their last liveness signal
 // is older than this. With heartbeats from offscreen at 10s cadence,
 // a 5-minute miss is a strong "offscreen is dead" signal. The previous
@@ -3133,6 +3405,7 @@ async function _wv2nasWritePersistedBrowserJobs(jobs) {
 // unpersist path. What we cannot allow is two writers concurrently
 // overwriting the whole map.
 let _wv2nasPersistMutex = Promise.resolve();
+let _wv2nasTransferSnapshotMutex = Promise.resolve();
 
 function _wv2nasWithPersistLock(fn) {
   // Chain after any in-flight work; failures don't poison subsequent
@@ -3140,6 +3413,155 @@ function _wv2nasWithPersistLock(fn) {
   const next = _wv2nasPersistMutex.then(fn, fn);
   _wv2nasPersistMutex = next.then(() => undefined, () => undefined);
   return next;
+}
+
+function _wv2nasWithTransferSnapshotLock(fn) {
+  const next = _wv2nasTransferSnapshotMutex.then(fn, fn);
+  _wv2nasTransferSnapshotMutex = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+async function _wv2nasReadBrowserTransferSnapshots() {
+  const area = chrome.storage && chrome.storage.session;
+  if (!area || typeof area.get !== 'function') return {};
+  try {
+    const cur = await area.get(_BROWSER_TRANSFER_SNAPSHOT_KEY);
+    const value = cur && cur[_BROWSER_TRANSFER_SNAPSHOT_KEY];
+    return value && typeof value === 'object' ? value : {};
+  } catch (e) {
+    console.warn('[wv2nas] read browser-transfer snapshots failed:', e);
+    return {};
+  }
+}
+
+async function _wv2nasWriteBrowserTransferSnapshots(snapshots) {
+  const area = chrome.storage && chrome.storage.session;
+  if (!area || typeof area.set !== 'function') return false;
+  try {
+    await area.set({ [_BROWSER_TRANSFER_SNAPSHOT_KEY]: snapshots });
+    return true;
+  } catch (e) {
+    console.warn('[wv2nas] write browser-transfer snapshots failed:', e);
+    return false;
+  }
+}
+
+function _wv2nasTransferSnapshotPatch(msg) {
+  const payload = msg && msg.payload;
+  const jobId = payload && payload.jobId;
+  if (!jobId) return null;
+
+  const patch = { jobId: String(jobId), ts: Number(payload.ts) || Date.now() };
+  const copyNumber = (targetKey, value) => {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed >= 0) patch[targetKey] = parsed;
+  };
+
+  if (msg.type === 'BROWSER_JOB_PROGRESS') {
+    copyNumber('done', payload.done);
+    copyNumber('total', payload.total);
+    copyNumber('concurrency', payload.concurrency);
+    if (payload.transferTimings && typeof payload.transferTimings === 'object') {
+      patch.transferTimings = payload.transferTimings;
+    }
+  } else if (msg.type === 'BROWSER_JOB_DONE') {
+    const summary = payload.summary && typeof payload.summary === 'object'
+      ? payload.summary
+      : {};
+    copyNumber('done', summary.totalSegments);
+    copyNumber('total', summary.totalSegments);
+    copyNumber('concurrency', summary.concurrency);
+    if (summary.transferTimings && typeof summary.transferTimings === 'object') {
+      patch.transferTimings = summary.transferTimings;
+    }
+    patch.terminal = true;
+    patch.failed = false;
+  } else if (msg.type === 'BROWSER_JOB_FAILED') {
+    copyNumber('done', payload.done);
+    copyNumber('total', payload.total);
+    copyNumber('concurrency', payload.concurrency);
+    if (payload.transferTimings && typeof payload.transferTimings === 'object') {
+      patch.transferTimings = payload.transferTimings;
+    }
+    patch.terminal = true;
+    patch.failed = true;
+  } else {
+    return null;
+  }
+  return patch;
+}
+
+function _wv2nasMergeTransferTimings(previous, incoming, incomingIsNewer) {
+  if (!previous || typeof previous !== 'object') return incoming;
+  if (!incoming || typeof incoming !== 'object') return previous;
+  const cumulativeKeys = [
+    'bytes', 'attemptedBytes', 'requests', 'failures', 'cancelled',
+    'requestMs', 'activeMs',
+  ];
+  const mergeStage = (oldStage, newStage) => {
+    if (!oldStage || typeof oldStage !== 'object') return newStage;
+    if (!newStage || typeof newStage !== 'object') return oldStage;
+    const stage = {};
+    for (const key of cumulativeKeys) {
+      stage[key] = Math.max(Number(oldStage[key]) || 0, Number(newStage[key]) || 0);
+    }
+    stage.inFlight = incomingIsNewer
+      ? Number(newStage.inFlight) || 0
+      : Number(oldStage.inFlight) || 0;
+    stage.mbPerSecond = stage.activeMs > 0
+      ? (stage.bytes / (1024 * 1024)) / (stage.activeMs / 1000)
+      : 0;
+    return stage;
+  };
+  return {
+    cdn: mergeStage(previous.cdn, incoming.cdn),
+    nas: mergeStage(previous.nas, incoming.nas),
+  };
+}
+
+async function _wv2nasPersistBrowserTransferSnapshot(msg) {
+  const patch = _wv2nasTransferSnapshotPatch(msg);
+  if (!patch) return false;
+  return _wv2nasWithTransferSnapshotLock(async () => {
+    const now = Date.now();
+    const snapshots = await _wv2nasReadBrowserTransferSnapshots();
+    const previous = snapshots[patch.jobId] && typeof snapshots[patch.jobId] === 'object'
+      ? snapshots[patch.jobId]
+      : {};
+    // Completion is sticky. A throttled PROGRESS sendMessage can arrive after
+    // DONE because progress delivery is intentionally fire-and-forget; it must
+    // not replace the final counters or make the stored row live again.
+    const patchIsTerminal = patch.terminal === true;
+    const previousIsTerminal = previous.terminal === true;
+    const incomingIsNewer = (Number(patch.ts) || 0) >= (Number(previous.ts) || 0);
+    const merged = previousIsTerminal && !patchIsTerminal
+      ? { ...previous }
+      : {
+          ...previous,
+          ...patch,
+          done: Math.max(Number(previous.done) || 0, Number(patch.done) || 0),
+          total: Math.max(Number(previous.total) || 0, Number(patch.total) || 0),
+          ts: Math.max(Number(previous.ts) || 0, Number(patch.ts) || 0),
+          transferTimings: _wv2nasMergeTransferTimings(
+            previous.transferTimings,
+            patch.transferTimings,
+            incomingIsNewer || patchIsTerminal,
+          ),
+        };
+    const total = Number(merged.total) || 0;
+    const done = Number(merged.done) || 0;
+    merged.percent = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+    snapshots[patch.jobId] = merged;
+
+    const kept = Object.entries(snapshots)
+      .filter(([, snapshot]) => {
+        const ts = Number(snapshot && snapshot.ts) || 0;
+        return ts > 0 && now - ts <= _BROWSER_TRANSFER_SNAPSHOT_TTL_MS;
+      })
+      .sort((a, b) => (Number(b[1].ts) || 0) - (Number(a[1].ts) || 0))
+      .slice(0, _BROWSER_TRANSFER_SNAPSHOT_MAX);
+    return _wv2nasWriteBrowserTransferSnapshots(Object.fromEntries(kept));
+  });
 }
 
 async function _wv2nasPersistBrowserJob(jobId, data) {
@@ -3210,6 +3632,10 @@ async function _wv2nasPersistAbortRetry(jobId, reason, { dnrCleaned = false } = 
 async function _wv2nasHandleDurableCompletion(msg) {
   const jobId = msg && msg.payload && msg.payload.jobId;
   if (!jobId) return;
+  // Capture final counters before cleanup removes the durable job entry. This
+  // also preserves a failed transfer's partial CDN/NAS timings for the next
+  // sidepanel render.
+  await _wv2nasPersistBrowserTransferSnapshot(msg);
   // Codex review #19a: block until the SW-boot recovery finishes
   // populating `_wv2nasActiveBrowserJobs` so the offscreen-close
   // decision below sees ALL alive jobs, not just the one we're
@@ -3420,6 +3846,8 @@ async function _wv2nasRecoverStaleBrowserJobs() {
 // wipe its staging dir (Codex review #3). Returns true only when the
 // caller can safely forget its persisted abort-retry state.
 async function _wv2nasAbortBrowserJob(nasEndpoint, apiKey, jobId, reason) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), _BROWSER_JOB_ABORT_TIMEOUT_MS);
   try {
     const resp = await fetch(`${nasEndpoint}/api/jobs/${encodeURIComponent(jobId)}/abort`, {
       method: 'POST',
@@ -3428,6 +3856,7 @@ async function _wv2nasAbortBrowserJob(nasEndpoint, apiKey, jobId, reason) {
         'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify({ reason: (reason || '').slice(0, 500) }),
+      signal: controller.signal,
     });
     if (!resp.ok) {
       console.warn(`[wv2nas] abort ${jobId} returned ${resp.status}`);
@@ -3437,6 +3866,8 @@ async function _wv2nasAbortBrowserJob(nasEndpoint, apiKey, jobId, reason) {
   } catch (e) {
     console.warn(`[wv2nas] abort ${jobId} request failed:`, e);
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -3867,9 +4298,16 @@ _wv2nasInitRecovery();
 chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
   if (!msg || msg.target !== 'service-worker') return false;
   if (msg.type === 'BROWSER_JOB_DONE' || msg.type === 'BROWSER_JOB_FAILED') {
-    _wv2nasHandleDurableCompletion(msg).catch((e) => {
-      console.warn('[wv2nas] durable completion handler failed:', e);
-    });
+    _wv2nasHandleDurableCompletion(msg)
+      .then(() => _sendResponse({ ok: true }))
+      .catch((e) => {
+        console.warn('[wv2nas] durable completion handler failed:', e);
+        _sendResponse({ ok: false, error: String(e && e.message || e) });
+      });
+    // Keep the MV3 message event alive until the session snapshot and durable
+    // cleanup finish. offscreen.js awaits this acknowledgement before it
+    // considers completion delivered.
+    return true;
   } else if (msg.type === 'BROWSER_JOB_HEARTBEAT') {
     // Codex review #16: persist the heartbeat so the next SW-boot
     // watchdog can use it as liveness signal. Fire-and-forget — a
@@ -3893,11 +4331,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
     // sidepanel/options page is open.
     const p = msg.payload || {};
     if (p.jobId) {
+      _wv2nasPersistBrowserTransferSnapshot(msg).catch(() => {});
       chrome.runtime.sendMessage({
         action: 'browserJobProgress',
         jobId: p.jobId,
         done: p.done,
         total: p.total,
+        concurrency: p.concurrency,
+        transferTimings: p.transferTimings,
       }, () => { void chrome.runtime.lastError; });
     }
   } else if (msg.type === 'OFFSCREEN_READY') {

@@ -9,7 +9,14 @@ import logging
 import os
 import random
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    wait,
+)
 from typing import List, Dict, Optional, Callable, Set
 import time
 from pathlib import Path
@@ -20,13 +27,24 @@ from Crypto.Util.Padding import unpad
 from ssl_adapter import create_legacy_session, create_impersonated_session, tls_verify_enabled
 from shared.security import redacted_headers_for_log as _redacted_headers_for_log
 from shared.security import guarded_get
+from shared.security import scoped_captured_headers
+from shared.security import is_trusted_for_captured_headers
 
 # Cross-process per-host concurrency throttle. Optional — no-op when
 # HOST_CONCURRENCY_CAP env is unset. See host_throttle.py for rationale.
 try:
     import host_throttle as _host_throttle
+    from host_throttle import (
+        HostThrottleCancelled,
+        HostThrottleCapacityTimeout,
+    )
+    _HOST_THROTTLE_ERRORS = (
+        HostThrottleCancelled,
+        HostThrottleCapacityTimeout,
+    )
 except ImportError:
     _host_throttle = None  # type: ignore[assignment]
+    _HOST_THROTTLE_ERRORS = ()
 
 # Network-layer errors that should NOT trigger Referer-strategy fallback.
 # A RST or transfer timeout means the host is throttling/dropping us — trying
@@ -58,6 +76,94 @@ if not tls_verify_enabled():
 logger = logging.getLogger(__name__)
 
 
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _get_header_ci(headers: Dict, name: str):
+    target = str(name).strip().lower()
+    for existing_name, value in (headers or {}).items():
+        if str(existing_name).strip().lower() == target:
+            return value
+    return None
+
+
+def _replace_header_ci(headers: Dict, name: str, value) -> None:
+    """Remove every casing of an HTTP field, then optionally set one value."""
+    target = str(name).strip().lower()
+    for existing_name in list(headers):
+        if str(existing_name).strip().lower() == target:
+            headers.pop(existing_name, None)
+    if value is not None:
+        headers[name] = value
+
+
+# Segments are retained in memory for validation/decryption before being
+# written. Always stream them and cap one response so a hostile/chunked CDN
+# cannot make every DASH worker buffer an arbitrary body concurrently.
+MAX_SEGMENT_RESPONSE_BYTES = _positive_env_int(
+    "MAX_SEGMENT_RESPONSE_BYTES", 64 * 1024 * 1024,
+)
+MAX_INFLIGHT_SEGMENT_BYTES = _positive_env_int(
+    "MAX_INFLIGHT_SEGMENT_BYTES", 128 * 1024 * 1024,
+)
+
+
+class _WeightedByteBudget:
+    """Process-local reservation budget for retained segment bodies."""
+
+    def __init__(self, limit: int):
+        self.limit = max(1, int(limit))
+        self.used = 0
+        self._condition = threading.Condition()
+
+    def acquire(self, amount: int, stop_event: threading.Event) -> None:
+        amount = int(amount)
+        if amount <= 0 or amount > self.limit:
+            raise ValueError(
+                f"segment buffer reservation {amount} exceeds process limit "
+                f"{self.limit}"
+            )
+        with self._condition:
+            while self.used + amount > self.limit:
+                if stop_event.is_set():
+                    raise RuntimeError("segment buffer reservation cancelled")
+                self._condition.wait(timeout=0.1)
+            self.used += amount
+
+    def release(self, amount: int) -> None:
+        amount = int(amount)
+        if amount <= 0:
+            return
+        with self._condition:
+            self.used = max(0, self.used - amount)
+            self._condition.notify_all()
+
+
+class _BufferLease:
+    """One segment attempt's ownership of the process byte budget."""
+
+    def __init__(self, budget: _WeightedByteBudget):
+        self._budget = budget
+        self._amount = 0
+
+    def reserve(self, amount: int, stop_event: threading.Event) -> None:
+        self.release()
+        self._budget.acquire(amount, stop_event)
+        self._amount = int(amount)
+
+    def release(self) -> None:
+        amount, self._amount = self._amount, 0
+        self._budget.release(amount)
+
+
+_segment_buffer_budget = _WeightedByteBudget(MAX_INFLIGHT_SEGMENT_BYTES)
+
+
 class TransportThrottleAbort(Exception):
     """Raised by the worker's progress callback when transport-layer failures
     dominate (curl timeouts / connection resets). The classifier in
@@ -71,6 +177,77 @@ class TransportThrottleAbort(Exception):
         super().__init__(message)
         self.transport_count = transport_count
         self.total_failures = total_failures
+
+
+class NonRetryableSegmentResourceError(ValueError):
+    """A deterministic segment range/size policy rejection.
+
+    Referer changes and recursive retries cannot make an oversized body or an
+    invalid byte-range contract safe.  Keep this typed until the caller can
+    stop those retry layers (and, for DASH, classify the whole manifest job as
+    non-retryable).
+    """
+
+
+class NonRetryableKeyResourceError(NonRetryableSegmentResourceError):
+    """A deterministic AES key shape rejection invalidates the HLS job.
+
+    Unlike one missing HLS media segment, an invalid shared key makes every
+    dependent segment undecipherable. Preserve this subtype so the concurrent
+    downloader can stop the whole future window after the single-flight GET.
+    """
+
+
+class RequiredSegmentFailed(RuntimeError):
+    """A downloader configured for all-or-nothing output lost one segment."""
+
+
+def _validate_single_byte_content_range(
+    headers,
+    *,
+    expected_offset: int,
+    expected_length: int,
+) -> None:
+    """Require a 206 response to identify the exact requested byte interval."""
+    raw_value = None
+    try:
+        raw_value = headers.get("Content-Range")
+        if raw_value is None:
+            raw_value = headers.get("content-range")
+    except AttributeError:
+        pass
+    if raw_value is None:
+        raise ValueError("missing Content-Range header")
+
+    value = str(raw_value).strip()
+    unit, separator, remainder = value.partition(" ")
+    interval, slash, complete_length = remainder.strip().partition("/")
+    start_text, dash, end_text = interval.strip().partition("-")
+    if (
+        unit.lower() != "bytes"
+        or not separator
+        or not slash
+        or not dash
+        or not start_text.strip().isdigit()
+        or not end_text.strip().isdigit()
+    ):
+        raise ValueError(f"malformed Content-Range header: {value!r}")
+
+    start = int(start_text.strip())
+    end = int(end_text.strip())
+    expected_end = expected_offset + expected_length - 1
+    if start != expected_offset or end != expected_end:
+        raise ValueError(
+            f"Content-Range mismatch: got bytes {start}-{end}, "
+            f"expected {expected_offset}-{expected_end}"
+        )
+
+    complete_length = complete_length.strip()
+    if complete_length != "*":
+        if not complete_length.isdigit() or int(complete_length) <= end:
+            raise ValueError(
+                f"malformed Content-Range complete length: {value!r}"
+            )
 
 
 # MPEG-TS sync byte - all valid .ts files start with this
@@ -511,7 +688,10 @@ class SegmentDownloader:
         encryption_key: Optional[bytes] = None,
         encryption_iv: Optional[bytes] = None,
         m3u8_url: Optional[str] = None,
-        session=None
+        header_trust_base: Optional[str] = None,
+        referer_trust_base: Optional[str] = None,
+        session=None,
+        require_all: bool = False,
     ):
         self.segments = segments
         self.output_dir = Path(output_dir)
@@ -522,9 +702,14 @@ class SegmentDownloader:
         self.encryption_key = encryption_key
         self.encryption_iv = encryption_iv
         self.m3u8_url = m3u8_url
+        self.header_trust_base = header_trust_base or m3u8_url
+        self.referer_trust_base = referer_trust_base or m3u8_url
+        self.require_all = bool(require_all)
 
         # Cache for rotating AES-128 keys (key URI -> bytes)
         self._key_cache = {}
+        self._key_failure_cache: Dict[str, str] = {}
+        self._key_inflight: Dict[str, Future] = {}
         self._key_cache_lock = threading.Lock()
         
         self.downloaded_count = 0
@@ -660,7 +845,8 @@ class SegmentDownloader:
         
         # Log key info on first segment
         if segment_index == 0:
-            logger.info(f"Encryption key (first 4 bytes): {self.encryption_key[:4].hex()}")
+            key_fp = hashlib.sha256(self.encryption_key).hexdigest()[:12]
+            logger.info(f"Encryption key fingerprint: sha256={key_fp}")
             if self.encryption_iv is not None:
                 logger.info(f"Using provided IV: {self.encryption_iv.hex()}")
             else:
@@ -728,11 +914,47 @@ class SegmentDownloader:
             return data  # Return original data if decryption fails
 
     def _get_key_bytes(self, key_url: str) -> bytes:
-        """Fetch AES-128 key bytes with caching (thread-safe)."""
+        """Fetch/cache AES-128 key bytes with one in-flight GET per URL."""
         with self._key_cache_lock:
             cached = self._key_cache.get(key_url)
-        if cached is not None:
-            return cached
+            if cached is not None:
+                return cached
+            cached_failure = self._key_failure_cache.get(key_url)
+            if cached_failure is not None:
+                raise NonRetryableKeyResourceError(cached_failure)
+            future = self._key_inflight.get(key_url)
+            owner = future is None
+            if owner:
+                future = Future()
+                self._key_inflight[key_url] = future
+
+        if not owner:
+            while True:
+                try:
+                    return future.result(timeout=0.1)
+                except FutureTimeoutError:
+                    if self._stop_event.is_set():
+                        raise RuntimeError("AES-128 key fetch wait cancelled")
+
+        try:
+            key = self._fetch_key_bytes_uncached(key_url)
+            with self._key_cache_lock:
+                self._key_cache[key_url] = key
+            future.set_result(key)
+            return key
+        except BaseException as exc:
+            if isinstance(exc, NonRetryableKeyResourceError):
+                with self._key_cache_lock:
+                    self._key_failure_cache[key_url] = str(exc)
+            future.set_exception(exc)
+            raise
+        finally:
+            with self._key_cache_lock:
+                if self._key_inflight.get(key_url) is future:
+                    self._key_inflight.pop(key_url, None)
+
+    def _fetch_key_bytes_uncached(self, key_url: str) -> bytes:
+        """Perform one bounded network fetch for an uncached AES key."""
 
         # v2.4.1 (Codex adversarial review): per-host header overrides from
         # HOST_HEADERS_FILE must apply to AES key fetches too, not just to
@@ -742,35 +964,109 @@ class SegmentDownloader:
         # fails despite the documented per-host override being set. Lookup
         # uses the KEY URL's host (which can differ from the segment host).
         key_host = urlparse(key_url).hostname or ""
-        request_headers = dict(self.headers)
         if key_host:
-            host_overrides = get_host_headers_for(key_host)
-            if host_overrides:
-                request_headers.update(host_overrides)
-
-        response = guarded_get(
-            self.session,
+            with self._touched_hosts_lock:
+                self._touched_hosts.add(key_host)
+        request_headers = self._captured_headers_for_target(
+            self.headers,
             key_url,
-            headers=request_headers,
-            timeout=self.timeout,
-            stream=False,
         )
-        response.raise_for_status()
-        key = response.content or b""
-        if len(key) != 16:
-            raise ValueError(f"Unexpected AES-128 key length: {len(key)} bytes (expected 16)")
+        if (
+            self.m3u8_url
+            and self.referer_trust_base
+            and is_trusted_for_captured_headers(
+                key_url,
+                self.referer_trust_base,
+            )
+        ):
+            _replace_header_ci(
+                request_headers, "Referer", self.m3u8_url,
+            )
+            playlist_parts = urlparse(self.m3u8_url)
+            _replace_header_ci(
+                request_headers,
+                "Origin",
+                f"{playlist_parts.scheme}://{playlist_parts.netloc}",
+            )
 
-        # Diagnostic: a real AES-128 key is 16 random binary bytes. If the
-        # endpoint returned 16 PRINTABLE ASCII chars instead (e.g. a hex
-        # string truncated to 16 chars), every segment will decrypt to
-        # garbage even though length passes the check above. Log the full
-        # hex + Content-Type so we can tell at a glance whether the key
-        # is real or text. Loud WARNING when it looks like ASCII.
-        content_type = ''
+        # Rotating-key playlists can use a distinct URI on every segment, so
+        # per-URL single-flight alone does not bound same-host key traffic.
+        # Put key GETs through the same adaptive pacing + cross-process host
+        # throttle as media requests; otherwise MAX_DOWNLOAD_WORKERS processes
+        # can bypass an operator's HOST_CONCURRENCY_CAP via the key endpoint.
+        sleep_for = (
+            0.0
+            if self._single_mode
+            else _adaptive_delay.acquire_pace_slot(key_host)
+        )
+        if sleep_for > 0 and self._stop_event.wait(sleep_for):
+            _adaptive_delay.cancel_host_reservations(key_host)
+            raise RuntimeError("AES-128 key fetch cancelled during pacing")
+
+        if self._stop_event.is_set():
+            raise RuntimeError("AES-128 key fetch cancelled before request")
+
+        response = None
         try:
-            content_type = response.headers.get('Content-Type', '') or ''
-        except Exception:
+            response = guarded_get(
+                self.session,
+                key_url,
+                headers=request_headers,
+                timeout=self.timeout,
+                stream=True,
+                request_slot=self._host_request_slot,
+                headers_for_url=self._headers_for_redirect_hop,
+            )
+            response.raise_for_status()
+            try:
+                declared = int(response.headers.get("Content-Length", ""))
+            except (AttributeError, TypeError, ValueError):
+                declared = None
+            if declared is not None and declared != 16:
+                raise NonRetryableKeyResourceError(
+                    f"Unexpected AES-128 key Content-Length: {declared} "
+                    f"bytes (expected 16)"
+                )
+            iterator = getattr(response, "iter_content", None)
+            if not callable(iterator):
+                raise NonRetryableKeyResourceError(
+                    "AES-128 key response is not stream-readable"
+                )
+            key_buffer = bytearray()
+            for chunk in iterator(chunk_size=17):
+                if not chunk:
+                    continue
+                if len(key_buffer) + len(chunk) > 16:
+                    raise NonRetryableKeyResourceError(
+                        "Unexpected AES-128 key length: more than 16 bytes"
+                    )
+                key_buffer.extend(chunk)
+            key = bytes(key_buffer)
+            if len(key) != 16:
+                raise NonRetryableKeyResourceError(
+                    f"Unexpected AES-128 key length: {len(key)} bytes "
+                    f"(expected 16)"
+                )
+
+            # Diagnostic: a real AES-128 key is 16 random binary bytes. If the
+            # endpoint returned 16 PRINTABLE ASCII chars instead (e.g. a hex
+            # string truncated to 16 chars), every segment will decrypt to
+            # garbage even though length passes the check above.
             content_type = ''
+            try:
+                content_type = response.headers.get('Content-Type', '') or ''
+            except Exception:
+                content_type = ''
+        except _TRANSPORT_ERRORS:
+            if not self._single_mode:
+                _adaptive_delay.report_failure(key_host)
+            raise
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
         is_printable_ascii = all(0x20 <= b <= 0x7E for b in key)
         # Never log the key itself (hex or decoded) — it is decryption material.
         # A short SHA-256 fingerprint is enough to correlate/compare keys across
@@ -789,9 +1085,88 @@ class SegmentDownloader:
                 "If decryption output looks wrong, check the key endpoint response."
             )
 
-        with self._key_cache_lock:
-            self._key_cache[key_url] = key
+        if key_host:
+            _adaptive_delay.report_success(key_host)
+
         return key
+
+    @contextmanager
+    def _host_request_slot(self, url: str):
+        """Hold the configured slot for the exact redirect-hop host.
+
+        ``guarded_get`` invokes this scope separately before each network
+        request and retains the final one until a streamed response closes.
+        That prevents a public redirector from bypassing a cap configured for
+        the real CDN host.
+        """
+        throttle = (
+            _host_throttle.get() if _host_throttle is not None else None
+        )
+        acquired = (
+            throttle.acquire(
+                url,
+                stop_event=self._stop_event,
+                fail_open=False,
+            )
+            if throttle is not None else False
+        )
+        try:
+            if self._stop_event.is_set():
+                raise RuntimeError("Download cancelled by user before network fetch")
+            yield
+        finally:
+            if acquired and throttle is not None:
+                throttle.release(url)
+
+    def _headers_for_target(self, headers: Dict, target_url: str) -> Dict:
+        """Scope captured credentials, then apply explicit host overrides."""
+        scoped = self._captured_headers_for_target(headers, target_url)
+        host = urlparse(target_url).hostname or ""
+        host_overrides = get_host_headers_for(host)
+        if host_overrides:
+            # Dict keys are case-sensitive but HTTP field names are not.
+            # Replace existing spellings before applying the operator's value
+            # so e.g. ``referer`` cannot coexist ambiguously with ``Referer``.
+            for override_name, override_value in host_overrides.items():
+                _replace_header_ci(
+                    scoped, override_name, override_value,
+                )
+        return scoped
+
+    def _captured_headers_for_target(
+        self,
+        headers: Dict,
+        target_url: str,
+    ) -> Dict:
+        return scoped_captured_headers(
+            headers,
+            target_url,
+            self.header_trust_base,
+        )
+
+    def _headers_for_redirect_hop(
+        self,
+        target_url: str,
+        headers: Dict,
+    ) -> Dict:
+        generated_referer = _get_header_ci(headers, "Referer")
+        generated_origin = _get_header_ci(headers, "Origin")
+        scoped = self._headers_for_target(headers, target_url)
+        if (
+            self.referer_trust_base
+            and is_trusted_for_captured_headers(
+                target_url,
+                self.referer_trust_base,
+            )
+        ):
+            present = {
+                str(name).strip().lower() for name in scoped
+            }
+            if generated_referer and "referer" not in present:
+                scoped["Referer"] = generated_referer
+            if generated_origin and "origin" not in present:
+                scoped["Origin"] = generated_origin
+        return scoped
 
     def _decrypt_segment_with_key(
         self,
@@ -806,7 +1181,8 @@ class SegmentDownloader:
             return data
 
         if segment_index == 0:
-            logger.info(f"Encryption key (first 4 bytes): {key_bytes[:4].hex()}")
+            key_fp = hashlib.sha256(key_bytes).hexdigest()[:12]
+            logger.info(f"Encryption key fingerprint: sha256={key_fp}")
             if iv_bytes is not None:
                 logger.info(f"Using provided IV: {iv_bytes.hex()}")
             else:
@@ -901,8 +1277,12 @@ class SegmentDownloader:
         segment_parsed = urlparse(segment_url)
         segment_origin = f"{segment_parsed.scheme}://{segment_parsed.netloc}"
 
-        original_referer = self.headers.get('Referer', '')
-        original_origin = self.headers.get('Origin', '')
+        target_headers = self._captured_headers_for_target(
+            self.headers,
+            segment_url,
+        )
+        original_referer = _get_header_ci(target_headers, 'Referer') or ''
+        original_origin = _get_header_ci(target_headers, 'Origin') or ''
 
         # Strategy 1: Original headers (source page as Referer)
         strategies.append({
@@ -919,7 +1299,14 @@ class SegmentDownloader:
         })
 
         # Strategy 3: Use m3u8 URL as Referer
-        if self.m3u8_url:
+        if (
+            self.m3u8_url
+            and self.referer_trust_base
+            and is_trusted_for_captured_headers(
+                segment_url,
+                self.referer_trust_base,
+            )
+        ):
             m3u8_parsed = urlparse(self.m3u8_url)
             m3u8_origin = f"{m3u8_parsed.scheme}://{m3u8_parsed.netloc}"
             strategies.append({
@@ -957,10 +1344,24 @@ class SegmentDownloader:
             offset = int(byte_range["offset"])
             length = int(byte_range["length"])
         except (KeyError, TypeError, ValueError) as e:
-            raise ValueError(f"Invalid byte_range metadata: {byte_range!r}") from e
+            raise NonRetryableSegmentResourceError(
+                f"Invalid byte_range metadata: {byte_range!r}"
+            ) from e
         if offset < 0 or length <= 0:
-            raise ValueError(f"Invalid byte_range metadata: {byte_range!r}")
-        return f"bytes={offset}-{offset + length - 1}"
+            raise NonRetryableSegmentResourceError(
+                f"Invalid byte_range metadata: {byte_range!r}"
+            )
+        if length > MAX_SEGMENT_RESPONSE_BYTES:
+            raise NonRetryableSegmentResourceError(
+                f"Segment byte range length {length} exceeds "
+                f"MAX_SEGMENT_RESPONSE_BYTES={MAX_SEGMENT_RESPONSE_BYTES}"
+            )
+        try:
+            return f"bytes={offset}-{offset + length - 1}"
+        except (ValueError, OverflowError) as e:
+            raise NonRetryableSegmentResourceError(
+                f"Invalid byte_range metadata: {byte_range!r}"
+            ) from e
 
     @classmethod
     def _headers_for_byte_range(cls, headers: Dict, byte_range: Optional[Dict]) -> Dict:
@@ -979,6 +1380,7 @@ class SegmentDownloader:
         headers: Dict,
         index: int,
         byte_range: Optional[Dict] = None,
+        memory_lease: Optional[_BufferLease] = None,
     ) -> Optional[bytes]:
         """
         Try downloading a segment with specific headers.
@@ -998,6 +1400,11 @@ class SegmentDownloader:
             pressure. Let the outer retry+backoff in download_segment
             handle recovery.
         """
+        owns_memory_lease = memory_lease is None
+        if memory_lease is None:
+            memory_lease = _BufferLease(_segment_buffer_budget)
+        keep_memory_reservation = False
+
         # Resolve hostname once for both throttle and adaptive-delay bookkeeping.
         host = urlparse(url).hostname or ""
 
@@ -1013,9 +1420,11 @@ class SegmentDownloader:
         # "always send these headers for this host" via HOST_HEADERS_FILE,
         # we honor that across all referer-strategy probes (e.g. forcing
         # a specific Authorization token even when mobile_ua probe runs).
-        host_overrides = get_host_headers_for(host)
-        if host_overrides:
-            headers = {**headers, **host_overrides}
+        # ``download_segment`` already scoped captured headers before adding
+        # generated Referer/Origin strategies. Keep that distinction intact:
+        # the per-hop callback may preserve a generated final-manifest Referer
+        # for its CDN while still stripping captured secrets on foreign hosts.
+        headers = dict(headers or {})
         headers = self._headers_for_byte_range(headers, byte_range)
 
         # Adaptive inter-segment pacing. acquire_pace_slot() atomically
@@ -1051,12 +1460,7 @@ class SegmentDownloader:
                 logger.debug(f"Segment {index} pacing-sleep cancelled by stop event")
                 return None
 
-        # Acquire a per-host slot if cross-process throttle is enabled. Held
-        # for the entire request (including response.content read) — we don't
-        # release mid-transfer because a partial download still occupies a
-        # connection slot at the CDN. Released in the outer finally below.
-        throttle = _host_throttle.get() if _host_throttle is not None else None
-        slot_acquired = throttle.acquire(url) if throttle is not None else False
+        response = None
         try:
             try:
                 response = guarded_get(
@@ -1064,7 +1468,9 @@ class SegmentDownloader:
                     url,
                     headers=headers,
                     timeout=self.timeout,
-                    stream=bool(byte_range)
+                    stream=True,
+                    request_slot=self._host_request_slot,
+                    headers_for_url=self._headers_for_redirect_hop,
                 )
 
                 # Log response cookies for debugging
@@ -1077,24 +1483,115 @@ class SegmentDownloader:
                     logger.debug(f"Segment {index} got 474 error with current headers")
                     return None
                 if byte_range and response.status_code != 206:
-                    logger.debug(
-                        f"Segment {index} byte-range request was not honored "
-                        f"(HTTP {response.status_code})"
-                    )
+                    # Auth/block responses may still be recoverable with a
+                    # different Referer. A successful non-206 response is a
+                    # deterministic protocol violation: never read a full body
+                    # or replay it through every strategy/retry.
+                    if response.status_code == 416 or (
+                        200 <= response.status_code < 400
+                    ):
+                        raise NonRetryableSegmentResourceError(
+                            f"Segment {index} byte-range request not honored "
+                            f"(HTTP {response.status_code})"
+                        )
+
+                if byte_range and response.status_code == 206:
                     try:
-                        response.close()
-                    except Exception:
-                        pass
-                    return None
+                        _validate_single_byte_content_range(
+                            response.headers,
+                            expected_offset=int(byte_range["offset"]),
+                            expected_length=int(byte_range["length"]),
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise NonRetryableSegmentResourceError(
+                            f"Segment {index} byte-range response invalid: {exc}"
+                        ) from exc
 
                 response.raise_for_status()
-                content = response.content
-                if byte_range and len(content) != int(byte_range["length"]):
-                    logger.debug(
-                        f"Segment {index} byte-range length mismatch: "
-                        f"got {len(content)}, expected {byte_range['length']}"
+                expected_range_length = (
+                    int(byte_range["length"]) if byte_range else None
+                )
+                body_limit = (
+                    expected_range_length
+                    if expected_range_length is not None
+                    else MAX_SEGMENT_RESPONSE_BYTES
+                )
+                if body_limit > MAX_SEGMENT_RESPONSE_BYTES:
+                    raise NonRetryableSegmentResourceError(
+                        f"Segment {index} declared size {body_limit} exceeds "
+                        f"MAX_SEGMENT_RESPONSE_BYTES={MAX_SEGMENT_RESPONSE_BYTES}"
                     )
-                    return None
+                try:
+                    declared_length = int(
+                        response.headers.get("Content-Length", "")
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    declared_length = None
+                if declared_length is not None and (
+                    declared_length < 0 or declared_length > body_limit
+                ):
+                    raise NonRetryableSegmentResourceError(
+                        f"Segment {index} Content-Length {declared_length} "
+                        f"exceeds expected limit {body_limit}"
+                    )
+                content_encoding = ""
+                try:
+                    content_encoding = str(
+                        response.headers.get("Content-Encoding", "") or ""
+                    ).strip().lower()
+                except (AttributeError, TypeError):
+                    content_encoding = ""
+                expected_body_length = expected_range_length
+                # For identity/unencoded media, Content-Length is an exact
+                # reservation and stream bound. Encoded bodies may expand
+                # during iter_content(), so reserve the configured worst case.
+                if (
+                    expected_body_length is None
+                    and declared_length is not None
+                    and declared_length > 0
+                    and content_encoding in ("", "identity")
+                ):
+                    expected_body_length = declared_length
+                    body_limit = declared_length
+                if (
+                    expected_body_length is not None
+                    and declared_length is not None
+                    and content_encoding in ("", "identity")
+                    and declared_length != expected_body_length
+                ):
+                    raise NonRetryableSegmentResourceError(
+                        f"Segment {index} byte-range Content-Length mismatch: "
+                        f"got {declared_length}, expected {expected_body_length}"
+                    )
+
+                try:
+                    memory_lease.reserve(body_limit, self._stop_event)
+                except ValueError as exc:
+                    raise NonRetryableSegmentResourceError(str(exc)) from exc
+
+                content = bytearray()
+                iterator = getattr(response, "iter_content", None)
+                if not callable(iterator):
+                    raise NonRetryableSegmentResourceError(
+                        f"Segment {index} streaming response has no iter_content"
+                    )
+                for chunk in iterator(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    if len(content) + len(chunk) > body_limit:
+                        raise NonRetryableSegmentResourceError(
+                            f"Segment {index} response body exceeded "
+                            f"limit {body_limit} bytes"
+                        )
+                    content.extend(chunk)
+                if (
+                    expected_body_length is not None
+                    and len(content) != expected_body_length
+                ):
+                    raise NonRetryableSegmentResourceError(
+                        f"Segment {index} response length mismatch: "
+                        f"got {len(content)}, expected {expected_body_length}"
+                    )
 
                 # Early content-type based blocking detection
                 content_type = ""
@@ -1122,8 +1619,16 @@ class SegmentDownloader:
                 # decay the host delay back to 0 even though every
                 # segment is still failing). report_success is now called
                 # in download_segment AFTER validation + file write.
+                keep_memory_reservation = True
                 return content
 
+            except NonRetryableSegmentResourceError:
+                raise
+            except _HOST_THROTTLE_ERRORS:
+                # Capacity/cancellation is independent of Referer strategy.
+                # Replaying four alternate header sets would only wait through
+                # the same hard cap repeatedly (up to tens of minutes).
+                raise
             except _TRANSPORT_ERRORS:
                 # Network-layer failure (connect timeout, RST, partial-body
                 # timeout). Re-raise so caller skips remaining Referer
@@ -1151,8 +1656,13 @@ class SegmentDownloader:
                 logger.debug(f"Segment {index} download attempt failed (HTTP/app level): {e}")
                 return None
         finally:
-            if slot_acquired and throttle is not None:
-                throttle.release(url)
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            if owns_memory_lease or not keep_memory_reservation:
+                memory_lease.release()
     
     def download_segment(
         self, 
@@ -1177,6 +1687,7 @@ class SegmentDownloader:
         url = segment['url']
         index = segment['index']
         output_path = self.output_dir / f"segment_{index:05d}.ts"
+        memory_lease = _BufferLease(_segment_buffer_budget)
         
         try:
             logger.debug(f"Downloading segment {index}: {url}")
@@ -1192,15 +1703,22 @@ class SegmentDownloader:
             # If we already found a working strategy, use it directly
             if self.working_referer_strategy and retry_count == 0:
                 strategy = self.working_referer_strategy
-                headers = self.headers.copy()
+                headers = self._captured_headers_for_target(
+                    self.headers,
+                    url,
+                )
                 if strategy.get('Referer'):
-                    headers['Referer'] = strategy['Referer']
-                elif 'Referer' in headers and strategy.get('Referer') is None:
-                    del headers['Referer']
+                    _replace_header_ci(
+                        headers, 'Referer', strategy['Referer'],
+                    )
+                elif strategy.get('Referer') is None:
+                    _replace_header_ci(headers, 'Referer', None)
                 if strategy.get('Origin'):
-                    headers['Origin'] = strategy['Origin']
-                elif 'Origin' in headers and strategy.get('Origin') is None:
-                    del headers['Origin']
+                    _replace_header_ci(
+                        headers, 'Origin', strategy['Origin'],
+                    )
+                elif strategy.get('Origin') is None:
+                    _replace_header_ci(headers, 'Origin', None)
                 # User-Agent override (v2.3.16 mobile_ua strategy support).
                 # Strategies that don't set this inherit self.headers['User-Agent'].
                 if strategy.get('User-Agent'):
@@ -1213,7 +1731,11 @@ class SegmentDownloader:
                 # not the Referer wrong — and the exception propagates to the
                 # outer retry+backoff without invalidating the cache.
                 content = self._try_download_with_headers(
-                    url, headers, index, byte_range=segment.get("byte_range")
+                    url,
+                    headers,
+                    index,
+                    byte_range=segment.get("byte_range"),
+                    memory_lease=memory_lease,
                 )
                 if content:
                     used_strategy = strategy['name']
@@ -1238,18 +1760,25 @@ class SegmentDownloader:
                         logger.debug(f"Segment {index} aborted during strategy attempts - stop requested")
                         return None
                     
-                    headers = self.headers.copy()
+                    headers = self._captured_headers_for_target(
+                        self.headers,
+                        url,
+                    )
                     
                     # Apply strategy headers
                     if strategy.get('Referer'):
-                        headers['Referer'] = strategy['Referer']
-                    elif 'Referer' in headers and strategy.get('Referer') is None:
-                        del headers['Referer']
+                        _replace_header_ci(
+                            headers, 'Referer', strategy['Referer'],
+                        )
+                    elif strategy.get('Referer') is None:
+                        _replace_header_ci(headers, 'Referer', None)
 
                     if strategy.get('Origin'):
-                        headers['Origin'] = strategy['Origin']
-                    elif 'Origin' in headers and strategy.get('Origin') is None:
-                        del headers['Origin']
+                        _replace_header_ci(
+                            headers, 'Origin', strategy['Origin'],
+                        )
+                    elif strategy.get('Origin') is None:
+                        _replace_header_ci(headers, 'Origin', None)
 
                     # User-Agent override (v2.3.16 mobile_ua strategy support).
                     # Strategies that don't set this inherit self.headers['User-Agent'].
@@ -1260,7 +1789,11 @@ class SegmentDownloader:
                         logger.info(f"Trying strategy: {strategy['name']}")
                     
                     content = self._try_download_with_headers(
-                        url, headers, index, byte_range=segment.get("byte_range")
+                        url,
+                        headers,
+                        index,
+                        byte_range=segment.get("byte_range"),
+                        memory_lease=memory_lease,
                     )
                     
                     if content:
@@ -1353,7 +1886,33 @@ class SegmentDownloader:
         
         except Exception as e:
             err_str = str(e)
+            # Do not hold retained-body budget during retry backoff or while a
+            # recursive retry waits for a fresh reservation.
+            memory_lease.release()
             logger.warning(f"Failed to download segment {index} (attempt {retry_count + 1}): {err_str}")
+
+            if isinstance(e, NonRetryableKeyResourceError):
+                raise
+
+            if isinstance(e, NonRetryableSegmentResourceError):
+                if self.require_all:
+                    raise
+                self.failed_segments.append({
+                    'segment': segment,
+                    'error': err_str,
+                })
+                return None
+
+            if isinstance(e, _HOST_THROTTLE_ERRORS):
+                # The configured host cap is independent of headers and the
+                # slot wait already consumed its full deadline. Do not repeat
+                # every Referer strategy or recursive segment retry; record one
+                # failure and let the worker-level job retry policy decide.
+                self.failed_segments.append({
+                    'segment': segment,
+                    'error': err_str,
+                })
+                return None
 
             # Check if stop was requested before retrying
             if self._stop_event.is_set():
@@ -1383,6 +1942,8 @@ class SegmentDownloader:
                 logger.error(f"Segment {index} failed after {self.max_retries} attempts")
                 self.failed_segments.append({'segment': segment, 'error': err_str})
                 return None
+        finally:
+            memory_lease.release()
     
     def download_all(
         self, 
@@ -1404,38 +1965,85 @@ class SegmentDownloader:
         # remain finished — only None slots get re-attempted).
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit all download tasks
-                future_to_segment = {
-                    executor.submit(self.download_segment, segment): segment
-                    for segment in self.segments
-                }
+                # Keep only a small window in the executor. Submitting a 100k
+                # segment MPD up front retains ~100k Future/work-item objects
+                # (hundreds of MiB) before the first byte is downloaded.
+                segment_iter = iter(self.segments)
+                max_in_flight = max(1, self.max_workers * 2)
+                future_to_segment = {}
+
+                def fill_window() -> None:
+                    while (
+                        len(future_to_segment) < max_in_flight
+                        and not self._stop_event.is_set()
+                    ):
+                        try:
+                            segment = next(segment_iter)
+                        except StopIteration:
+                            break
+                        future = executor.submit(self.download_segment, segment)
+                        future_to_segment[future] = segment
+
+                fill_window()
 
                 # Process completed downloads
                 try:
-                    for future in as_completed(future_to_segment):
+                    while future_to_segment:
+                        done, _pending = wait(
+                            tuple(future_to_segment),
+                            return_when=FIRST_COMPLETED,
+                        )
+                        stop_requested = False
+                        for future in done:
+                            segment = future_to_segment.pop(future)
                         # Check if stop was requested before processing more results
-                        if self._stop_event.is_set():
-                            logger.info("Stop event detected in download_all, aborting...")
-                            for f in future_to_segment:
-                                f.cancel()
+                            if self._stop_event.is_set():
+                                stop_requested = True
+                                continue
+
+                            index = segment['index']
+
+                            file_path = None
+                            fatal_error = None
+                            try:
+                                file_path = future.result()
+                                if file_path:
+                                    self._partial_files[index] = file_path
+                                    self.downloaded_count += 1
+
+                            except NonRetryableSegmentResourceError as e:
+                                fatal_error = e
+                            except Exception as e:
+                                logger.error(f"Unexpected error downloading segment {index}: {e}")
+                                self.failed_segments.append({'segment': segment, 'error': str(e)})
+
+                            # Callback exceptions intentionally propagate: the
+                            # worker uses this as its fail-fast/cancel signal.
+                            if progress_callback:
+                                progress_callback(
+                                    self.downloaded_count, self.total_segments,
+                                )
+
+                            if fatal_error is not None:
+                                raise fatal_error
+                            if self.require_all and not file_path:
+                                detail = (
+                                    self.failed_segments[-1].get('error')
+                                    if self.failed_segments else
+                                    "segment returned no output"
+                                )
+                                raise RequiredSegmentFailed(
+                                    f"Required segment {index} failed: {detail}"
+                                )
+
+                        if stop_requested or self._stop_event.is_set():
+                            logger.info(
+                                "Stop event detected in download_all, aborting..."
+                            )
+                            for pending_future in future_to_segment:
+                                pending_future.cancel()
                             break
-
-                        segment = future_to_segment[future]
-                        index = segment['index']
-
-                        try:
-                            file_path = future.result()
-                            if file_path:
-                                self._partial_files[index] = file_path
-                                self.downloaded_count += 1
-
-                        except Exception as e:
-                            logger.error(f"Unexpected error downloading segment {index}: {e}")
-                            self.failed_segments.append({'segment': segment, 'error': str(e)})
-
-                        # Call progress callback (outside try-except so callback exceptions propagate)
-                        if progress_callback:
-                            progress_callback(self.downloaded_count, self.total_segments)
+                        fill_window()
 
                 except Exception as e:
                     # Callback raised an exception (e.g., job cancelled or too many errors)

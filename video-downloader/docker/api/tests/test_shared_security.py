@@ -1,4 +1,5 @@
 import ipaddress
+from contextlib import contextmanager
 
 import pytest
 
@@ -90,6 +91,130 @@ def test_guarded_get_follows_public_redirect(monkeypatch):
     assert [c[0] for c in sess.calls] == ["https://cdn1.example/a", "https://cdn2.example/b"]
     # Manual following: native redirects disabled on each hop.
     assert sess.calls[0][1]["allow_redirects"] is False
+
+
+def test_guarded_get_throttles_each_redirect_host_and_holds_stream(monkeypatch):
+    monkeypatch.delenv("SSRF_GUARD", raising=False)
+    import shared.security as sec
+
+    events = []
+
+    class _EventResponse(_StubResponse):
+        def __init__(self, url, status_code=200, location=None):
+            super().__init__(status_code, location)
+            self.url = url
+
+        def close(self):
+            events.append(("close", self.url))
+            super().close()
+
+    class _EventSession(_StubSession):
+        def get(self, url, **kwargs):
+            events.append(("get", url))
+            return super().get(url, **kwargs)
+
+    @contextmanager
+    def request_slot(url):
+        events.append(("acquire", url))
+        try:
+            yield
+        finally:
+            events.append(("release", url))
+
+    first = "https://redirector.example/a"
+    final_url = "https://cdn.example/media"
+    redirect = _EventResponse(first, 302, location=final_url)
+    final = _EventResponse(final_url)
+    session = _EventSession({first: redirect, final_url: final})
+
+    out = sec.guarded_get(
+        session,
+        first,
+        stream=True,
+        request_slot=request_slot,
+    )
+
+    assert events == [
+        ("acquire", first),
+        ("get", first),
+        ("close", first),
+        ("release", first),
+        ("acquire", final_url),
+        ("get", final_url),
+    ]
+    # The real CDN's slot remains held for the streamed body, then releases
+    # exactly once even if callers defensively close twice.
+    out.close()
+    out.close()
+    assert events[-3:] == [
+        ("close", final_url),
+        ("release", final_url),
+        ("close", final_url),
+    ]
+
+
+def test_scoped_captured_headers_strip_credentials_from_foreign_origin():
+    import shared.security as sec
+
+    captured = {
+        "Cookie": "sid=secret",
+        "Authorization": "Bearer secret",
+        "X-Playback-Token": "secret",
+        "Referer": "https://trusted.example/watch?token=secret",
+        "Origin": "https://trusted.example",
+        "User-Agent": "browser",
+        "Accept": "*/*",
+        "Range": "bytes=0-15",
+    }
+
+    foreign = sec.scoped_captured_headers(
+        captured,
+        "https://attacker.example/collect",
+        "https://trusted.example/manifest.mpd",
+    )
+    assert foreign == {
+        "User-Agent": "browser",
+        "Accept": "*/*",
+        "Range": "bytes=0-15",
+    }
+    child = sec.scoped_captured_headers(
+        captured,
+        "https://cdn.trusted.example/segment.m4s",
+        "https://trusted.example/manifest.mpd",
+    )
+    assert child == captured
+
+
+def test_guarded_get_rescopes_headers_on_cross_origin_redirect(monkeypatch):
+    monkeypatch.delenv("SSRF_GUARD", raising=False)
+    import shared.security as sec
+
+    first = "https://trusted.example/manifest.mpd"
+    final_url = "https://attacker.example/collect"
+    redirect = _StubResponse(302, location=final_url)
+    final = _StubResponse(200)
+    session = _StubSession({first: redirect, final_url: final})
+    captured = {
+        "Cookie": "sid=secret",
+        "Authorization": "Bearer secret",
+        "X-Token": "secret",
+        "User-Agent": "browser",
+    }
+
+    out = sec.guarded_get(
+        session,
+        first,
+        headers=captured,
+        headers_for_url=lambda target, headers: sec.scoped_captured_headers(
+            headers,
+            target,
+            first,
+        ),
+    )
+
+    assert out is final
+    assert session.calls[0][1]["headers"] == captured
+    assert session.calls[1][1]["headers"] == {"User-Agent": "browser"}
 
 
 def test_shared_security_public_ip_policy_matches_api_and_worker_ssrf_guard():

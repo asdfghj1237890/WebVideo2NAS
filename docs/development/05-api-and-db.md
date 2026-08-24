@@ -218,11 +218,12 @@ GROUP BY status;
 
 兩軌的 `url` 與正整數 `content_length` 必填。API 在 materialize plan 之前先拒絕：
 
-- video + audio 總長超過 `MAX_JOB_STAGING_BYTES`（預設 50 GiB）
+- video + audio 總長已超過 `MAX_JOB_STAGING_BYTES`（預設 50 GiB）
 - 預估 Range chunk 數超過 `MAX_BROWSER_SEGMENTS`（預設 100,000）
+- 依 URL 長度與 Range 數保守估出的 JSON 超過 `MAX_BROWSER_PLAN_BYTES`（預設 32 MiB）
 - 任一 URL 未通過 always-on browser plan URL safety
 
-Planner 以 `min(8 MiB, MAX_SEGMENT_BYTES)` 切出連續、無缺口的 byte ranges，回傳標記 `direct_range_concat=true` 的標準兩軌 DASH plan。Extension 仍走既有 segment PUT；API 會在每次 PUT 發布前核對實收 bytes 與 plan 的 `byte_range.length`，finalize 再逐檔核對一次。Worker 依 seq 重建每條完整軌道後 mux，並套用與 NAS-direct 相同的 duration shortfall / `suspect_reason` 判定。
+Planner 以 `min(8 MiB, MAX_SEGMENT_BYTES)` 切出連續、無缺口的 byte ranges，回傳標記 `direct_range_concat=true` 的標準兩軌 DASH plan。序列化後還會做 exact plan-size check，且 media bytes + `manifest.json` 必須一併落在 staging quota 內。HLS 在 `m3u8.loads` 前先限制 URI／segment／variant，且 URI 對應的 Segment/Playlist objects 會和 KEY、MAP、PART、MEDIA、DATERANGE 等 auxiliary parser objects 共用同一總上限；DASH 則在 segment materialization 前限制兩軌合計數。Direct plan 的 `recommended_concurrency` 最多 12，且不超過 `MAX_CONCURRENT_UPLOADS_PER_JOB` 與 staging quota 可容納的最大 Range 數；一般 manifest plan 也回傳最多 6 的 server-safe recommendation，extension 對兩者都會下修；舊 API 未提供 recommendation 時 direct DASH 保守維持 legacy 6。Extension 仍走既有 segment PUT；API 以單一 Redis token lease 原子保存每個請求的到期時間與實際 in-flight reservation，不再把每個 8 MiB range 一律當作 500 MiB。publish 後由 Lua 原子把 reservation 轉入 staged counter；計帳不確定時改用 dirty scan 或不占 active slot 的 byte-only retained lease，publish→commit 間則以 hard-link source 或 token-owned generation marker 避免 physical final 與 positive reservation 被重複計量。Init BYTERANGE 同樣使用 plan 長度作 reservation、stream hard cap 與 finalize equality check。無 hard-link 的 NAS 以 advisory lock 序列化 rename，不支援 advisory lock 時退回有 TTL、compare-owner release 的 Redis lock，並由獨立 heartbeat 在 NAS syscall 阻塞時續租。每個 request body 同時受 `UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS` idle deadline 與 `UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS` 接收 deadline 約束；後者包含 Redis/DB lease housekeeping，但不宣稱中止已進入 kernel 的 NAS write/fsync。活躍 stream 按 `UPLOAD_COORDINATION_REFRESH_SECONDS` 節流刷新 token lease。Worker 依 seq 重建每條完整軌道後 mux，並套用與 NAS-direct 相同的 duration shortfall / `suspect_reason` 判定；NAS-direct worker 對 resource cap、未知 segment count 與 zero-track 類的 `MPDFallbackUnsafeError` 永遠 fail-closed，不會再由 ffmpeg fallback 繞過。
 
 ## 5. GET /api/jobs（list）— sidepanel 主要呼叫
 

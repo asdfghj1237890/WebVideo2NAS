@@ -9,11 +9,14 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
+import asyncio
 import errno
 import hmac
 import os
 import re
+import stat
 import logging
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +38,9 @@ from shared.security import resolve_host_ips as _shared_resolve_host_ips
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/m3u8_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+REDIS_SOCKET_TIMEOUT_SECONDS = max(
+    0.1, float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "5"))
+)
 API_KEY = os.getenv("API_KEY")
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "0") or "0")
 ALLOWED_CLIENT_CIDRS_RAW = os.getenv("ALLOWED_CLIENT_CIDRS", "").strip()
@@ -53,16 +59,61 @@ MAX_SEGMENT_BYTES = int(os.getenv("MAX_SEGMENT_BYTES", str(500 * 1024 * 1024)))
 # Per-job staging total. 50 GB caps the cumulative bytes a single browser
 # job can park on the NAS before /finalize runs.
 MAX_JOB_STAGING_BYTES = int(os.getenv("MAX_JOB_STAGING_BYTES", str(50 * 1024 * 1024 * 1024)))
+# Persisted browser plans also occupy staging space. Bound their serialized
+# size separately so a tiny DASH chunk cap cannot materialize a huge JSON plan
+# even when the media bytes themselves fit the per-job quota.
+MAX_BROWSER_PLAN_BYTES = int(os.getenv("MAX_BROWSER_PLAN_BYTES", str(32 * 1024 * 1024)))
 # Codex review #9: hard cap on simultaneously-streaming uploads per job.
-# segmentDownloader.js runs at concurrency=6; cap at 12 leaves slack for
-# transient retries. Combined with the reserved-bytes quota
-# (slot_count * MAX_SEGMENT_BYTES counted against MAX_JOB_STAGING_BYTES),
-# this bounds worst-case in-flight bytes per job and keeps a malicious
-# client from filling the disk via concurrent PUT streams.
+# The API advertises a direct-DASH recommendation no higher than this cap.
+# Upload slots and the exact in-flight byte reservation below jointly bound
+# per-job concurrency and disk exposure.
 MAX_CONCURRENT_UPLOADS_PER_JOB = int(os.getenv("MAX_CONCURRENT_UPLOADS_PER_JOB", "12"))
-# TTL for the per-job upload-slot counter; outlives the longest plausible
-# segment upload so a crash mid-PUT eventually self-clears.
-_UPLOAD_SLOT_KEY_TTL_SECONDS = 3600
+# Extension-side direct-DASH ceiling. Kept server-side too so an older/newer
+# client cannot make the advertised recommendation exceed the reviewed limit.
+DIRECT_DASH_CLIENT_MAX_CONCURRENCY = 12
+MANIFEST_CLIENT_DEFAULT_CONCURRENCY = 6
+# Abort a request body that stops producing bytes. Active long uploads refresh
+# their Redis coordination TTL on every chunk; an idle upload cannot outlive
+# the counters and silently release its slot/reservation underneath itself.
+UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS = max(
+    1, int(os.getenv("UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS", "300"))
+)
+# An idle timeout alone still permits a slow-drip client to keep one upload
+# slot forever by sending a byte just before every idle deadline. Bound body
+# reception + its lease housekeeping as well; this deliberately does not claim
+# to interrupt an already-running kernel/NAS write or fsync. Thirty minutes
+# still permits a 500 MiB cap to arrive at roughly 0.28 MiB/s.
+UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS = max(
+    UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS,
+    int(os.getenv("UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS", "1800")),
+)
+UPLOAD_COORDINATION_REFRESH_SECONDS = max(
+    1, int(os.getenv("UPLOAD_COORDINATION_REFRESH_SECONDS", "30"))
+)
+# Keep the database activity lease alive for a legitimately long request body.
+# This is intentionally less frequent than Redis heartbeats to avoid a commit
+# per chunk while remaining far below the stale-browser reaper's hour scale.
+UPLOAD_DB_LEASE_REFRESH_SECONDS = 300
+_UPLOAD_SLOT_KEY_TTL_SECONDS = max(
+    3600,
+    UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS + 60,
+    UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS + 60,
+    UPLOAD_COORDINATION_REFRESH_SECONDS + 60,
+)
+_STAGED_BYTES_CACHE_TTL_SECONDS = max(60, _UPLOAD_SLOT_KEY_TTL_SECONDS // 2)
+# Dirty mode deliberately heals after a bounded interval. The staged counter
+# is deleted marker-first, so expiry makes the next reader seed from disk;
+# refreshing this marker on every PUT would otherwise turn one transient
+# Redis fault into permanent O(N)-per-segment scans.
+_STAGED_BYTES_DIRTY_TTL_SECONDS = max(
+    60, min(300, _STAGED_BYTES_CACHE_TTL_SECONDS)
+)
+# Redis is only the fallback on NAS filesystems without advisory locking.
+# Keep its owner lease alive independently of the async request thread because
+# a blocking NAS rename/fsync can stall that thread for an unbounded interval.
+_PUBLISH_LOCK_REFRESH_INTERVAL_SECONDS = max(
+    1, min(30, _UPLOAD_SLOT_KEY_TTL_SECONDS // 3)
+)
 
 # Backward-compatible default: allow all origins unless explicitly restricted.
 _allowed_origins_raw = os.getenv("ALLOWED_ORIGINS", "*").strip()
@@ -168,7 +219,12 @@ def _ensure_schema() -> None:
         logger.warning(f"Schema migration skipped: {e}")
 
 # Redis setup
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+redis_client = redis.from_url(
+    REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+    socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+)
 
 # Security helpers
 def _get_client_ip(request: Request) -> str:
@@ -215,12 +271,11 @@ def _enforce_client_allowlist(request: Request) -> None:
 
 
 # Codex review #7: 'upload' bucket for browser-side segment PUTs. Each
-# segment is its own request (concurrency 6 per job), so an HLS playlist
-# with even modest length would self-throttle a deployment that set
+# segment is its own request (concurrency 6 for manifests, 12 for direct
+# DASH), so even a modest job would self-throttle a deployment that set
 # RATE_LIMIT_PER_MINUTE for legitimate /api/download protection. The
-# 100x multiplier sustains ~16N concurrent browser jobs at any given
-# RATE_LIMIT_PER_MINUTE=N setting (each job runs at most 6 concurrent
-# PUTs; the bucket easily absorbs that without bottlenecking).
+# 100x multiplier absorbs the extension's maximum per-job PUT burst
+# without bottlenecking normal browser-side downloads.
 _RATE_LIMIT_MULTIPLIERS = {"read": 6, "write": 1, "upload": 100}
 
 def _rate_limit(request: Request, bucket: str) -> None:
@@ -229,7 +284,8 @@ def _rate_limit(request: Request, bucket: str) -> None:
     multiplier = _RATE_LIMIT_MULTIPLIERS.get(bucket, 1)
     limit = RATE_LIMIT_PER_MINUTE * multiplier
     client_ip = _get_client_ip(request)
-    window = int(time.time() // 60)
+    now = time.time()
+    window = int(now // 60)
     key = f"rl:{bucket}:{client_ip}:{window}"
     try:
         count = redis_client.incr(key)
@@ -243,6 +299,7 @@ def _rate_limit(request: Request, bucket: str) -> None:
         # no idea the API was rejecting them, let alone how to fix it.
         raise HTTPException(
             status_code=429,
+            headers={"Retry-After": str(max(1, 60 - int(now % 60)))},
             detail=(
                 f"Rate limit exceeded ({bucket}: {limit} requests/min). "
                 f"Raise RATE_LIMIT_PER_MINUTE in .env (currently {RATE_LIMIT_PER_MINUTE}) "
@@ -402,7 +459,8 @@ def verify_api_key_upload(request: Request, authorization: Optional[str] = Heade
     """Verify API key — segment-upload rate limit (100x write limit).
 
     Codex review #7: browser-side downloads issue one PUT per segment
-    at concurrency 6 from segmentDownloader.js. A 200-segment job
+    at concurrency 6 (manifest) or 12 (direct DASH) from
+    segmentDownloader.js. A 200-segment job
     under RATE_LIMIT_PER_MINUTE=100 would hit the write bucket's cap
     after 100 PUTs and self-fail (the extension treats 429 as segment
     failure and aborts the whole browser job). Routing segment +
@@ -664,13 +722,13 @@ async def delete_job(
         # All four states' winning CAS guarantees we own the staging
         # dir — nothing else writes to it after the status flip succeeds.
         pending_cas = db.execute(text("""
-            UPDATE jobs SET status = 'cancelled'
+            UPDATE jobs SET status = 'cancelled', completed_at = :now
             WHERE id = :job_id
               AND status IN (
                   'pending', 'browser_pending',
                   'browser_uploading', 'browser_finalizing'
               )
-        """), {"job_id": job_id})
+        """), {"job_id": job_id, "now": _utcnow_naive()})
         db.commit()
 
         if pending_cas.rowcount == 1:
@@ -694,6 +752,7 @@ async def delete_job(
                 # path. Containment alone could delete another job's staging
                 # dir if job_metadata.staging_dir was poisoned.
                 sd = meta.staging_dir or ""
+                staging_cleaned = False
                 if sd:
                     import shutil
                     staging_path = _metadata_staging_path_for_job(
@@ -706,11 +765,17 @@ async def delete_job(
                                 logger.info(
                                     f"Cancel {job_id}: cleaned staging {sd}"
                                 )
+                            staging_cleaned = not staging_path.exists()
                         except Exception as e:
                             logger.warning(
                                 f"Cancel {job_id}: rmtree {sd!r} failed: {e}"
                             )
-                _staged_bytes_clear(job_id)
+                # Preserve accounting when an in-flight upload/NAS handle
+                # makes rmtree fail. The worker's periodic terminal-row sweep
+                # will retry the job-bound cleanup; clearing this counter now
+                # would hide the leaked bytes before that recovery pass.
+                if staging_cleaned:
+                    _staged_bytes_clear(job_id)
             logger.info(f"Job {job_id} cancelled")
             return {"message": "Job cancelled successfully"}
 
@@ -720,9 +785,9 @@ async def delete_job(
         # next status update and exit cleanly (or finish and overwrite
         # the cancelled flag, which mirrors pre-existing behavior).
         result = db.execute(text("""
-            UPDATE jobs SET status = 'cancelled'
+            UPDATE jobs SET status = 'cancelled', completed_at = :now
             WHERE id = :job_id AND status IN ('downloading', 'processing')
-        """), {"job_id": job_id})
+        """), {"job_id": job_id, "now": _utcnow_naive()})
         db.commit()
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Job not found or cannot be cancelled")
@@ -931,14 +996,17 @@ def _enforce_plan_url_safety(plan: Dict) -> None:
     )
 
 
-def _planned_segment_lengths(track_data: Dict) -> Dict[int, int]:
-    """Return declared byte-range lengths keyed by sequence number.
+def _planned_segment_length_bounds(
+    track_data: Dict,
+) -> Dict[int, tuple[int, int]]:
+    """Return inclusive plaintext upload bounds keyed by sequence number.
 
-    HLS byte-range and manifest-less DASH plans both carry an exact length
-    for each segment. Treat malformed/missing entries as unspecified so
-    ordinary non-range HLS keeps its existing behavior.
+    Unencrypted HLS ranges and direct DASH ranges are exact.  AES-128 HLS
+    ranges describe ciphertext; WebCrypto AES-CBC removes 1..16 bytes of
+    PKCS#7 padding, so an aligned N-byte ciphertext can only upload N-16
+    through N-1 plaintext bytes (with zero still rejected by the endpoint).
     """
-    lengths: Dict[int, int] = {}
+    bounds: Dict[int, tuple[int, int]] = {}
     try:
         for index, segment in enumerate(track_data.get("segments") or []):
             if not isinstance(segment, dict):
@@ -948,28 +1016,125 @@ def _planned_segment_lengths(track_data: Dict) -> Dict[int, int]:
                 continue
             seq = int(segment.get("seq", index))
             length = int(byte_range.get("length"))
-            if seq >= 0 and length > 0:
-                lengths[seq] = length
+            key = segment.get("key")
+            method = (
+                str(key.get("method") or "").upper()
+                if isinstance(key, dict)
+                else ""
+            )
+            if seq < 0 or length <= 0:
+                continue
+            if method == "AES-128":
+                # Planner rejects non-aligned AES-CBC ranges. If a staged plan
+                # was manually corrupted, omit the unusable bound rather than
+                # inventing an interval that could bless invalid plaintext.
+                if length < 16 or length % 16 != 0:
+                    continue
+                bounds[seq] = (max(1, length - 16), length - 1)
+            elif method in ("", "NONE"):
+                bounds[seq] = (length, length)
     except (TypeError, ValueError):
         return {}
+    return bounds
+
+
+def _planned_segment_lengths(
+    track_data: Dict, *, exact_only: bool = False,
+) -> Dict[int, int]:
+    """Return plaintext upper bounds (or only exact lengths) by sequence."""
+    lengths: Dict[int, int] = {}
+    for seq, (lower, upper) in _planned_segment_length_bounds(track_data).items():
+        if exact_only and lower != upper:
+            continue
+        lengths[seq] = upper
     return lengths
+
+
+def _recommended_direct_dash_concurrency(plan: Dict) -> int:
+    """Return a positive, server-safe client concurrency for direct DASH.
+
+    The client has its own ceiling, but the API must also respect deployments
+    that lower the per-job upload cap. The quota-derived bound uses the
+    largest *actual planned range*, not ``MAX_SEGMENT_BYTES`` (500 MiB by
+    default), because direct-DASH plans split complete tracks into bounded
+    ranges whose exact lengths are known.
+    """
+    server_cap = min(
+        DIRECT_DASH_CLIENT_MAX_CONCURRENCY,
+        MAX_CONCURRENT_UPLOADS_PER_JOB,
+    )
+    if server_cap <= 0:
+        raise ValueError("MAX_CONCURRENT_UPLOADS_PER_JOB must be positive")
+
+    range_lengths: List[int] = []
+    for track_data in (plan.get("tracks") or {}).values():
+        lengths = _planned_segment_lengths(track_data)
+        range_lengths.extend(lengths.values())
+    if not range_lengths:
+        raise ValueError("Direct DASH plan has no declared byte-range lengths")
+
+    largest_range = max(range_lengths)
+    quota_cap = MAX_JOB_STAGING_BYTES // largest_range
+    if quota_cap <= 0:
+        raise ValueError(
+            "MAX_JOB_STAGING_BYTES cannot hold the largest direct-DASH range"
+        )
+    return int(min(server_cap, quota_cap))
+
+
+def _recommended_manifest_concurrency() -> int:
+    """Advertise the server cap to ordinary HLS/MPD clients as well."""
+    recommended = min(
+        MANIFEST_CLIENT_DEFAULT_CONCURRENCY,
+        MAX_CONCURRENT_UPLOADS_PER_JOB,
+    )
+    if recommended <= 0:
+        raise ValueError("MAX_CONCURRENT_UPLOADS_PER_JOB must be positive")
+    return int(recommended)
+
+
+def _estimated_direct_dash_plan_bytes(direct: Dict, chunk_bytes: int) -> int:
+    """No-false-positive pre-allocation lower bound for direct DASH.
+
+    Every range necessarily repeats its JSON-quoted track URL. Rejecting when
+    those strings alone exceed the cap prevents the long-URL/tiny-chunk OOM
+    case without treating an arbitrary cushion as exact (which used to reject
+    valid plans under small custom caps). Segment-count and final exact JSON
+    checks remain authoritative for all other structure.
+    """
+    estimated = 0
+    for name in ("video", "audio"):
+        track = direct[name]
+        content_length = int(track["content_length"])
+        segment_count = (content_length + chunk_bytes - 1) // chunk_bytes
+        quoted_url_bytes = len(
+            json.dumps(str(track["url"]), ensure_ascii=False).encode("utf-8")
+        )
+        estimated += segment_count * quoted_url_bytes
+    return estimated
 
 
 def _expected_segment_shape_for_track(
     staging_root: Path, track: str,
-) -> tuple[Optional[int], Dict[int, int]]:
-    """Read one track's count and exact byte-range lengths in one pass."""
+) -> tuple[Optional[int], Dict[int, int], Dict[int, int], set[int]]:
+    """Read one track's count and plaintext length bounds in one pass."""
     try:
         plan_path = staging_root / "manifest.json"
         if not plan_path.is_file():
-            return None, {}
+            return None, {}, {}, set()
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         track_data = (plan.get("tracks") or {}).get(track) or {}
         count = track_data.get("segment_count")
         expected_count = int(count) if count else None
-        return expected_count, _planned_segment_lengths(track_data)
+        bounds = _planned_segment_length_bounds(track_data)
+        lower_bounds = {seq: lower for seq, (lower, _upper) in bounds.items()}
+        upper_bounds = {seq: upper for seq, (_lower, upper) in bounds.items()}
+        exact_sequences = {
+            seq for seq, (lower, upper) in bounds.items() if lower == upper
+        }
+        return expected_count, lower_bounds, upper_bounds, exact_sequences
     except Exception:
-        return None, {}
+        return None, {}, {}, set()
 
 
 def _expected_segment_count_for_track(staging_root: Path, track: str) -> Optional[int]:
@@ -983,11 +1148,69 @@ def _expected_segment_count_for_track(staging_root: Path, track: str) -> Optiona
     Returns None when the plan is unreadable or has no entry for this
     track — caller falls back to the job-wide bound.
     """
-    count, _lengths = _expected_segment_shape_for_track(staging_root, track)
+    count, _lower, _upper, _exact = _expected_segment_shape_for_track(
+        staging_root, track,
+    )
     return count
 
 
-def _staging_total_bytes(staging_root: Path) -> int:
+def _expected_init_length_for_track(
+    staging_root: Path, track: str,
+) -> Optional[int]:
+    """Return an exact planned init BYTERANGE length when declared."""
+    try:
+        plan_path = staging_root / "manifest.json"
+        if not plan_path.is_file():
+            return None
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        track_data = (plan.get("tracks") or {}).get(track) or {}
+        byte_range = track_data.get("init_segment_byte_range")
+        if not isinstance(byte_range, dict):
+            return None
+        length = int(byte_range.get("length"))
+        return length if length > 0 else None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _declared_upload_length(request: Request) -> Optional[int]:
+    """Parse a trustworthy-by-enforcement HTTP Content-Length.
+
+    A client may lie, so stream writers also use this as an exact hard cap and
+    post-body equality check. When absent, callers retain their conservative
+    plan/MAX_SEGMENT_BYTES reservation.
+    """
+    headers = getattr(request, "headers", None)
+    raw = headers.get("content-length") if headers is not None else None
+    if raw is None:
+        return None
+    try:
+        value = int(str(raw), 10)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid Content-Length")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail="Content-Length must be positive")
+    if value > MAX_SEGMENT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Content-Length exceeds MAX_SEGMENT_BYTES={MAX_SEGMENT_BYTES}",
+        )
+    return value
+
+
+def _upload_body_limit(*candidates: Optional[int]) -> int:
+    limits = [MAX_SEGMENT_BYTES]
+    limits.extend(int(value) for value in candidates if value is not None)
+    return min(limits)
+
+
+class _StagingAccountingError(RuntimeError):
+    pass
+
+
+def _staging_total_bytes(
+    staging_root: Path, active_upload_tokens: Optional[set[str]] = None,
+) -> int:
     """Sum staged file sizes by walking the tree.
 
     Codex review (P2): the PUT quota gate previously called this on every
@@ -997,20 +1220,562 @@ def _staging_total_bytes(staging_root: Path) -> int:
     reads `_staged_bytes_get`'s O(1) redis counter; this function
     survives as the seed-on-miss / reconciliation walk.
     """
-    if not staging_root.exists():
+    try:
+        root_stat = staging_root.stat()
+    except FileNotFoundError:
         return 0
-    total = 0
-    for f in staging_root.rglob("*"):
-        if f.is_file():
+    except OSError as e:
+        raise _StagingAccountingError(
+            f"cannot inspect staging root {staging_root}: {e}"
+        ) from e
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise _StagingAccountingError(
+            f"staging root is not a real directory: {staging_root}"
+        )
+    active_tokens = active_upload_tokens or set()
+    # Collect metadata first, then total it.  A coordinated publisher can make
+    # the final path visible while its exact positive reservation is still in
+    # Redis.  The token-owned source part (hard-link path) or explicit
+    # ``.publish.<token>.part`` marker (rename fallback) identifies that final
+    # as the same reservation generation.  Discovering those guards before we
+    # add any final file makes the result independent of scandir order.
+    files: list[tuple[str, os.stat_result]] = []
+    active_publish_targets: set[str] = set()
+    active_hardlink_identities: set[tuple[int, int]] = set()
+    pending = [staging_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as e:
+            raise _StagingAccountingError(
+                f"cannot enumerate staging directory {directory}: {e}"
+            ) from e
+        for entry in entries:
             try:
-                total += f.stat().st_size
-            except OSError:
-                pass
+                if entry.is_symlink():
+                    raise _StagingAccountingError(
+                        f"unexpected symlink in staging tree: {entry.path}"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    # A publish lock contains no payload. Keep it out of the
+                    # byte total; finalize separately treats it as in-flight.
+                    if entry.name.endswith(".publish.lock"):
+                        continue
+                    pending.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    raise _StagingAccountingError(
+                        f"unexpected filesystem entry in staging tree: {entry.path}"
+                    )
+                if entry.name.endswith(".publish.lock"):
+                    continue
+                entry_stat = os.stat(entry.path, follow_symlinks=False)
+                identity = (int(entry_stat.st_dev), int(entry_stat.st_ino))
+                can_identify_hardlink = (
+                    int(getattr(entry_stat, "st_nlink", 1)) > 1
+                    and identity != (0, 0)
+                )
+                # Active attempt bytes are already covered by that token's
+                # full reservation. Orphan .part files have no live token and
+                # MUST count toward disk usage so repeated process crashes
+                # cannot bypass the per-job cap.
+                if entry.name.endswith(".part"):
+                    pieces = entry.name.rsplit(".", 2)
+                    token = pieces[-2] if len(pieces) == 3 else ""
+                    if token in active_tokens:
+                        final_target = _upload_final_target_for_part(
+                            Path(entry.path)
+                        )
+                        if final_target is not None:
+                            if ".bin.publish." in entry.name:
+                                # The rename fallback creates this marker while
+                                # holding the publish lock, before the rename.
+                                # Its presence proves that a visible final is
+                                # still represented by this positive lease.
+                                active_publish_targets.add(os.path.normcase(
+                                    os.path.abspath(str(final_target))
+                                ))
+                            elif can_identify_hardlink:
+                                # os.link() keeps the token-owned source until
+                                # accounting commits.  Exclude the matching
+                                # final inode as well as the reserved source.
+                                active_hardlink_identities.add(identity)
+                        continue
+                files.append((entry.path, entry_stat))
+            except _StagingAccountingError:
+                raise
+            except OSError as e:
+                # An authoritative reconciliation may fail closed, but never
+                # seed a long-lived undercount after a transient NAS stat error.
+                raise _StagingAccountingError(
+                    f"cannot inspect staging entry {entry.path}: {e}"
+                ) from e
+    total = 0
+    seen_files: set[tuple[int, int]] = set()
+    for entry_path, entry_stat in files:
+        identity = (int(entry_stat.st_dev), int(entry_stat.st_ino))
+        can_deduplicate = (
+            int(getattr(entry_stat, "st_nlink", 1)) > 1
+            and identity != (0, 0)
+        )
+        if os.path.normcase(os.path.abspath(entry_path)) in active_publish_targets:
+            continue
+        if can_deduplicate and identity in active_hardlink_identities:
+            continue
+        # On Windows, DirEntry.stat() can expose cached `(st_dev, st_ino) ==
+        # (0, 0)` for every file on some shares.  We used a fresh os.stat
+        # above and only deduplicate when the filesystem also reports multiple
+        # hard links and a meaningful identity.
+        if can_deduplicate:
+            if identity in seen_files:
+                continue
+            seen_files.add(identity)
+        total += entry_stat.st_size
     return total
 
 
 def _staged_bytes_key(job_id: str) -> str:
     return f"wv2nas:staged_bytes:{job_id}"
+
+
+def _staged_bytes_dirty_key(job_id: str) -> str:
+    return f"wv2nas:staged_bytes_dirty:{job_id}"
+
+
+_REDIS_GET_REFRESH_LUA = """
+-- wv2nas:get-refresh
+local value = redis.call('GET', KEYS[1])
+if not value then
+  return false
+end
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return value
+"""
+
+_REDIS_STAGED_RECORD_LUA = """
+-- wv2nas:staged-record-existing
+if redis.call('EXISTS', KEYS[2]) == 1 then return -1 end
+local current = redis.call('GET', KEYS[1])
+if not current or not tonumber(current) then
+  return false
+end
+local value = redis.call('INCRBY', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return value
+"""
+
+_REDIS_STAGED_COMMIT_UPLOAD_LUA = """
+-- wv2nas:staged-commit-upload-v1
+local function decode(value)
+  local sep = value and string.find(value, ':', 1, true)
+  if not sep then return nil, nil end
+  return tonumber(string.sub(value, 1, sep - 1)), tonumber(string.sub(value, sep + 1))
+end
+local function dirty()
+  redis.call('SET', KEYS[2], 1, 'EX', ARGV[4])
+  redis.call('DEL', KEYS[1])
+end
+local token = ARGV[1]
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  redis.call('HDEL', KEYS[3], token)
+  return -1
+end
+local lease = redis.call('HGET', KEYS[3], token)
+local _, reserved = decode(lease)
+local published = tonumber(ARGV[2])
+local current = redis.call('GET', KEYS[1])
+if not reserved or reserved <= 0 or not published or published <= 0
+   or published > reserved or not current or not tonumber(current) then
+  -- Missing/ambiguous coordination is safe only after forcing future quota
+  -- gates to reconcile the complete on-disk staging tree.
+  dirty()
+  redis.call('HDEL', KEYS[3], token)
+  return -2
+end
+local value = redis.call('INCRBY', KEYS[1], published)
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+redis.call('HDEL', KEYS[3], token)
+if redis.call('HLEN', KEYS[3]) == 0 then redis.call('DEL', KEYS[3]) end
+return value
+"""
+
+_REDIS_STAGED_SEED_LUA = """
+-- wv2nas:staged-seed-if-clean
+if redis.call('EXISTS', KEYS[2]) == 1 then return {-1, false} end
+local current = redis.call('GET', KEYS[1])
+if current and tonumber(current) then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+  return {1, current}
+end
+-- A filesystem scan can race a positive reservation's publish: it may see
+-- the new final file just before that uploader records the same bytes. Never
+-- persist a cold scan while any request can cross that publish boundary.
+for _, value in ipairs(redis.call('HVALS', KEYS[3])) do
+  local sep = string.find(value, ':', 1, true)
+  local amount = sep and tonumber(string.sub(value, sep + 1)) or nil
+  if not amount or amount ~= 0 then return {-2, false} end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return {0, ARGV[1]}
+"""
+
+_REDIS_MARK_STAGED_DIRTY_LUA = """
+-- wv2nas:mark-staged-dirty
+redis.call('SET', KEYS[2], 1, 'EX', ARGV[1])
+redis.call('DEL', KEYS[1])
+return 1
+"""
+
+_REDIS_UPLOAD_LEASE_CLAIM_LUA = """
+-- wv2nas:upload-lease-claim-v2
+local now = tonumber(redis.call('TIME')[1])
+local function decode(value)
+  local sep = value and string.find(value, ':', 1, true)
+  if not sep then return nil, nil end
+  return tonumber(string.sub(value, 1, sep - 1)), tonumber(string.sub(value, sep + 1))
+end
+local function dirty()
+  redis.call('SET', KEYS[3], 1, 'EX', ARGV[5])
+  redis.call('DEL', KEYS[2])
+end
+local entries = redis.call('HGETALL', KEYS[1])
+for i = 1, #entries, 2 do
+  local expires, amount = decode(entries[i + 1])
+  if not expires or not amount or expires <= now then
+    if not amount or amount ~= 0 then dirty() end
+    redis.call('HDEL', KEYS[1], entries[i])
+  end
+end
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+local _, current_amount = decode(current)
+local active = 0
+for _, value in ipairs(redis.call('HVALS', KEYS[1])) do
+  local _, amount = decode(value)
+  if amount and amount >= 0 then active = active + 1 end
+end
+if not current and active >= tonumber(ARGV[4]) then
+  return tonumber(ARGV[4]) + 1
+end
+if current and (not current_amount or current_amount < 0) then
+  return tonumber(ARGV[4]) + 1
+end
+redis.call('HSET', KEYS[1], ARGV[1], tostring(now + tonumber(ARGV[2])) .. ':' .. tostring(current_amount or 0))
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+if not current then active = active + 1 end
+return active
+"""
+
+_REDIS_UPLOAD_LEASE_RESERVE_LUA = """
+-- wv2nas:upload-lease-reserve-v2
+local now = tonumber(redis.call('TIME')[1])
+local function decode(value)
+  local sep = value and string.find(value, ':', 1, true)
+  if not sep then return nil, nil end
+  return tonumber(string.sub(value, 1, sep - 1)), tonumber(string.sub(value, sep + 1))
+end
+local function dirty()
+  redis.call('SET', KEYS[3], 1, 'EX', ARGV[5])
+  redis.call('DEL', KEYS[2])
+end
+local entries = redis.call('HGETALL', KEYS[1])
+for i = 1, #entries, 2 do
+  local expires, amount = decode(entries[i + 1])
+  if not expires or not amount or expires <= now then
+    if not amount or amount ~= 0 then dirty() end
+    redis.call('HDEL', KEYS[1], entries[i])
+  end
+end
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+local _, current_amount = decode(current)
+if not current_amount or current_amount < 0 then return -1 end
+redis.call('HSET', KEYS[1], ARGV[1], tostring(now + tonumber(ARGV[3])) .. ':' .. ARGV[2])
+local total = 0
+for _, value in ipairs(redis.call('HVALS', KEYS[1])) do
+  local _, amount = decode(value)
+  if not amount then dirty(); return -2 end
+  -- Negative entries are byte-only retained leases. Their conversion also
+  -- forces authoritative disk-scan mode, where the physical final/.part is
+  -- counted directly; adding abs(amount) here would double-charge it.
+  if amount > 0 then total = total + amount end
+end
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return total
+"""
+
+_REDIS_UPLOAD_QUOTA_SNAPSHOT_LUA = """
+-- wv2nas:upload-quota-snapshot-v1
+local now = tonumber(redis.call('TIME')[1])
+local function decode(value)
+  local sep = value and string.find(value, ':', 1, true)
+  if not sep then return nil, nil end
+  return tonumber(string.sub(value, 1, sep - 1)), tonumber(string.sub(value, sep + 1))
+end
+local function dirty()
+  redis.call('SET', KEYS[3], 1, 'EX', ARGV[1])
+  redis.call('DEL', KEYS[2])
+end
+local entries = redis.call('HGETALL', KEYS[1])
+for i = 1, #entries, 2 do
+  local expires, amount = decode(entries[i + 1])
+  if not expires or not amount or expires <= now then
+    if not amount or amount ~= 0 then dirty() end
+    redis.call('HDEL', KEYS[1], entries[i])
+  end
+end
+local reserved = 0
+local signature_parts = {}
+local active_tokens = {}
+local live = redis.call('HGETALL', KEYS[1])
+for i = 1, #live, 2 do
+  local token = live[i]
+  local _, amount = decode(live[i + 1])
+  if not amount then
+    dirty()
+    return {-2, -1, 0, ''}
+  end
+  if amount > 0 then reserved = reserved + amount end
+  if amount >= 0 then table.insert(active_tokens, token) end
+  table.insert(signature_parts, token .. '=' .. tostring(amount))
+end
+table.sort(signature_parts)
+table.sort(active_tokens)
+local signature = table.concat(signature_parts, '|')
+local staged = redis.call('GET', KEYS[2])
+local clean = redis.call('EXISTS', KEYS[3]) == 0 and staged and tonumber(staged)
+local result = {clean and 1 or 0, clean and tonumber(staged) or -1, reserved, signature}
+for _, token in ipairs(active_tokens) do table.insert(result, token) end
+return result
+"""
+
+_REDIS_UPLOAD_LEASE_HEARTBEAT_LUA = """
+-- wv2nas:upload-lease-heartbeat-v2
+local now = tonumber(redis.call('TIME')[1])
+local function decode(value)
+  local sep = value and string.find(value, ':', 1, true)
+  if not sep then return nil, nil end
+  return tonumber(string.sub(value, 1, sep - 1)), tonumber(string.sub(value, sep + 1))
+end
+local function dirty()
+  redis.call('SET', KEYS[3], 1, 'EX', ARGV[5])
+  redis.call('DEL', KEYS[2])
+end
+local entries = redis.call('HGETALL', KEYS[1])
+for i = 1, #entries, 2 do
+  local expires, amount = decode(entries[i + 1])
+  if not expires or not amount or expires <= now then
+    if not amount or amount ~= 0 then dirty() end
+    redis.call('HDEL', KEYS[1], entries[i])
+  end
+end
+local value = redis.call('HGET', KEYS[1], ARGV[1])
+local _, amount = decode(value)
+if not amount or amount < 0 then return 0 end
+if tonumber(ARGV[3]) == 1 and amount <= 0 then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], tostring(now + tonumber(ARGV[2])) .. ':' .. tostring(amount))
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return 1
+"""
+
+_REDIS_UPLOAD_LEASE_RELEASE_LUA = """
+-- wv2nas:upload-lease-release-v2
+local now = tonumber(redis.call('TIME')[1])
+local function decode(value)
+  local sep = value and string.find(value, ':', 1, true)
+  if not sep then return nil, nil end
+  return tonumber(string.sub(value, 1, sep - 1)), tonumber(string.sub(value, sep + 1))
+end
+local own_value = redis.call('HGET', KEYS[1], ARGV[1])
+local _, own_amount = decode(own_value)
+-- Negative amounts are retained byte-only leases. They intentionally do not
+-- consume an active slot and ordinary request cleanup must not erase them.
+if own_amount and own_amount < 0 then return 0 end
+redis.call('HDEL', KEYS[1], ARGV[1])
+local entries = redis.call('HGETALL', KEYS[1])
+for i = 1, #entries, 2 do
+  local expires, amount = decode(entries[i + 1])
+  if not expires or not amount or expires <= now then
+    if not amount or amount ~= 0 then
+      redis.call('SET', KEYS[3], 1, 'EX', ARGV[2])
+      redis.call('DEL', KEYS[2])
+    end
+    redis.call('HDEL', KEYS[1], entries[i])
+  end
+end
+if redis.call('HLEN', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
+return 1
+"""
+
+_REDIS_UPLOAD_LEASE_TOKENS_LUA = """
+-- wv2nas:upload-lease-active-tokens-v2
+local now = tonumber(redis.call('TIME')[1])
+local function decode(value)
+  local sep = value and string.find(value, ':', 1, true)
+  if not sep then return nil, nil end
+  return tonumber(string.sub(value, 1, sep - 1)), tonumber(string.sub(value, sep + 1))
+end
+local entries = redis.call('HGETALL', KEYS[1])
+for i = 1, #entries, 2 do
+  local expires, amount = decode(entries[i + 1])
+  if not expires or not amount or expires <= now then
+    if not amount or amount ~= 0 then
+      redis.call('SET', KEYS[3], 1, 'EX', ARGV[1])
+      redis.call('DEL', KEYS[2])
+    end
+    redis.call('HDEL', KEYS[1], entries[i])
+  end
+end
+local active = {}
+local live = redis.call('HGETALL', KEYS[1])
+for i = 1, #live, 2 do
+  local _, amount = decode(live[i + 1])
+  if amount and (tonumber(ARGV[2]) == 1 or amount >= 0) then
+    table.insert(active, live[i])
+  end
+end
+return active
+"""
+
+_REDIS_UPLOAD_LEASE_RETAIN_LUA = """
+-- wv2nas:upload-lease-retain-bytes-v1
+local now = tonumber(redis.call('TIME')[1])
+local value = redis.call('HGET', KEYS[1], ARGV[1])
+local sep = value and string.find(value, ':', 1, true)
+local amount = sep and tonumber(string.sub(value, sep + 1)) or nil
+if not amount or amount == 0 then return 0 end
+redis.call(
+  'HSET', KEYS[1], ARGV[1],
+  tostring(now + tonumber(ARGV[2])) .. ':' .. tostring(-math.abs(amount))
+)
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+-- A retained lease always corresponds to physical bytes whose cached staged
+-- accounting is uncertain (published final or undeletable temp). Force scans
+-- while the negative marker lives so quota counts that file exactly once.
+redis.call('SET', KEYS[3], 1, 'EX', ARGV[4])
+redis.call('DEL', KEYS[2])
+return 1
+"""
+
+_REDIS_PUBLISH_LOCK_RELEASE_LUA = """
+-- wv2nas:publish-lock-release
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[1])
+return 1
+"""
+
+_REDIS_PUBLISH_LOCK_REFRESH_LUA = """
+-- wv2nas:publish-lock-refresh
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('EXPIRE', KEYS[1], ARGV[2])
+"""
+
+
+
+def _redis_eval_or_fallback(script: str, key: str, *args):
+    """Run a Redis atomic script; support minimal in-memory test doubles.
+
+    Production always uses ``redis.Redis`` from ``redis.from_url`` and takes
+    the Lua path. The fallback keeps lightweight unit-test adapters useful;
+    it is not used by the deployed API.
+    """
+    evaluator = getattr(redis_client, "eval", None)
+    if callable(evaluator):
+        return evaluator(script, 1, key, *args)
+
+    marker = script.splitlines()[1].strip() if len(script.splitlines()) > 1 else ""
+    if marker == "-- wv2nas:get-refresh":
+        value = redis_client.get(key)
+        if value is not None:
+            redis_client.expire(key, int(args[0]))
+        return value
+    if marker == "-- wv2nas:staged-record-existing":
+        current = redis_client.get(key)
+        if current is None:
+            return None
+        value = redis_client.incrby(key, int(args[0]))
+        redis_client.expire(key, int(args[1]))
+        return value
+    raise RuntimeError(f"Unsupported Redis script marker: {marker}")
+
+
+def _redis_staged_eval(script: str, job_id: str, *args):
+    """Run a two-key staged-counter operation atomically in production."""
+    staged_key = _staged_bytes_key(job_id)
+    dirty_key = _staged_bytes_dirty_key(job_id)
+    lease_key = _upload_slot_key(job_id)
+    evaluator = getattr(redis_client, "eval", None)
+    if callable(evaluator):
+        return evaluator(script, 3, staged_key, dirty_key, lease_key, *args)
+
+    # Compatibility for narrow unit-test adapters only. Production requires
+    # Redis EVAL and therefore cannot observe these split operations.
+    marker = script.splitlines()[1].strip() if len(script.splitlines()) > 1 else ""
+    if marker == "-- wv2nas:mark-staged-dirty":
+        redis_client.set(dirty_key, 1, ex=int(args[0]))
+        redis_client.delete(staged_key)
+        return 1
+    if marker == "-- wv2nas:staged-seed-if-clean":
+        if redis_client.get(dirty_key) is not None:
+            return (-1, None)
+        current = redis_client.get(staged_key)
+        if current is not None:
+            redis_client.expire(staged_key, int(args[1]))
+            return (1, current)
+        # Legacy adapters cannot atomically inspect token reservations, so a
+        # cache miss remains scan-only rather than persisting a racy seed.
+        if getattr(redis_client, "lease_amounts", {}).get(lease_key):
+            return (-2, None)
+        redis_client.set(staged_key, int(args[0]), ex=int(args[1]))
+        return (0, int(args[0]))
+    if marker == "-- wv2nas:staged-record-existing":
+        if redis_client.get(dirty_key) is not None:
+            return -1
+        current = redis_client.get(staged_key)
+        if current is None:
+            return None
+        value = redis_client.incrby(staged_key, int(args[0]))
+        redis_client.expire(staged_key, int(args[1]))
+        return value
+    raise RuntimeError(f"Unsupported staged Redis script marker: {marker}")
+
+
+def _staged_bytes_dirty_is_active(job_id: str) -> bool:
+    # Do not refresh the dirty marker here. Its bounded lifetime is the
+    # self-healing path: the staged counter was deleted marker-first, so the
+    # first read after expiry performs a full authoritative seed from disk.
+    value = redis_client.get(_staged_bytes_dirty_key(job_id))
+    return value is not None and value is not False
+
+
+def _mark_staged_bytes_dirty(job_id: str) -> bool:
+    """Switch this job to authoritative filesystem scans after uncertainty."""
+    dirty_key = _staged_bytes_dirty_key(job_id)
+    try:
+        stored = _redis_staged_eval(
+            _REDIS_MARK_STAGED_DIRTY_LUA,
+            job_id,
+            _STAGED_BYTES_DIRTY_TTL_SECONDS,
+        )
+        if stored is False or stored is None:
+            if not _staged_bytes_dirty_is_active(job_id):
+                return False
+    except Exception as e:
+        logger.warning(f"Staged-bytes dirty marker failed for {job_id}: {e}")
+        # SET may have committed server-side and only its response was lost.
+        # A follow-up read avoids retaining a reservation that the confirmed
+        # dirty scan mode already accounts for on disk.
+        try:
+            if _staged_bytes_dirty_is_active(job_id):
+                return True
+        except Exception:
+            pass
+        return False
+
+    # The Lua operation sets the marker and deletes the stale counter in the
+    # same Redis transaction. A confirmed marker after response loss therefore
+    # also proves the deletion committed; a short-lived marker cannot expose
+    # the old undercount later.
+    return True
 
 
 def _staged_bytes_get(job_id: str, staging_root: Path) -> int:
@@ -1020,46 +1785,104 @@ def _staged_bytes_get(job_id: str, staging_root: Path) -> int:
     publish in `_stream_segment_to_disk` / `_stream_init_to_disk`. On
     counter miss (TTL expired, redis flushed, fresh container) the walk
     seeds the counter from the on-disk tree so the quota gate stays
-    accurate. On redis failure we degrade to the legacy O(N) walk
-    instead of fail-closing — the slot/reserved-bytes gate is the
-    primary defense and bytes-on-disk is a defense-in-depth backstop.
+    accurate. On Redis failure we use an authoritative O(N) walk. Metadata
+    errors fail closed rather than seeding a persistent undercount.
     """
     key = _staged_bytes_key(job_id)
     try:
-        cached = redis_client.get(key)
-        if cached is not None:
+        if _staged_bytes_dirty_is_active(job_id):
+            return _scan_staging_total(job_id, staging_root)[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        # If Redis cannot tell us whether cached accounting is trustworthy,
+        # the filesystem is the safe source of truth for this request.
+        logger.warning(f"Staged-bytes dirty read failed for {job_id}: {e}")
+        return _scan_staging_total(job_id, staging_root)[0]
+    try:
+        cached = _redis_eval_or_fallback(
+            _REDIS_GET_REFRESH_LUA,
+            key,
+            _STAGED_BYTES_CACHE_TTL_SECONDS,
+        )
+        if cached is not None and cached is not False:
             try:
                 return int(cached)
             except (TypeError, ValueError):
                 pass
     except Exception as e:
         logger.warning(f"Staged-bytes read failed for {job_id}: {e}")
-        return _staging_total_bytes(staging_root)
+        return _scan_staging_total(job_id, staging_root)[0]
 
-    seeded = _staging_total_bytes(staging_root)
+    seeded, trustworthy_seed = _scan_staging_total(job_id, staging_root)
+    if not trustworthy_seed:
+        return seeded
     try:
-        redis_client.set(key, seeded, ex=_UPLOAD_SLOT_KEY_TTL_SECONDS)
+        # The dirty-key guard and seed happen atomically. A sibling that marks
+        # accounting uncertain during our filesystem walk prevents this stale
+        # snapshot from resurrecting the deleted cache.
+        seeded_result = _redis_staged_eval(
+            _REDIS_STAGED_SEED_LUA,
+            job_id,
+            seeded,
+            _STAGED_BYTES_CACHE_TTL_SECONDS,
+        )
+        state, value = seeded_result
+        if int(state) >= 0 and value is not None and value is not False:
+            return int(value)
     except Exception as e:
         logger.warning(f"Staged-bytes seed failed for {job_id}: {e}")
     return seeded
 
 
-def _staged_bytes_record(job_id: str, n: int) -> None:
+def _staged_bytes_record(
+    job_id: str, n: int, *, upload_token: Optional[str] = None,
+) -> bool:
     """Record `n` newly-published bytes against the per-job counter.
 
     Called from the publish success paths in
-    `_stream_segment_to_disk` / `_stream_init_to_disk`. Best-effort: a
-    redis hiccup leaves the counter under-counting until the next miss
-    triggers a re-seed walk.
+    `_stream_segment_to_disk` / `_stream_init_to_disk`. Best-effort:
+    Returns False when Redis cannot confirm the update or the key expired.
+    The caller then retains its exact byte reservation until TTL, preventing
+    an uncounted publish from opening a quota hole. This script never creates
+    a missing staged key from only the latest delta; the next PUT will re-seed
+    the full on-disk total instead.
     """
     if n <= 0:
-        return
+        return True
     key = _staged_bytes_key(job_id)
     try:
-        redis_client.incrby(key, n)
-        redis_client.expire(key, _UPLOAD_SLOT_KEY_TTL_SECONDS)
+        if upload_token:
+            # Atomically move this request's bytes from the in-flight lease to
+            # the staged counter. No observer can double-count both states or
+            # miss both states during a concurrent quota gate.
+            value = _redis_staged_eval(
+                _REDIS_STAGED_COMMIT_UPLOAD_LUA,
+                job_id,
+                str(upload_token),
+                int(n),
+                _STAGED_BYTES_CACHE_TTL_SECONDS,
+                _STAGED_BYTES_DIRTY_TTL_SECONDS,
+            )
+        else:
+            # Narrow compatibility path for maintenance/tests without a live
+            # upload lease. Production publish callers always pass a token.
+            value = _redis_staged_eval(
+                _REDIS_STAGED_RECORD_LUA,
+                job_id,
+                int(n),
+                _STAGED_BYTES_CACHE_TTL_SECONDS,
+            )
+        if value is not None and value is not False and int(value) == -1:
+            return True
+        if value is not None and value is not False:
+            return True
     except Exception as e:
         logger.warning(f"Staged-bytes record failed for {job_id}: {e}")
+    # A confirmed dirty marker makes future quota reads scan the complete
+    # staging tree, so the caller may safely release its exact reservation.
+    # Only retain that reservation if even the marker cannot be confirmed.
+    return _mark_staged_bytes_dirty(job_id)
 
 
 def _staged_bytes_clear(job_id: str) -> None:
@@ -1068,15 +1891,93 @@ def _staged_bytes_clear(job_id: str) -> None:
     explicit cleanup keeps redis tidy."""
     try:
         redis_client.delete(_staged_bytes_key(job_id))
+        redis_client.delete(_staged_bytes_dirty_key(job_id))
     except Exception as e:
         logger.warning(f"Staged-bytes clear failed for {job_id}: {e}")
 
 
 def _upload_slot_key(job_id: str) -> str:
-    return f"wv2nas:upload_slots:{job_id}"
+    # Slot expiry and reserved byte count intentionally share ONE Redis hash
+    # entry per request (`expires:bytes`; negative bytes are retained-only).
+    # Separate ZSET/HASH keys can be
+    # evicted independently and turn a fail-closed quota into undercounting.
+    return f"wv2nas:upload_leases:{job_id}"
 
 
-def _claim_upload_slot(job_id: str) -> int:
+def _redis_upload_lease_eval(script: str, job_id: str, *args):
+    lease_key = _upload_slot_key(job_id)
+    evaluator = getattr(redis_client, "eval", None)
+    if callable(evaluator):
+        return evaluator(
+            script,
+            3,
+            lease_key,
+            _staged_bytes_key(job_id),
+            _staged_bytes_dirty_key(job_id),
+            *args,
+        )
+    # Token ownership, pruning and the bytes sum must be one atomic operation.
+    # A legacy INCR/DECR fallback cannot preserve those semantics, so fail
+    # closed rather than give lightweight adapters a production-only quota
+    # hole. Tests use a small interpreter for these scripts.
+    raise RuntimeError("Redis EVAL is required for upload lease coordination")
+
+
+def _upload_tokens(
+    job_id: str, *, include_retained: bool,
+) -> Optional[set[str]]:
+    """Return coordinated token owners, pruning expired leases atomically.
+
+    Redis failure returns ``None`` so reconciliation conservatively counts
+    every .part file and knows not to cache that possibly double-counted total.
+    """
+    try:
+        raw = _redis_upload_lease_eval(
+            _REDIS_UPLOAD_LEASE_TOKENS_LUA,
+            job_id,
+            _STAGED_BYTES_DIRTY_TTL_SECONDS,
+            1 if include_retained else 0,
+        )
+    except Exception as e:
+        logger.warning(f"Upload-token read failed for {job_id}: {e}")
+        return None
+    tokens: set[str] = set()
+    for token in raw or []:
+        if isinstance(token, bytes):
+            token = token.decode("utf-8", errors="strict")
+        tokens.add(str(token))
+    return tokens
+
+
+def _active_upload_tokens(job_id: str) -> Optional[set[str]]:
+    """Return slot-owning tokens only (retained byte-only leases excluded)."""
+    return _upload_tokens(job_id, include_retained=False)
+
+
+def _scan_staging_total(job_id: str, staging_root: Path) -> tuple[int, bool]:
+    # Positive/live attempts remain covered by an in-flight reservation and
+    # their .part must be excluded. Negative retained leases force dirty scan
+    # mode and are *not* in the reservation sum, so their physical final/.part
+    # must be included here exactly once.
+    reserved_tokens = _active_upload_tokens(job_id)
+    try:
+        total = _staging_total_bytes(
+            staging_root,
+            active_upload_tokens=reserved_tokens or set(),
+        )
+    except _StagingAccountingError as e:
+        logger.warning(f"Staging reconciliation failed for {job_id}: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Staging usage could not be verified; retry",
+        ) from e
+    # When Redis was unavailable, counting every .part is safe for this gate
+    # but may double-charge live attempts. Never persist that conservative
+    # snapshot into the long-lived cache.
+    return total, reserved_tokens is not None
+
+
+def _claim_upload_slot(job_id: str, upload_token: str) -> int:
     """Atomically claim an upload slot for `job_id` and return the new
     in-flight count. Codex review #9: redis INCR is the only atomic
     primitive available without a schema change; fail-closed if redis
@@ -1087,24 +1988,353 @@ def _claim_upload_slot(job_id: str) -> int:
     _UPLOAD_SLOT_KEY_TTL_SECONDS even if `_release_upload_slot` is
     never reached (process killed mid-stream, etc.).
     """
-    try:
-        count = redis_client.incr(_upload_slot_key(job_id))
-        # EXPIRE is a separate command; refresh on every claim so a long-
-        # running stream doesn't get its counter wiped from under it.
-        redis_client.expire(_upload_slot_key(job_id), _UPLOAD_SLOT_KEY_TTL_SECONDS)
-        return int(count)
-    except Exception as e:
-        logger.error(f"Upload slot claim failed for {job_id}: {e}")
+    last_error: Optional[Exception] = None
+    # EVAL may commit and lose its response. Repeating with the same token is
+    # idempotent and recovers that ambiguous outcome without leaking a phantom
+    # slot for the full lease lifetime.
+    for _attempt in range(2):
+        try:
+            return int(_redis_upload_lease_eval(
+                _REDIS_UPLOAD_LEASE_CLAIM_LUA,
+                job_id,
+                upload_token,
+                _UPLOAD_SLOT_KEY_TTL_SECONDS,
+                _UPLOAD_SLOT_KEY_TTL_SECONDS + 60,
+                MAX_CONCURRENT_UPLOADS_PER_JOB,
+                _STAGED_BYTES_DIRTY_TTL_SECONDS,
+            ))
+        except Exception as e:
+            last_error = e
+    logger.error(f"Upload slot claim failed for {job_id}: {last_error}")
+    # If Redis recovered just after both ambiguous responses, clean the known
+    # token. Release is itself idempotent.
+    _release_upload_claim(job_id, upload_token)
+    return -1
+
+
+def _release_upload_claim(job_id: str, upload_token: str) -> bool:
+    """Release one token-owned slot and its byte reservation."""
+    last_error: Optional[Exception] = None
+    for _attempt in range(2):
+        try:
+            _redis_upload_lease_eval(
+                _REDIS_UPLOAD_LEASE_RELEASE_LUA,
+                job_id,
+                upload_token,
+                _STAGED_BYTES_DIRTY_TTL_SECONDS,
+            )
+            return True
+        except Exception as e:
+            last_error = e
+    logger.warning(f"Upload lease release failed for {job_id}: {last_error}")
+    return False
+
+
+def _reserve_upload_bytes(
+    job_id: str, upload_token: str, expected_bytes: int,
+) -> int:
+    """Atomically reserve exact in-flight bytes and return the new total.
+
+    Direct-DASH byte-range lengths are declared in the persisted plan, so
+    charging 500 MiB per 8 MiB range both misrepresents exposure and rejects
+    valid jobs on smaller staging quotas. Non-range uploads still pass
+    ``MAX_SEGMENT_BYTES`` and retain the original worst-case reservation.
+    """
+    if expected_bytes <= 0:
         return -1
+    last_error: Optional[Exception] = None
+    # Same-token reserve retries overwrite the same hash field, never add the
+    # amount twice, so a lost EVAL response can be recovered safely.
+    for _attempt in range(2):
+        try:
+            return int(_redis_upload_lease_eval(
+                _REDIS_UPLOAD_LEASE_RESERVE_LUA,
+                job_id,
+                upload_token,
+                int(expected_bytes),
+                _UPLOAD_SLOT_KEY_TTL_SECONDS,
+                _UPLOAD_SLOT_KEY_TTL_SECONDS + 60,
+                _STAGED_BYTES_DIRTY_TTL_SECONDS,
+            ))
+        except Exception as e:
+            last_error = e
+    logger.error(f"Upload byte reservation failed for {job_id}: {last_error}")
+    return -1
 
 
-def _release_upload_slot(job_id: str) -> None:
-    """Release a previously-claimed upload slot. Best-effort; on redis
-    failure the TTL eventually clears the counter."""
+def _upload_quota_snapshot(
+    job_id: str,
+) -> Optional[tuple[bool, int, int, str, set[str]]]:
+    """Atomically snapshot staged bytes and every positive reservation.
+
+    The signature/token set supports a stable filesystem scan when the staged
+    cache is dirty or cold. A publish moves bytes from reservation to staged in
+    one Lua transaction, so a clean snapshot can never count both generations.
+    """
     try:
-        redis_client.decr(_upload_slot_key(job_id))
+        raw = _redis_upload_lease_eval(
+            _REDIS_UPLOAD_QUOTA_SNAPSHOT_LUA,
+            job_id,
+            _STAGED_BYTES_DIRTY_TTL_SECONDS,
+        )
+        if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+            raise ValueError("invalid quota snapshot response")
+        state = int(raw[0])
+        if state < 0:
+            raise ValueError("corrupt upload lease state")
+        staged = int(raw[1])
+        reserved = int(raw[2])
+        signature_raw = raw[3]
+        if isinstance(signature_raw, bytes):
+            signature_raw = signature_raw.decode("utf-8", errors="strict")
+        active_tokens: set[str] = set()
+        for token in raw[4:]:
+            if isinstance(token, bytes):
+                token = token.decode("utf-8", errors="strict")
+            active_tokens.add(str(token))
+        return state == 1, staged, reserved, str(signature_raw), active_tokens
     except Exception as e:
-        logger.warning(f"Upload slot release failed for {job_id}: {e}")
+        logger.warning(f"Upload quota snapshot failed for {job_id}: {e}")
+        return None
+
+
+def _upload_quota_usage(
+    job_id: str, staging_root: Path,
+) -> tuple[int, int, int]:
+    """Return one consistent ``(staged, reserved, total)`` quota snapshot.
+
+    Clean Redis accounting is a single atomic read. Dirty/cold accounting uses
+    a filesystem walk bracketed by lease signatures; if a reserve/publish
+    transition crosses the walk, retry instead of combining two generations.
+    """
+    for _attempt in range(3):
+        before = _upload_quota_snapshot(job_id)
+        if before is None:
+            break
+        clean, staged, reserved, signature, active_tokens = before
+        if clean:
+            return staged, reserved, staged + reserved
+        try:
+            scanned = _staging_total_bytes(
+                staging_root,
+                active_upload_tokens=active_tokens,
+            )
+        except _StagingAccountingError as e:
+            logger.warning(f"Staging quota scan failed for {job_id}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="Staging usage could not be verified; retry",
+            ) from e
+        after = _upload_quota_snapshot(job_id)
+        if after is None:
+            break
+        after_clean, after_staged, after_reserved, after_signature, _tokens = after
+        if after_clean:
+            return (
+                after_staged,
+                after_reserved,
+                after_staged + after_reserved,
+            )
+        if after_signature == signature:
+            return scanned, after_reserved, scanned + after_reserved
+    raise HTTPException(
+        status_code=503,
+        detail="Upload quota changed during reconciliation; retry",
+    )
+
+
+def _retain_upload_reservation(job_id: str, upload_token: str) -> bool:
+    """Convert one active lease to byte-only fail-closed accounting.
+
+    A negative encoded amount no longer consumes an active upload slot. The
+    same atomic Lua operation forces dirty filesystem-scan mode; the physical
+    final/orphan part is then counted once instead of being double-charged as
+    both on-disk bytes and an absolute reservation.
+    """
+    last_error: Optional[Exception] = None
+    for _attempt in range(2):
+        try:
+            return int(_redis_upload_lease_eval(
+                _REDIS_UPLOAD_LEASE_RETAIN_LUA,
+                job_id,
+                upload_token,
+                _UPLOAD_SLOT_KEY_TTL_SECONDS,
+                _UPLOAD_SLOT_KEY_TTL_SECONDS + 60,
+                _STAGED_BYTES_DIRTY_TTL_SECONDS,
+            )) == 1
+        except Exception as e:
+            last_error = e
+    logger.warning(
+        f"Upload byte-only lease conversion failed for {job_id}: {last_error}"
+    )
+    return False
+
+
+def _heartbeat_upload_claim(
+    job_id: str, upload_token: str, *, require_reserved: bool,
+) -> bool:
+    try:
+        return int(_redis_upload_lease_eval(
+            _REDIS_UPLOAD_LEASE_HEARTBEAT_LUA,
+            job_id,
+            upload_token,
+            _UPLOAD_SLOT_KEY_TTL_SECONDS,
+            1 if require_reserved else 0,
+            _UPLOAD_SLOT_KEY_TTL_SECONDS + 60,
+            _STAGED_BYTES_DIRTY_TTL_SECONDS,
+        )) == 1
+    except Exception:
+        return False
+
+
+def _refresh_upload_coordination_ttl(
+    job_id: str, upload_token: Optional[str] = None, *,
+    require_slot: bool = False, require_reserved: bool = False,
+) -> bool:
+    """Refresh active leases and report whether required counters still exist."""
+    healthy = not require_slot
+    if require_slot:
+        healthy = bool(upload_token) and _heartbeat_upload_claim(
+            job_id,
+            str(upload_token),
+            require_reserved=require_reserved,
+        )
+    for key in (_staged_bytes_key(job_id),):
+        try:
+            redis_client.expire(key, _STAGED_BYTES_CACHE_TTL_SECONDS)
+        except Exception as e:
+            logger.warning(f"Upload coordination TTL refresh failed for {job_id}: {e}")
+    return healthy
+
+
+def _upload_monotonic_seconds() -> float:
+    return time.monotonic()
+
+
+def _refresh_upload_lease_independent(job_id: str) -> None:
+    """Refresh a long upload from a thread-owned SQLAlchemy session."""
+    lease_db = SessionLocal()
+    try:
+        _refresh_upload_lease(lease_db, job_id)
+    finally:
+        lease_db.close()
+
+
+def _run_upload_housekeeping(
+    job_id: str,
+    upload_token: Optional[str],
+    *,
+    refresh_coordination: bool,
+    refresh_database: bool,
+    coordination_required: bool,
+    byte_reservation_required: bool,
+) -> bool:
+    """Synchronous lease work executed outside the asyncio event loop."""
+    healthy = True
+    if refresh_coordination:
+        healthy = _refresh_upload_coordination_ttl(
+            job_id,
+            upload_token,
+            require_slot=coordination_required,
+            require_reserved=byte_reservation_required,
+        )
+    if refresh_database:
+        _refresh_upload_lease_independent(job_id)
+    return healthy
+
+
+def _upload_total_deadline_error() -> HTTPException:
+    return HTTPException(
+        status_code=408,
+        detail=(
+            "Upload body exceeded total deadline of "
+            f"{UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS}s"
+        ),
+    )
+
+
+async def _iter_upload_chunks(
+    request: Request, job_id: str, db: Session, *,
+    upload_token: Optional[str] = None,
+    coordination_required: bool = False,
+    byte_reservation_required: bool = False,
+):
+    """Yield body chunks with idle + total deadlines and lease heartbeats."""
+    iterator = request.stream().__aiter__()
+    started_at = _upload_monotonic_seconds()
+    last_refresh = started_at
+    last_db_refresh = last_refresh
+    while True:
+        elapsed = _upload_monotonic_seconds() - started_at
+        remaining = UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS - elapsed
+        if remaining <= 0:
+            raise _upload_total_deadline_error()
+        try:
+            chunk = await asyncio.wait_for(
+                iterator.__anext__(),
+                timeout=min(UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS, remaining),
+            )
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            total_expired = (
+                _upload_monotonic_seconds() - started_at
+                >= UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS
+            )
+            raise HTTPException(
+                status_code=408,
+                detail=(
+                    (
+                        "Upload body exceeded total deadline of "
+                        f"{UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS}s"
+                    )
+                    if total_expired else
+                    (
+                        "Upload body timed out after "
+                        f"{UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS}s without data"
+                    )
+                ),
+            )
+        now = _upload_monotonic_seconds()
+        refresh_coordination = (
+            now - last_refresh >= UPLOAD_COORDINATION_REFRESH_SECONDS
+        )
+        refresh_database = (
+            now - last_db_refresh >= UPLOAD_DB_LEASE_REFRESH_SECONDS
+        )
+        if refresh_coordination or refresh_database:
+            remaining = (
+                UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS - (now - started_at)
+            )
+            if remaining <= 0:
+                raise _upload_total_deadline_error()
+            try:
+                healthy = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _run_upload_housekeeping,
+                        job_id,
+                        upload_token,
+                        refresh_coordination=refresh_coordination,
+                        refresh_database=refresh_database,
+                        coordination_required=coordination_required,
+                        byte_reservation_required=byte_reservation_required,
+                    ),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                # The worker thread may finish its idempotent lease refresh
+                # later, but it no longer freezes this or unrelated requests.
+                raise _upload_total_deadline_error()
+            if refresh_coordination and not healthy:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Upload coordination lease was lost; retry",
+                )
+            if refresh_coordination:
+                last_refresh = now
+            if refresh_database:
+                last_db_refresh = now
+        yield chunk
 
 
 def _get_browser_job_meta(db: Session, job_id: str):
@@ -1136,7 +2366,7 @@ class DirectDashTrackRequest(BaseModel):
 class DirectDashRequest(BaseModel):
     video: DirectDashTrackRequest
     audio: DirectDashTrackRequest
-    duration: Optional[float] = Field(default=None, ge=0)
+    duration: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class JobInitRequest(BaseModel):
@@ -1205,19 +2435,22 @@ def init_browser_job(
     # the (curl_cffi) stack into the test fast-path that doesn't need it.
     from manifest_planner import (
         ManifestPlanError,
+        ManifestSegmentLimitError,
+        ManifestPlanTooLargeError,
         plan_direct_dash,
         plan_from_text,
         plan_from_url,
     )
 
+    direct_media_bytes: Optional[int] = None
     try:
         if request.direct_dash:
             direct = request.direct_dash.model_dump(mode="json")
-            staged_bytes = (
+            direct_media_bytes = (
                 int(direct["video"]["content_length"])
                 + int(direct["audio"]["content_length"])
             )
-            if staged_bytes > MAX_JOB_STAGING_BYTES:
+            if direct_media_bytes > MAX_JOB_STAGING_BYTES:
                 raise HTTPException(
                     status_code=413,
                     detail=(
@@ -1239,12 +2472,26 @@ def init_browser_job(
                     status_code=413,
                     detail=f"Plan exceeds MAX_BROWSER_SEGMENTS={MAX_BROWSER_SEGMENTS}",
                 )
+            if _estimated_direct_dash_plan_bytes(direct, chunk_bytes) > MAX_BROWSER_PLAN_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "Estimated direct DASH plan exceeds "
+                        f"MAX_BROWSER_PLAN_BYTES={MAX_BROWSER_PLAN_BYTES}"
+                    ),
+                )
             plan = plan_direct_dash(
                 direct["video"],
                 direct["audio"],
                 duration=direct.get("duration"),
                 chunk_bytes=chunk_bytes,
             )
+            try:
+                plan["recommended_concurrency"] = (
+                    _recommended_direct_dash_concurrency(plan)
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=500, detail=str(e))
         elif request.manifest_text:
             # Codex review (P2): headers must ride through the
             # master→variant fallback. If the extension sent us a
@@ -1255,6 +2502,8 @@ def init_browser_job(
                 request.manifest_text,
                 str(request.base_url),
                 headers=request.headers or {},
+                max_plan_bytes=MAX_BROWSER_PLAN_BYTES,
+                max_segments=MAX_BROWSER_SEGMENTS,
             )
         else:
             # Codex review: pass container_hint through. The extension
@@ -1265,9 +2514,33 @@ def init_browser_job(
                 str(request.url),
                 request.headers or {},
                 container_hint=request.container_hint,
+                max_plan_bytes=MAX_BROWSER_PLAN_BYTES,
+                max_segments=MAX_BROWSER_SEGMENTS,
             )
+        if not request.direct_dash:
+            try:
+                plan["recommended_concurrency"] = (
+                    _recommended_manifest_concurrency()
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=500, detail=str(e))
     except HTTPException:
         raise
+    except ManifestSegmentLimitError as e:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Plan exceeds MAX_BROWSER_SEGMENTS={MAX_BROWSER_SEGMENTS}: {e}"
+            ),
+        )
+    except ManifestPlanTooLargeError as e:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Manifest plan exceeds "
+                f"MAX_BROWSER_PLAN_BYTES={MAX_BROWSER_PLAN_BYTES}: {e}"
+            ),
+        )
     except ManifestPlanError as e:
         raise HTTPException(status_code=422, detail=f"Manifest plan failed: {e}")
     except Exception as e:
@@ -1289,6 +2562,29 @@ def init_browser_job(
     # new trust boundary beyond /api/download's host validation.
     _enforce_plan_url_safety(plan)
 
+    try:
+        plan_json = json.dumps(plan, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Manifest plan contains a non-serializable value: {e}",
+        )
+    plan_bytes = len(plan_json.encode("utf-8"))
+    if plan_bytes > MAX_BROWSER_PLAN_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Serialized plan exceeds MAX_BROWSER_PLAN_BYTES={MAX_BROWSER_PLAN_BYTES}",
+        )
+    planned_staging_bytes = plan_bytes + (direct_media_bytes or 0)
+    if planned_staging_bytes > MAX_JOB_STAGING_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Browser job media plus manifest exceed "
+                f"MAX_JOB_STAGING_BYTES={MAX_JOB_STAGING_BYTES}"
+            ),
+        )
+
     job_id = str(uuid.uuid4())
     staging_root = _staging_path_for(job_id)
     try:
@@ -1300,8 +2596,12 @@ def init_browser_job(
         # re-querying the source manifest (which by now has likely
         # expired — that's the whole reason we're doing browser-side).
         with open(staging_root / "manifest.json", "w", encoding="utf-8") as fh:
-            json.dump(plan, fh, ensure_ascii=False)
-    except OSError as e:
+            fh.write(plan_json)
+        # Seed the O(1) quota counter with the manifest included. Without this,
+        # the first upload either misses that overhead or pays an unexpected
+        # cold filesystem scan depending on Redis state.
+        _staged_bytes_get(job_id, staging_root)
+    except (OSError, HTTPException) as e:
         # We may have created STAGING_DIR/{job_id} before a later mkdir or
         # manifest write failed. No DB row exists yet, so the stale reapers
         # cannot discover this orphan; clean it here with the same exact path
@@ -1318,6 +2618,8 @@ def init_browser_job(
                 f"skipped ({cleanup_err}); no DB row exists for reapers"
             )
         _staged_bytes_clear(job_id)
+        if isinstance(e, HTTPException):
+            raise
         logger.error(f"Failed to create staging dir for {job_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to allocate staging dir")
 
@@ -1442,10 +2744,40 @@ async def upload_segment(
     # worker's _segment_files later rejects len(files) != expected_count
     # and the whole job fails AFTER all expected uploads landed.
     staging_root_for_bounds = _staging_path_for(job_id)
-    per_track_count, per_track_lengths = _expected_segment_shape_for_track(
-        staging_root_for_bounds, track,
-    )
-    expected_length = per_track_lengths.get(seq)
+    (
+        per_track_count,
+        per_track_min_lengths,
+        per_track_max_lengths,
+        per_track_exact,
+    ) = _expected_segment_shape_for_track(staging_root_for_bounds, track)
+    expected_min_length = per_track_min_lengths.get(seq)
+    expected_length = per_track_max_lengths.get(seq)
+    expected_length_is_exact = seq in per_track_exact
+    declared_length = _declared_upload_length(request)
+    if (
+        declared_length is not None
+        and expected_length is not None
+        and declared_length > expected_length
+    ):
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Content-Length {declared_length} exceeds planned upper bound "
+                f"{expected_length} for {track}/{seq}"
+            ),
+        )
+    if (
+        declared_length is not None
+        and expected_min_length is not None
+        and declared_length < expected_min_length
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Content-Length {declared_length} is below planned lower "
+                f"bound {expected_min_length} for {track}/{seq}"
+            ),
+        )
     if per_track_count is not None:
         if seq >= per_track_count:
             raise HTTPException(
@@ -1466,15 +2798,14 @@ async def upload_segment(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     # Codex review #9: atomic per-job concurrency cap + reserved-bytes
-    # quota. INCR returns the post-claim count; if it exceeds the
-    # concurrency cap we release immediately. The reserved-bytes check
-    # below counts BOTH on-disk staging AND worst-case in-flight
-    # (slot_count × MAX_SEGMENT_BYTES) against MAX_JOB_STAGING_BYTES,
-    # closing the race where many concurrent PUTs each see the same
-    # pre-write disk total and collectively overshoot the quota.
-    slot_count = _claim_upload_slot(job_id)
+    # quota. Exact byte-range lengths come from the persisted plan; ordinary
+    # non-range segments retain the MAX_SEGMENT_BYTES worst-case charge.
+    upload_token = uuid.uuid4().hex
+    slot_count = _claim_upload_slot(job_id, upload_token)
     if slot_count < 0:
         raise HTTPException(status_code=503, detail="Upload coordination unavailable")
+    release_claim = True
+    claim_resolved = False
     try:
         if slot_count > MAX_CONCURRENT_UPLOADS_PER_JOB:
             raise HTTPException(
@@ -1484,26 +2815,57 @@ async def upload_segment(
                     f"({MAX_CONCURRENT_UPLOADS_PER_JOB}) reached; "
                     f"retry shortly"
                 ),
+                headers={"Retry-After": "1"},
             )
 
         if _published_target_has_bytes(target):
             return await _stream_segment_to_disk(
                 request=request, db=db, meta=meta, job_id=job_id, track=track,
                 seq=seq, target=target, expected_length=expected_length,
+                expected_min_length=expected_min_length,
+                expected_length_is_exact=expected_length_is_exact,
+                declared_length=declared_length,
+                upload_token=upload_token,
+                coordination_required=True,
             )
 
         staging_root = _staging_path_for(job_id)
-        on_disk = _staged_bytes_get(job_id, staging_root)
-        # Worst-case in-flight (this request + sibling streams). Each
-        # request can write up to MAX_SEGMENT_BYTES; charge that to the
-        # quota up front so concurrent streams can't collectively bust
-        # the cap before any of them sees the post-write total.
-        reserved_in_flight = slot_count * MAX_SEGMENT_BYTES
-        if on_disk + reserved_in_flight > MAX_JOB_STAGING_BYTES:
+        # Reconcile a cold counter while our just-claimed token still owns
+        # zero bytes. The seed Lua only persists the scan when every token has
+        # amount=0, preventing publish+record from double-counting a file that
+        # appeared during the walk. We still reserve before the authoritative
+        # quota read below.
+        _staged_bytes_get(job_id, staging_root)
+        # Range plans declare the exact body length. Atomic reservation makes
+        # this request and every sibling visible before the quota check; after
+        # publish, one Lua operation transfers it into the staged counter.
+        reservation_size = declared_length or expected_length or MAX_SEGMENT_BYTES
+        reservation_result = _reserve_upload_bytes(
+            job_id, upload_token, reservation_size,
+        )
+        if reservation_result < 0:
+            raise HTTPException(
+                status_code=503,
+                detail="Upload byte coordination unavailable",
+            )
+        # Staged + positive reservations must be one logical generation. A
+        # sibling publish atomically moves bytes between those buckets; adding
+        # two Python snapshots from opposite sides of that move false-413s a
+        # job exactly at quota.
+        on_disk, reserved_in_flight, quota_total = _upload_quota_usage(
+            job_id, staging_root,
+        )
+        if quota_total > MAX_JOB_STAGING_BYTES:
             if _published_target_has_bytes(target):
                 return await _stream_segment_to_disk(
                     request=request, db=db, meta=meta, job_id=job_id, track=track,
                     seq=seq, target=target, expected_length=expected_length,
+                    expected_min_length=expected_min_length,
+                    expected_length_is_exact=expected_length_is_exact,
+                    declared_length=declared_length,
+                    upload_token=upload_token,
+                    coordination_required=True,
+                    byte_reservation_required=True,
                 )
             raise HTTPException(
                 status_code=413,
@@ -1514,19 +2876,49 @@ async def upload_segment(
                 ),
             )
 
-        return await _stream_segment_to_disk(
+        result = await _stream_segment_to_disk(
             request=request, db=db, meta=meta, job_id=job_id, track=track,
             seq=seq, target=target, expected_length=expected_length,
+            expected_min_length=expected_min_length,
+            expected_length_is_exact=expected_length_is_exact,
+            declared_length=declared_length,
+            upload_token=upload_token,
+            coordination_required=True,
+            byte_reservation_required=True,
         )
+        if result.pop("_retain_upload_reservation", False):
+            # Staged-counter update was not confirmed after publish. Keep the
+            # exact reservation until TTL so the bytes cannot become invisible
+            # to the next quota check; a later counter miss re-seeds from disk.
+            claim_resolved = _retain_upload_reservation(
+                job_id, upload_token,
+            )
+            release_claim = False
+        return result
     finally:
-        _release_upload_slot(job_id)
+        own_part = target.parent / f"{target.name}.{upload_token}.part"
+        if not _cleanup_upload_part_before_claim_release(job_id, own_part):
+            claim_resolved = _retain_upload_reservation(
+                job_id, upload_token,
+            )
+            release_claim = False
+        if release_claim:
+            claim_resolved = _release_upload_claim(job_id, upload_token)
+        # The marker is the publish-generation guard for dirty/cold scans.
+        # Remove it only after Redis confirms the positive lease was deleted
+        # or converted to a negative byte-only lease.  On ambiguous Redis
+        # failure it intentionally survives until token TTL/reconciliation.
+        if claim_resolved:
+            _best_effort_unlink(
+                _upload_publish_marker_path(target, upload_token)
+            )
 
 
 # Errnos returned by link() when the underlying filesystem can't honour
 # hard links: NAS bind mounts (SMB/CIFS/SSHFS) commonly return EPERM,
 # some FUSE drivers return EOPNOTSUPP/ENOTSUP/ENOSYS, and a staging tree
 # that straddles a mount boundary returns EXDEV. Any of these means
-# "fall back to a copy-based publish", not "abort the upload".
+# "fall back to a serialized same-directory rename", not "abort the upload".
 _LINK_UNSUPPORTED_ERRNOS = frozenset(
     e for e in (
         getattr(errno, "EXDEV", None),
@@ -1536,104 +2928,491 @@ _LINK_UNSUPPORTED_ERRNOS = frozenset(
         getattr(errno, "ENOSYS", None),
     ) if e is not None
 )
+_RUNNING_ON_WINDOWS = os.name == "nt"
 
 
-def _atomic_publish_part(part_target: Path, target: Path) -> None:
+def _windows_invalid_function(error: OSError) -> bool:
+    """Windows SMB unsupported-operation errors map to errno.EINVAL."""
+    return (
+        _RUNNING_ON_WINDOWS
+        and getattr(error, "winerror", None) in (1, 50)
+        and getattr(error, "errno", None) == errno.EINVAL
+    )
+
+
+def _link_is_unsupported(error: OSError) -> bool:
+    return error.errno in _LINK_UNSUPPORTED_ERRNOS or _windows_invalid_function(error)
+
+
+class _PublishBusyError(RuntimeError):
+    pass
+
+
+def _publish_lock_path(target: Path) -> Path:
+    return target.with_name(f".{target.name}.publish.lock")
+
+
+def _upload_publish_marker_path(target: Path, upload_token: str) -> Path:
+    """Return the zero-byte generation guard for a coordinated publish."""
+    return target.with_name(f"{target.name}.publish.{upload_token}.part")
+
+
+def _create_upload_publish_marker(target: Path, upload_token: str) -> Path:
+    """Create a token-owned marker without ever replacing an older guard."""
+    marker = _upload_publish_marker_path(target, upload_token)
+    fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    return marker
+
+
+def _lock_publish_fd(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_publish_fd(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+_ADVISORY_LOCK_UNSUPPORTED_ERRNOS = frozenset(
+    e for e in (
+        getattr(errno, "ENOSYS", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "ENOTSUP", None),
+    ) if e is not None
+)
+
+
+def _redis_publish_lock_key(target: Path) -> str:
+    try:
+        relative = target.resolve(strict=False).relative_to(
+            Path(STAGING_DIR).resolve(strict=False)
+        )
+        identity = relative.as_posix()
+    except (OSError, ValueError):
+        identity = str(target.absolute()).replace("\\", "/")
+    return f"wv2nas:publish_lock:{identity}"
+
+
+def _acquire_redis_publish_lock(
+    lock_path: Path, target: Path,
+) -> tuple[Path, None, tuple[str, str, str]]:
+    """Bounded crash-recoverable fallback when a NAS lacks advisory locks."""
+    key = _redis_publish_lock_key(target)
+    owner = uuid.uuid4().hex
+    try:
+        claimed = redis_client.set(
+            key,
+            owner,
+            nx=True,
+            ex=_UPLOAD_SLOT_KEY_TTL_SECONDS,
+        )
+    except Exception as e:
+        # SET NX may commit and lose its reply. Confirm our unique owner before
+        # failing closed; otherwise the key's TTL provides crash recovery.
+        try:
+            current = redis_client.get(key)
+            if isinstance(current, bytes):
+                current = current.decode("utf-8", errors="strict")
+            if str(current) == owner:
+                return lock_path, None, ("redis", key, owner)
+        except Exception:
+            pass
+        raise _PublishBusyError(f"Redis publish lock unavailable: {e}") from e
+    if not claimed:
+        raise _PublishBusyError("another upload is publishing this target")
+    return lock_path, None, ("redis", key, owner)
+
+
+def _acquire_publish_lock(
+    target: Path,
+) -> tuple[Path, Optional[int], object]:
+    """Acquire a crash-recoverable advisory lock for one final target.
+
+    The tiny lock file intentionally persists with the staging job. Kernel
+    ownership is tied to the open descriptor, so process death releases it
+    automatically; unlike mkdir locks there is no orphan that wedges retry.
+    """
+    lock_path = _publish_lock_path(target)
+    fd: Optional[int] = None
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        stat_result = os.fstat(fd)
+        if stat_result.st_size == 0:
+            os.write(fd, b"\0")
+            stat_result = os.fstat(fd)
+        try:
+            _lock_publish_fd(fd)
+        except OSError as e:
+            if (
+                e.errno not in _ADVISORY_LOCK_UNSUPPORTED_ERRNOS
+                and not _windows_invalid_function(e)
+            ):
+                raise
+            os.close(fd)
+            fd = None
+            return _acquire_redis_publish_lock(lock_path, target)
+        return (
+            lock_path,
+            fd,
+            (int(stat_result.st_dev), int(stat_result.st_ino)),
+        )
+    except Exception as e:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if isinstance(e, (BlockingIOError, PermissionError)) or getattr(
+            e, "errno", None
+        ) in (errno.EACCES, errno.EAGAIN):
+            raise _PublishBusyError("another upload is publishing this target") from e
+        raise _PublishBusyError(f"publish advisory lock unavailable: {e}") from e
+
+
+def _publish_target_for_lock(lock_path: Path) -> Optional[Path]:
+    suffix = ".publish.lock"
+    name = lock_path.name
+    if not name.startswith(".") or not name.endswith(suffix):
+        return None
+    target_name = name[1:-len(suffix)]
+    return lock_path.with_name(target_name) if target_name else None
+
+
+def _publish_lock_matches(lock_path: Path, identity: object) -> bool:
+    if (
+        isinstance(identity, tuple)
+        and len(identity) == 3
+        and identity[0] == "redis"
+    ):
+        _mode, key, owner = identity
+        try:
+            current = redis_client.get(str(key))
+            if isinstance(current, bytes):
+                current = current.decode("utf-8", errors="strict")
+            return str(current) == str(owner)
+        except Exception:
+            return False
+    try:
+        stat_result = lock_path.stat()
+        return (int(stat_result.st_dev), int(stat_result.st_ino)) == identity
+    except OSError:
+        return False
+
+
+def _refresh_publish_lock(
+    lock_path: Path, fd: Optional[int], identity: object,
+) -> bool:
+    """Confirm ownership and extend a Redis fallback lock atomically.
+
+    Advisory locks are tied to the live file descriptor and do not expire, so
+    their refresh is just an inode-identity check. Redis fallback locks need a
+    compare-owner EXPIRE before each publish/accounting boundary; otherwise a
+    long NAS operation could let the TTL lapse and expose the target to
+    finalize while staged-byte accounting is still in progress.
+    """
+    if fd is not None:
+        return _publish_lock_matches(lock_path, identity)
+    if not (
+        isinstance(identity, tuple)
+        and len(identity) == 3
+        and identity[0] == "redis"
+    ):
+        return False
+    _mode, key, owner = identity
+    try:
+        evaluator = getattr(redis_client, "eval", None)
+        if not callable(evaluator):
+            raise RuntimeError("Redis EVAL is required for lock refresh")
+        refreshed = evaluator(
+            _REDIS_PUBLISH_LOCK_REFRESH_LUA,
+            1,
+            str(key),
+            str(owner),
+            _UPLOAD_SLOT_KEY_TTL_SECONDS,
+        )
+        return int(refreshed or 0) == 1
+    except Exception as e:
+        logger.warning(f"Redis publish lock refresh failed for {lock_path}: {e}")
+        return False
+
+
+def _start_publish_lock_heartbeat(
+    lock_path: Path, fd: Optional[int], identity: object,
+) -> Optional[tuple[threading.Event, threading.Thread]]:
+    """Renew a Redis fallback lock while the owning request may block on NAS.
+
+    A daemon thread is intentional here: the upload route performs synchronous
+    filesystem calls, so an asyncio task could not run while a remote rename
+    or fsync stalls the event loop. Process death stops the heartbeat and the
+    Redis TTL still provides crash recovery.
+    """
+    if fd is not None or not (
+        isinstance(identity, tuple)
+        and len(identity) == 3
+        and identity[0] == "redis"
+    ):
+        return None
+    stop = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop.wait(_PUBLISH_LOCK_REFRESH_INTERVAL_SECONDS):
+            if not _refresh_publish_lock(lock_path, fd, identity):
+                # Keep retrying at the bounded cadence. A transient Redis
+                # failure may recover before the existing TTL expires; a
+                # changed owner is protected by the Lua compare-owner check.
+                logger.warning(
+                    f"Redis publish lock heartbeat could not renew {lock_path}"
+                )
+
+    worker = threading.Thread(
+        target=heartbeat,
+        name="wv2nas-publish-lock-heartbeat",
+        daemon=True,
+    )
+    worker.start()
+    return stop, worker
+
+
+def _stop_publish_lock_heartbeat(
+    heartbeat: Optional[tuple[threading.Event, threading.Thread]],
+) -> None:
+    if heartbeat is None:
+        return
+    stop, worker = heartbeat
+    stop.set()
+    # Never let a stuck Redis socket wedge the upload response. The daemon may
+    # finish later; compare-owner refresh cannot recreate a released key.
+    worker.join(timeout=1.0)
+
+
+def _release_publish_lock(
+    lock_path: Path, fd: Optional[int], identity: object,
+    heartbeat: Optional[tuple[threading.Event, threading.Thread]] = None,
+) -> None:
+    _stop_publish_lock_heartbeat(heartbeat)
+    if fd is None:
+        if not (
+            isinstance(identity, tuple)
+            and len(identity) == 3
+            and identity[0] == "redis"
+        ):
+            return
+        _mode, key, owner = identity
+        try:
+            evaluator = getattr(redis_client, "eval", None)
+            if not callable(evaluator):
+                raise RuntimeError("Redis EVAL is required for lock release")
+            evaluator(_REDIS_PUBLISH_LOCK_RELEASE_LUA, 1, str(key), str(owner))
+        except Exception as e:
+            # Never delete without compare-owner. TTL bounds a crash or Redis
+            # fault; another writer cannot lose its lock to this cleanup.
+            logger.warning(f"Redis publish lock release failed for {lock_path}: {e}")
+        return
+    try:
+        _unlock_publish_fd(fd)
+    except Exception as e:
+        logger.warning(f"Publish lock release failed for {lock_path}: {e}")
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _target_file_state(target: Path) -> str:
+    """Return missing/zero/nonzero/error without conflating stat failures."""
+    try:
+        stat_result = target.stat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "error"
+    if not target.is_file():
+        return "error"
+    return "zero" if stat_result.st_size == 0 else "nonzero"
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    """Atomically rename ``source`` only when ``target`` is absent.
+
+    A Redis lease cannot fence a writer that is already blocked inside a NAS
+    syscall: its key may expire, a new owner may publish, and the stale
+    owner's later ``os.replace`` would overwrite the new generation.  The
+    filesystem commit itself therefore needs no-replace semantics.  Windows'
+    rename already has that contract; Linux exposes it as renameat2(2).
+    Other/older platforms fail closed instead of silently reverting to an
+    overwrite-capable rename.
+    """
+    if _RUNNING_ON_WINDOWS:
+        os.rename(str(source), str(target))
+        return
+    if sys.platform.startswith("linux"):
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOSYS,
+                "renameat2(RENAME_NOREPLACE) is unavailable",
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,  # AT_FDCWD
+            os.fsencode(source),
+            -100,
+            os.fsencode(target),
+            1,  # RENAME_NOREPLACE
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), target)
+        raise OSError(error_number, os.strerror(error_number), target)
+    raise OSError(
+        errno.ENOSYS,
+        "atomic no-replace rename is unavailable on this platform",
+    )
+
+
+def _atomic_publish_part(
+    part_target: Path,
+    target: Path,
+    *,
+    retain_fallback_lock: bool = False,
+    publish_token: Optional[str] = None,
+) -> Optional[tuple[
+    Path,
+    Optional[int],
+    object,
+    Optional[tuple[threading.Event, threading.Thread]],
+]]:
     """Publish staged bytes from `part_target` to `target` atomically.
 
     Succeeds iff `target` did not exist; raises FileExistsError otherwise
     so the caller can apply its dedupe / loser-of-race policy. os.link is
     preferred (race-free, no extra IO), but several common deployment
     filesystems — SMB/CIFS/SSHFS NAS mounts, some FUSE drivers — refuse
-    link() outright. On those we fall back to an O_CREAT|O_EXCL open of
-    the target plus a streamed copy, which preserves the same
-    test-and-publish guarantee.
+    link() outright. On those a crash-recoverable advisory file lock serializes
+    the same-directory rename. The lock also makes legacy zero-byte placeholders
+    repairable without leaving a permanent orphan after process death.
+
+    When ``retain_fallback_lock`` is true, the no-hardlink path returns its
+    live advisory-lock handle instead of releasing it. Upload callers keep
+    that handle through staged-byte accounting so finalize cannot observe a
+    renamed target in the publish->accounting gap. The hard-link path returns
+    ``None`` and keeps the source ``.part`` as that gap's visible guard.
     """
     try:
         os.link(str(part_target), str(target))
-        return
+        return None
     except FileExistsError:
-        raise
+        state = _target_file_state(target)
+        if state == "nonzero":
+            raise
+        if state == "error":
+            raise _PublishBusyError("cannot safely inspect existing publish target")
     except OSError as e:
-        if e.errno not in _LINK_UNSUPPORTED_ERRNOS:
+        if not _link_is_unsupported(e):
             raise
 
-    # Codex adversarial-review (high): two-stage publish for the no-
-    # hardlink fallback. The previous version opened `target` directly
-    # with O_CREAT|O_EXCL and copied bytes through that fd, so a
-    # mid-copy crash (process killed, container OOM, disk full mid-
-    # write) left a NON-EMPTY but PARTIAL file at the FINAL `target`
-    # path. The retry idempotency check would then accept it as
-    # "already committed" because target.exists() && size > 0, and
-    # `_verify_staging_complete` only checks presence + non-zero, so
-    # finalize would mux corrupt bytes into the user-visible MP4.
-    # Especially plausible because this fallback is targeted at
-    # SMB/CIFS/SSHFS NAS mounts, where the copy time is non-trivial.
-    #
-    # Two-stage publish:
-    #   1. O_CREAT|O_EXCL on `target` claims ownership (preserves
-    #      the test-and-publish FileExistsError contract). Close
-    #      the fd immediately; we do NOT write through it. Crash
-    #      now → target is 0-byte, _verify rejects (zero_byte) and
-    #      retry overwrites via the existing 0-byte handling.
-    #   2. Copy bytes to `<target>.publish.<token>.part`. The
-    #      `.part` extension makes the existing in-flight upload
-    #      guard in _verify_staging_complete catch a stale tmp.
-    #      Crash now → target is 0-byte AND publish.part visible;
-    #      verify rejects on either basis.
-    #   3. `os.replace(publish_tmp, target)` is atomic on the same
-    #      filesystem (rename(2) syscall). Either the rename
-    #      completes (target now contains the full bytes) or fails
-    #      before applying (target stays 0-byte, publish.part
-    #      stays). No torn state at the final path.
-    import secrets as _secrets
-    publish_token = _secrets.token_hex(8)
-    publish_tmp = target.parent / f"{target.name}.publish.{publish_token}.part"
-
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    sentinel_fd = os.open(str(target), flags, 0o644)
+    lock_path, lock_fd, lock_identity = _acquire_publish_lock(target)
+    lock_heartbeat = _start_publish_lock_heartbeat(
+        lock_path, lock_fd, lock_identity,
+    )
+    release_lock = True
+    publish_marker: Optional[Path] = None
     try:
-        # Don't write through the sentinel fd — close it now so the
-        # only path that can populate `target` is the atomic rename.
-        os.close(sentinel_fd)
-        sentinel_fd = -1
-
-        with open(str(publish_tmp), "wb") as dst:
-            with open(str(part_target), "rb") as src:
-                while True:
-                    chunk = src.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-            dst.flush()
-            try:
-                os.fsync(dst.fileno())
-            except OSError:
-                pass
-
-        # Atomic publish — replaces the 0-byte sentinel at `target`
-        # with the fully-written publish_tmp in one rename(2). No
-        # window where `target` contains partial bytes.
-        os.replace(str(publish_tmp), str(target))
-    except BaseException:
-        # Best-effort cleanup of BOTH the sentinel and the publish
-        # tmp so retry doesn't see leftover state. The sentinel
-        # being 0-byte at this point is also handled by the verify
-        # zero-byte rejection if cleanup fails.
-        if sentinel_fd != -1:
-            try:
-                os.close(sentinel_fd)
-            except OSError:
-                pass
+        state = _target_file_state(target)
+        if state == "nonzero":
+            raise FileExistsError(str(target))
+        if state == "error":
+            raise _PublishBusyError("cannot safely inspect existing publish target")
+        if state == "zero":
+            # Legacy crash placeholder from the older sentinel fallback. New
+            # writers never create one, and only the lock owner may remove it.
+            target.unlink(missing_ok=True)
+        if not _refresh_publish_lock(lock_path, lock_fd, lock_identity):
+            raise _PublishBusyError("publish lock ownership was lost")
+        if retain_fallback_lock and publish_token:
+            # Unlike the hard-link path, os.replace removes the source part.
+            # Create a token-owned generation guard under the live publish
+            # lock before the rename, so dirty quota scans can distinguish a
+            # newly visible final from already-reserved in-flight bytes.
+            publish_marker = _create_upload_publish_marker(
+                target, publish_token,
+            )
         try:
-            os.unlink(str(target))
-        except OSError:
-            pass
-        try:
-            os.unlink(str(publish_tmp))
-        except OSError:
-            pass
-        raise
+            _rename_noreplace(part_target, target)
+        except FileExistsError:
+            # The filesystem is the final fencing authority. A new Redis owner
+            # may have published after our last refresh; never overwrite it.
+            raise FileExistsError(str(target))
+        if retain_fallback_lock:
+            release_lock = False
+            return lock_path, lock_fd, lock_identity, lock_heartbeat
+        return None
+    finally:
+        if release_lock:
+            if publish_marker is not None:
+                _best_effort_unlink(publish_marker)
+            _release_publish_lock(
+                lock_path, lock_fd, lock_identity, lock_heartbeat,
+            )
+
+
+def _cleanup_upload_part_before_claim_release(
+    job_id: str, part_target: Path,
+) -> bool:
+    """Remove one token-owned temp file before releasing its byte lease.
+
+    A failed unlink leaves real bytes on disk. Confirming the staged-byte dirty
+    marker makes the next quota gate reconcile that orphan from disk; if Redis
+    cannot confirm the marker either, the exact token reservation must stay
+    alive until lease expiry instead of opening an unaccounted quota hole.
+    """
+    try:
+        part_target.unlink(missing_ok=True)
+        return True
+    except OSError as e:
+        logger.warning(f"Upload temp cleanup failed for {part_target}: {e}")
+    if _mark_staged_bytes_dirty(job_id):
+        return True
+    logger.error(
+        f"Upload temp cleanup and staged-byte invalidation both failed for "
+        f"{part_target}; retaining exact upload reservation"
+    )
+    return False
+
+
+def _best_effort_unlink(path: Path) -> bool:
+    """Remove a temp path without allowing cleanup failure to mask its cause."""
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        # The endpoint wrapper performs the quota-safe dirty/retain decision.
+        return False
 
 
 def _upload_final_target_for_part(part_path: Path) -> Optional[Path]:
@@ -1677,10 +3456,19 @@ def _is_nonzero_file(path: Path) -> bool:
         return False
 
 
-def _cleanup_stale_parts_for_published_target(target: Path) -> None:
-    """Best-effort cleanup for leftover temp parts after a target committed."""
+def _cleanup_stale_parts_for_published_target(
+    target: Path, *, protected_tokens: Optional[set[str]] = None,
+) -> None:
+    """Remove only inactive leftovers for an already-published target.
+
+    A live hard-link publisher deliberately keeps its token-owned source part
+    until staged-byte accounting commits. An idempotent retry must not unlink
+    that guard. Callers therefore supply Redis' active-token snapshot; when
+    coordination is unavailable they skip cleanup entirely (fail closed).
+    """
     if not _is_nonzero_file(target):
         return
+    protected = protected_tokens or set()
     try:
         candidates = list(target.parent.glob(f"{target.name}.*.part"))
     except OSError:
@@ -1688,17 +3476,27 @@ def _cleanup_stale_parts_for_published_target(target: Path) -> None:
     for part in candidates:
         if _upload_final_target_for_part(part) != target:
             continue
+        pieces = part.name.rsplit(".", 2)
+        token = pieces[-2] if len(pieces) == 3 else ""
+        if token in protected:
+            continue
         try:
             part.unlink(missing_ok=True)
         except OSError:
-            # Finalize also treats this as recoverable if the published
-            # target is present and non-empty.
+            # Finalize applies the same active-token rule and can retry this
+            # cleanup without risking the committed target.
             pass
 
 
 async def _stream_segment_to_disk(
     *, request: Request, db: Session, meta, job_id: str, track: str,
     seq: int, target: Path, expected_length: Optional[int] = None,
+    expected_min_length: Optional[int] = None,
+    expected_length_is_exact: bool = True,
+    declared_length: Optional[int] = None,
+    upload_token: Optional[str] = None,
+    coordination_required: bool = False,
+    byte_reservation_required: bool = False,
 ):
     """Inner streaming body — extracted so the slot/quota wrapper above
     stays focused. Same atomic-rename + post-stream re-check as before."""
@@ -1715,15 +3513,30 @@ async def _stream_segment_to_disk(
     # prior-commit bytes for the bad retry bytes, and finalize's
     # count check (length-only, not content) would ship a corrupt MP4.
     if _published_target_has_bytes(target):
-        _cleanup_stale_parts_for_published_target(target)
+        if coordination_required:
+            active_tokens = _active_upload_tokens(job_id)
+            if active_tokens is not None:
+                _cleanup_stale_parts_for_published_target(
+                    target, protected_tokens=active_tokens,
+                )
+        else:
+            _cleanup_stale_parts_for_published_target(target)
         # Drain the request body so the HTTP/1.1 connection isn't
         # wedged with unread bytes. Cost: bandwidth waste on the
         # repeat upload — acceptable, since this is a rare retry path.
         drained = 0
+        drain_limit = _upload_body_limit(expected_length, declared_length)
         try:
-            async for chunk in request.stream():
+            async for chunk in _iter_upload_chunks(
+                request, job_id, db,
+                upload_token=upload_token,
+                coordination_required=coordination_required,
+                byte_reservation_required=byte_reservation_required,
+            ):
                 if chunk:
                     drained += len(chunk)
+                    if drained >= drain_limit:
+                        break
         except Exception:
             pass
         return {
@@ -1747,21 +3560,41 @@ async def _stream_segment_to_disk(
     # because legitimate retries produce identical content (segments
     # are deterministic per URL).
     import secrets as _secrets
-    attempt_token = _secrets.token_hex(8)
+    # Reuse the Redis lease owner in the filename so an authoritative disk
+    # scan can distinguish a live, already-reserved attempt from an orphan
+    # left by a killed API process. Direct unit calls without coordination get
+    # an unowned random token and are conservatively counted.
+    attempt_token = upload_token or _secrets.token_hex(16)
     part_target = target.parent / f"{target.name}.{attempt_token}.part"
     written = 0
+    # A declared byte range is also the streaming hard cap, not merely a
+    # post-write equality check. Reserving (for example) 8 MiB while allowing
+    # the temporary file to grow toward MAX_SEGMENT_BYTES would let concurrent
+    # malicious PUTs bypass the exact in-flight reservation and staging quota.
+    stream_limit = _upload_body_limit(expected_length, declared_length)
     try:
         with open(part_target, "wb") as fh:
-            async for chunk in request.stream():
+            async for chunk in _iter_upload_chunks(
+                request, job_id, db,
+                upload_token=upload_token,
+                coordination_required=coordination_required,
+                byte_reservation_required=byte_reservation_required,
+            ):
                 if not chunk:
                     continue
                 written += len(chunk)
-                if written > MAX_SEGMENT_BYTES:
+                if written > stream_limit:
                     fh.close()
-                    part_target.unlink(missing_ok=True)
+                    _best_effort_unlink(part_target)
+                    detail = (
+                        f"Segment {track}/{seq} exceeds planned length "
+                        f"{expected_length} bytes"
+                        if expected_length is not None
+                        else f"Segment exceeds MAX_SEGMENT_BYTES={MAX_SEGMENT_BYTES}"
+                    )
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Segment exceeds MAX_SEGMENT_BYTES={MAX_SEGMENT_BYTES}",
+                        detail=detail,
                     )
                 fh.write(chunk)
             fh.flush()
@@ -1771,6 +3604,17 @@ async def _stream_segment_to_disk(
                 # fsync can fail on tmpfs / virtualised FS — best-effort.
                 pass
 
+        if coordination_required and not _refresh_upload_coordination_ttl(
+            job_id,
+            upload_token,
+            require_slot=True,
+            require_reserved=byte_reservation_required,
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Upload coordination lease was lost before publish; retry",
+            )
+
         # Codex review (P2): reject zero-byte segments BEFORE publish.
         # A successful HTTP 200 from a CDN with an empty body would
         # otherwise become a published `seg_*.bin` of size 0; the
@@ -1779,7 +3623,7 @@ async def _stream_segment_to_disk(
         # at /finalize time — too late for the upload retry to
         # recover. Same fail-fast semantics as the init segment path.
         if written == 0:
-            part_target.unlink(missing_ok=True)
+            _best_effort_unlink(part_target)
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -1788,14 +3632,42 @@ async def _stream_segment_to_disk(
                     f"failure — extension should retry)"
                 ),
             )
-        if expected_length is not None and written != expected_length:
-            part_target.unlink(missing_ok=True)
+        if (
+            expected_length is not None
+            and (
+                (expected_length_is_exact and written != expected_length)
+                or (
+                    not expected_length_is_exact
+                    and expected_min_length is not None
+                    and written < expected_min_length
+                )
+            )
+        ):
+            _best_effort_unlink(part_target)
+            expected_description = (
+                f"{expected_length} bytes"
+                if expected_length_is_exact
+                else (
+                    f"{expected_min_length}..{expected_length} bytes"
+                    if expected_min_length is not None
+                    else f"at most {expected_length} bytes"
+                )
+            )
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Segment {track}/{seq} length mismatch: "
-                    f"expected {expected_length} bytes, received {written}; "
+                    f"expected {expected_description}, received {written}; "
                     f"refusing to publish"
+                ),
+            )
+        if declared_length is not None and written != declared_length:
+            _best_effort_unlink(part_target)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Segment {track}/{seq} Content-Length mismatch: "
+                    f"declared {declared_length}, received {written}"
                 ),
             )
         # Codex review #6: re-check status atomically with the rename
@@ -1813,7 +3685,7 @@ async def _stream_segment_to_disk(
         if recheck is None or recheck.status not in (
             "browser_pending", "browser_uploading"
         ):
-            part_target.unlink(missing_ok=True)
+            _best_effort_unlink(part_target)
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1827,62 +3699,75 @@ async def _stream_segment_to_disk(
         # PUT had already published a good segment would have its bytes
         # replaced by the (possibly different) retry bytes. The helper
         # raises FileExistsError if target already exists, giving us an
-        # OS-level atomic test-and-publish (with a copy fallback for
+        # OS-level atomic test-and-publish (with a rename fallback for
         # filesystems that don't support hard links).
+        fallback_publish_lock = None
         try:
-            _atomic_publish_part(part_target, target)
+            fallback_publish_lock = _atomic_publish_part(
+                part_target,
+                target,
+                retain_fallback_lock=coordination_required,
+                publish_token=upload_token if coordination_required else None,
+            )
+        except _PublishBusyError as e:
+            _best_effort_unlink(part_target)
+            raise HTTPException(
+                status_code=503,
+                detail=str(e),
+                headers={"Retry-After": "1"},
+            )
         except FileExistsError:
-            # Target exists. Distinguish "real prior commit" (non-zero
-            # bytes — racer won) from "0-byte placeholder" (rare, but
-            # shouldn't block our legitimate write — atomic flow
-            # otherwise prevents 0-byte files appearing at the final
-            # path).
+            # Real prior commit. Discard our bytes — legitimate retries are
+            # deterministic, while a stale-token retry could differ.
+            _best_effort_unlink(part_target)
+            return {
+                "seq": seq, "track": track, "received": written,
+                "idempotent_concurrent": True,
+            }
+        if coordination_required and upload_token and fallback_publish_lock is None:
+            # os.link keeps the source part as an inode guard already.  Add an
+            # explicit marker before that source is later unlinked so the
+            # positive reservation remains distinguishable through release.
             try:
-                existing_size = target.stat().st_size
-            except OSError:
-                existing_size = -1
-            if existing_size == 0:
-                # 0-byte placeholder. Overwrite via os.replace —
-                # acceptable race because any concurrent writer also
-                # sees the placeholder as broken state.
-                try:
-                    os.replace(str(part_target), str(target))
-                except OSError:
-                    part_target.unlink(missing_ok=True)
-                    return {
-                        "seq": seq, "track": track, "received": written,
-                        "idempotent_concurrent": True,
-                    }
-            else:
-                # Real prior commit. Discard our bytes — legitimate
-                # retries produce identical content (segments are
-                # deterministic per URL), but a stale-token retry
-                # could carry different bytes; trust the prior commit.
-                part_target.unlink(missing_ok=True)
-                return {
-                    "seq": seq, "track": track, "received": written,
-                    "idempotent_concurrent": True,
-                }
-        # Link succeeded → both paths point at the same inode. Remove
-        # the .part path so verify glob doesn't see leftover. (When we
-        # fell back to os.replace above, .part was renamed-away; the
-        # unlink below is a no-op via missing_ok.)
-        try:
-            part_target.unlink(missing_ok=True)
-        except OSError:
-            pass
+                _create_upload_publish_marker(target, upload_token)
+            except OSError as e:
+                # A dirty scan can still correlate the hard-linked source and
+                # final inode during this short path.  Do not roll back the
+                # already-published target merely because the extra guard was
+                # unavailable.
+                logger.warning(
+                    f"Publish generation marker failed for {target}: {e}"
+                )
         # Codex review (P2): incrementally track staged bytes so the
         # PUT quota gate stays O(1). Only credited on real publish — not
         # on the idempotent-existing-file early return, not on
         # idempotent_concurrent (loser-of-race), not on streaming
-        # errors. Doing this AFTER the unlink keeps the counter
-        # consistent with on-disk bytes if a failure between the publish
-        # and the record drops us through the exception path.
-        _staged_bytes_record(job_id, written)
+        # errors. The hard-link source part stays visible until this record;
+        # the rename fallback keeps its publish lock live over the same gap.
+        try:
+            staged_counter_recorded = (
+                _staged_bytes_record(
+                    job_id, written, upload_token=upload_token,
+                )
+                if coordination_required else True
+            )
+        finally:
+            if fallback_publish_lock is not None:
+                _release_publish_lock(*fallback_publish_lock)
+        # Never roll back an already-published target when accounting is
+        # uncertain: finalize may already have verified/enqueued that exact
+        # file. The endpoint wrapper retains this request's exact reservation
+        # until lease expiry, so future quota gates still see the bytes.
+        if staged_counter_recorded:
+            _best_effort_unlink(part_target)
+    except asyncio.CancelledError:
+        _best_effort_unlink(part_target)
+        raise
     except HTTPException:
+        _best_effort_unlink(part_target)
         raise
     except Exception as e:
-        part_target.unlink(missing_ok=True)
+        _best_effort_unlink(part_target)
         logger.error(f"Failed to stream segment {job_id}/{track}/{seq}: {e}")
         raise HTTPException(status_code=500, detail="Segment write failed")
 
@@ -1899,7 +3784,10 @@ async def _stream_segment_to_disk(
         except Exception:
             db.rollback()
 
-    return {"seq": seq, "track": track, "received": written}
+    result = {"seq": seq, "track": track, "received": written}
+    if not staged_counter_recorded:
+        result["_retain_upload_reservation"] = True
+    return result
 
 
 @app.put("/api/jobs/{job_id}/init")
@@ -1923,13 +3811,31 @@ async def upload_init_segment(
 
     target = _init_segment_path(job_id, track)
     target.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = _staging_path_for(job_id)
+    expected_init_length = _expected_init_length_for_track(staging_root, track)
+    declared_length = _declared_upload_length(request)
+    if (
+        declared_length is not None
+        and expected_init_length is not None
+        and declared_length > expected_init_length
+    ):
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Content-Length {declared_length} exceeds planned init "
+                f"length {expected_init_length} for {track}"
+            ),
+        )
 
     # Codex review #9: same slot + quota gate as upload_segment. Init
     # uploads share the per-job concurrency budget so they can't be used
     # to bypass the cap by interleaving with media-segment PUTs.
-    slot_count = _claim_upload_slot(job_id)
+    upload_token = uuid.uuid4().hex
+    slot_count = _claim_upload_slot(job_id, upload_token)
     if slot_count < 0:
         raise HTTPException(status_code=503, detail="Upload coordination unavailable")
+    release_claim = True
+    claim_resolved = False
     try:
         if slot_count > MAX_CONCURRENT_UPLOADS_PER_JOB:
             raise HTTPException(
@@ -1938,20 +3844,42 @@ async def upload_init_segment(
                     f"Per-job concurrent upload cap "
                     f"({MAX_CONCURRENT_UPLOADS_PER_JOB}) reached; retry shortly"
                 ),
+                headers={"Retry-After": "1"},
             )
 
         if _published_target_has_bytes(target):
             return await _stream_init_to_disk(
                 request=request, db=db, job_id=job_id, track=track, target=target,
+                expected_length=expected_init_length,
+                declared_length=declared_length,
+                upload_token=upload_token,
+                coordination_required=True,
             )
 
-        staging_root = _staging_path_for(job_id)
-        on_disk = _staged_bytes_get(job_id, staging_root)
-        reserved_in_flight = slot_count * MAX_SEGMENT_BYTES
-        if on_disk + reserved_in_flight > MAX_JOB_STAGING_BYTES:
+        _staged_bytes_get(job_id, staging_root)
+        reservation_size = (
+            declared_length or expected_init_length or MAX_SEGMENT_BYTES
+        )
+        reservation_result = _reserve_upload_bytes(
+            job_id, upload_token, reservation_size,
+        )
+        if reservation_result < 0:
+            raise HTTPException(
+                status_code=503,
+                detail="Upload byte coordination unavailable",
+            )
+        on_disk, reserved_in_flight, quota_total = _upload_quota_usage(
+            job_id, staging_root,
+        )
+        if quota_total > MAX_JOB_STAGING_BYTES:
             if _published_target_has_bytes(target):
                 return await _stream_init_to_disk(
                     request=request, db=db, job_id=job_id, track=track, target=target,
+                    expected_length=expected_init_length,
+                    declared_length=declared_length,
+                    upload_token=upload_token,
+                    coordination_required=True,
+                    byte_reservation_required=True,
                 )
             raise HTTPException(
                 status_code=413,
@@ -1962,15 +3890,42 @@ async def upload_init_segment(
                 ),
             )
 
-        return await _stream_init_to_disk(
+        result = await _stream_init_to_disk(
             request=request, db=db, job_id=job_id, track=track, target=target,
+            expected_length=expected_init_length,
+            declared_length=declared_length,
+            upload_token=upload_token,
+            coordination_required=True,
+            byte_reservation_required=True,
         )
+        if result.pop("_retain_upload_reservation", False):
+            claim_resolved = _retain_upload_reservation(
+                job_id, upload_token,
+            )
+            release_claim = False
+        return result
     finally:
-        _release_upload_slot(job_id)
+        own_part = target.parent / f"{target.name}.{upload_token}.part"
+        if not _cleanup_upload_part_before_claim_release(job_id, own_part):
+            claim_resolved = _retain_upload_reservation(
+                job_id, upload_token,
+            )
+            release_claim = False
+        if release_claim:
+            claim_resolved = _release_upload_claim(job_id, upload_token)
+        if claim_resolved:
+            _best_effort_unlink(
+                _upload_publish_marker_path(target, upload_token)
+            )
 
 
 async def _stream_init_to_disk(
     *, request: Request, db: Session, job_id: str, track: str, target: Path,
+    expected_length: Optional[int] = None,
+    declared_length: Optional[int] = None,
+    coordination_required: bool = False,
+    byte_reservation_required: bool = False,
+    upload_token: Optional[str] = None,
 ):
     """Inner streaming body for init segment uploads — same shape as
     `_stream_segment_to_disk`. Codex review #12: per-attempt unique
@@ -1978,30 +3933,55 @@ async def _stream_init_to_disk(
     Codex review #13: idempotent retry — see _stream_segment_to_disk
     for the full rationale."""
     if _published_target_has_bytes(target):
-        _cleanup_stale_parts_for_published_target(target)
+        if coordination_required:
+            active_tokens = _active_upload_tokens(job_id)
+            if active_tokens is not None:
+                _cleanup_stale_parts_for_published_target(
+                    target, protected_tokens=active_tokens,
+                )
+        else:
+            _cleanup_stale_parts_for_published_target(target)
+        drained = 0
         try:
-            async for chunk in request.stream():
-                pass
+            async for chunk in _iter_upload_chunks(
+                request, job_id, db,
+                upload_token=upload_token,
+                coordination_required=coordination_required,
+                byte_reservation_required=byte_reservation_required,
+            ):
+                if chunk:
+                    drained += len(chunk)
+                    drain_limit = _upload_body_limit(
+                        expected_length, declared_length,
+                    )
+                    if drained >= drain_limit:
+                        break
         except Exception:
             pass
         return {"track": track, "received": 0, "idempotent": True}
 
     import secrets as _secrets
-    attempt_token = _secrets.token_hex(8)
+    attempt_token = upload_token or _secrets.token_hex(16)
     part_target = target.parent / f"{target.name}.{attempt_token}.part"
     written = 0
+    stream_limit = _upload_body_limit(expected_length, declared_length)
     try:
         with open(part_target, "wb") as fh:
-            async for chunk in request.stream():
+            async for chunk in _iter_upload_chunks(
+                request, job_id, db,
+                upload_token=upload_token,
+                coordination_required=coordination_required,
+                byte_reservation_required=byte_reservation_required,
+            ):
                 if not chunk:
                     continue
                 written += len(chunk)
-                if written > MAX_SEGMENT_BYTES:
+                if written > stream_limit:
                     fh.close()
-                    part_target.unlink(missing_ok=True)
+                    _best_effort_unlink(part_target)
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Init segment exceeds MAX_SEGMENT_BYTES={MAX_SEGMENT_BYTES}",
+                        detail=f"Init segment exceeds allowed length {stream_limit}",
                     )
                 fh.write(chunk)
             fh.flush()
@@ -2010,6 +3990,17 @@ async def _stream_init_to_disk(
             except OSError:
                 pass
 
+        if coordination_required and not _refresh_upload_coordination_ttl(
+            job_id,
+            upload_token,
+            require_slot=True,
+            require_reserved=byte_reservation_required,
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Upload coordination lease was lost before publish; retry",
+            )
+
         # Codex review (P2): reject zero-byte init bodies BEFORE the
         # publish. fMP4 / DASH init segments contain ftyp+moov boxes
         # the worker needs to mux; a 0-byte file would slip past
@@ -2017,12 +4008,30 @@ async def _stream_init_to_disk(
         # and only fail much later at finalize-then-mux time, with a
         # confusing "ffmpeg invalid data" error. Fail-fast at PUT.
         if written == 0:
-            part_target.unlink(missing_ok=True)
+            _best_effort_unlink(part_target)
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Init segment for track {track!r} arrived empty; "
                     f"refusing to publish"
+                ),
+            )
+        if expected_length is not None and written != expected_length:
+            _best_effort_unlink(part_target)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Init segment for {track!r} length mismatch: expected "
+                    f"{expected_length}, received {written}"
+                ),
+            )
+        if declared_length is not None and written != declared_length:
+            _best_effort_unlink(part_target)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Init segment for {track!r} Content-Length mismatch: "
+                    f"declared {declared_length}, received {written}"
                 ),
             )
         # Codex review #6: re-check status before final publish — see
@@ -2033,7 +4042,7 @@ async def _stream_init_to_disk(
         if recheck is None or recheck.status not in (
             "browser_pending", "browser_uploading"
         ):
-            part_target.unlink(missing_ok=True)
+            _best_effort_unlink(part_target)
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -2043,61 +4052,67 @@ async def _stream_init_to_disk(
             )
         # Codex review #17: atomic publish via _atomic_publish_part —
         # see _stream_segment_to_disk for full rationale.
-        # Codex review (P2): mirror the segment handler's 0-byte
-        # sentinel handling. The fallback path in _atomic_publish_part
-        # creates a 0-byte sentinel at `target` before the atomic
-        # rename. If a prior attempt crashed mid-publish, the sentinel
-        # persists and a retry hits FileExistsError. Without
-        # 0-byte detection, the retry returns success WITHOUT
-        # replacing the empty file, and finalize fails later with
-        # a confusing "init missing" or zero-byte rejection — even
-        # though the client believes it just succeeded.
+        fallback_publish_lock = None
         try:
-            _atomic_publish_part(part_target, target)
+            fallback_publish_lock = _atomic_publish_part(
+                part_target,
+                target,
+                retain_fallback_lock=coordination_required,
+                publish_token=upload_token if coordination_required else None,
+            )
+        except _PublishBusyError as e:
+            _best_effort_unlink(part_target)
+            raise HTTPException(
+                status_code=503,
+                detail=str(e),
+                headers={"Retry-After": "1"},
+            )
         except FileExistsError:
+            _best_effort_unlink(part_target)
+            return {
+                "track": track, "received": written,
+                "idempotent_concurrent": True,
+            }
+        if coordination_required and upload_token and fallback_publish_lock is None:
             try:
-                existing_size = target.stat().st_size
-            except OSError:
-                existing_size = -1
-            if existing_size == 0:
-                # 0-byte sentinel from a crashed prior attempt. Take
-                # ownership via os.replace — acceptable race because
-                # any concurrent writer also sees the placeholder as
-                # broken state.
-                try:
-                    os.replace(str(part_target), str(target))
-                except OSError:
-                    part_target.unlink(missing_ok=True)
-                    return {
-                        "track": track, "received": written,
-                        "idempotent_concurrent": True,
-                    }
-            else:
-                # Real prior commit. Discard our bytes — init segments
-                # are deterministic per URL, so a duplicate retry's
-                # bytes match the prior commit.
-                part_target.unlink(missing_ok=True)
-                return {
-                    "track": track, "received": written,
-                    "idempotent_concurrent": True,
-                }
-        try:
-            part_target.unlink(missing_ok=True)
-        except OSError:
-            pass
+                _create_upload_publish_marker(target, upload_token)
+            except OSError as e:
+                logger.warning(
+                    f"Publish generation marker failed for {target}: {e}"
+                )
         # Codex review (P2): see _stream_segment_to_disk for rationale.
-        _staged_bytes_record(job_id, written)
+        try:
+            staged_counter_recorded = (
+                _staged_bytes_record(
+                    job_id, written, upload_token=upload_token,
+                )
+                if coordination_required else True
+            )
+        finally:
+            if fallback_publish_lock is not None:
+                _release_publish_lock(*fallback_publish_lock)
+        if staged_counter_recorded:
+            _best_effort_unlink(part_target)
+    except asyncio.CancelledError:
+        _best_effort_unlink(part_target)
+        raise
     except HTTPException:
+        _best_effort_unlink(part_target)
         raise
     except Exception as e:
-        part_target.unlink(missing_ok=True)
+        _best_effort_unlink(part_target)
         logger.error(f"Failed to stream init segment {job_id}/{track}: {e}")
         raise HTTPException(status_code=500, detail="Init write failed")
 
-    return {"track": track, "received": written}
+    result = {"track": track, "received": written}
+    if not staged_counter_recorded:
+        result["_retain_upload_reservation"] = True
+    return result
 
 
-def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
+def _verify_staging_complete(
+    staging_root: Path, *, active_upload_tokens: Optional[set[str]] = None,
+) -> Dict[str, int]:
     """Verify every segment expected by the plan is present + atomic on
     disk. Returns the per-track (received, expected) summary on success.
 
@@ -2128,9 +4143,18 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
     # *.bin.part and rename-on-completion to *.bin. A live .part means
     # an upload is mid-stream; finalizing now races the rename.
     in_flight = []
+    active_tokens = active_upload_tokens or set()
     for part in sorted(staging_root.rglob("*.part")):
         final_target = _upload_final_target_for_part(part)
         if final_target is not None and _is_nonzero_file(final_target):
+            pieces = part.name.rsplit(".", 2)
+            token = pieces[-2] if len(pieces) == 3 else ""
+            if token in active_tokens:
+                # Hard-link publication makes the final target visible before
+                # staged-byte accounting completes. Its live token-owned part
+                # remains the finalize guard until record/release finishes.
+                in_flight.append(part)
+                continue
             # A prior attempt already published the authoritative .bin.
             # This leftover .part is recoverable (crash/unlink failure or a
             # losing duplicate retry) and cannot overwrite the committed file.
@@ -2140,9 +4164,32 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
                 pass
             continue
         in_flight.append(part)
-    if in_flight:
+    # Filesystems without hard-link support use an advisory file lock around
+    # same-directory rename. Probe kernel ownership: live holders block
+    # finalize; process-crash leftovers are unlocked and immediately reusable.
+    for lock_path in sorted(staging_root.rglob("*.publish.lock")):
+        final_target = _publish_target_for_lock(lock_path)
+        if final_target is None:
+            continue
+        try:
+            probe_path, probe_fd, probe_identity = _acquire_publish_lock(
+                final_target
+            )
+        except _PublishBusyError:
+            in_flight.append(lock_path)
+        else:
+            # Existing pathname but unlocked descriptor = no live publisher
+            # (including process-crash recovery). Leave the reusable lock file
+            # in place and let missing/.part validation decide completeness.
+            _release_publish_lock(probe_path, probe_fd, probe_identity)
+    if in_flight or active_tokens:
         names = [str(p.relative_to(staging_root)) for p in in_flight[:5]]
-        if len(in_flight) > 5:
+        remaining = max(0, 5 - len(names))
+        names.extend(
+            f"active-upload:{token[:12]}"
+            for token in sorted(active_tokens)[:remaining]
+        )
+        if len(in_flight) + len(active_tokens) > 5:
             names.append("...")
         raise HTTPException(
             status_code=409,
@@ -2162,7 +4209,7 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
         expected = int(track.get("segment_count") or 0)
         if expected <= 0:
             continue
-        expected_lengths = _planned_segment_lengths(track)
+        expected_bounds = _planned_segment_length_bounds(track)
         track_dir = staging_root / track_name
         # Match seg_*.bin (NOT .part files — atomic upload finalises by
         # rename so a `.part` file means an upload still in flight).
@@ -2187,8 +4234,17 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
                 except OSError:
                     continue
                 present.append(seq)
-                expected_size = expected_lengths.get(seq)
-                if expected_size is not None and actual_size != expected_size:
+                expected_bound = expected_bounds.get(seq)
+                if (
+                    expected_bound is not None
+                    and not (
+                        expected_bound[0] <= actual_size <= expected_bound[1]
+                    )
+                ):
+                    lower, upper = expected_bound
+                    expected_size = (
+                        lower if lower == upper else {"min": lower, "max": upper}
+                    )
                     size_mismatch.setdefault(track_name, []).append({
                         "seq": seq,
                         "expected": expected_size,
@@ -2219,14 +4275,39 @@ def _verify_staging_complete(staging_root: Path) -> Dict[str, int]:
         init_url = track.get("init_segment_url")
         if init_url:
             init_path = staging_root / "init" / f"{track_name}.bin"
+            init_range = track.get("init_segment_byte_range")
+            init_expected_length: Optional[int] = None
+            if isinstance(init_range, dict):
+                try:
+                    candidate = int(init_range.get("length"))
+                    if candidate > 0:
+                        init_expected_length = candidate
+                except (TypeError, ValueError):
+                    pass
             if not init_path.is_file():
                 missing.setdefault(f"{track_name}:init", []).append(0)
             else:
                 try:
-                    if init_path.stat().st_size == 0:
+                    init_actual_size = init_path.stat().st_size
+                    if init_actual_size == 0:
                         zero_byte.setdefault(f"{track_name}:init", []).append(0)
+                    elif (
+                        init_expected_length is not None
+                        and init_actual_size != init_expected_length
+                    ):
+                        size_mismatch.setdefault(
+                            f"{track_name}:init", []
+                        ).append({
+                            "seq": "init",
+                            "expected": init_expected_length,
+                            "actual": init_actual_size,
+                        })
                 except OSError:
-                    pass
+                    # A path that cannot be stat'ed is not safe to hand to the
+                    # worker. Treat the transient/unreadable init as missing
+                    # so finalize stays retryable instead of enqueueing a job
+                    # that will fail later during mux.
+                    missing.setdefault(f"{track_name}:init", []).append(0)
 
     if missing or unexpected or zero_byte or size_mismatch or bad_segment_names:
         # Truncate per track so a job missing thousands of segments doesn't
@@ -2387,7 +4468,16 @@ def finalize_browser_job(
     # Codex review #11: rollback restores the upload window so the
     # client can resume + retry finalize.
     try:
-        _verify_staging_complete(staging_root)
+        active_upload_tokens = _active_upload_tokens(job_id)
+        if active_upload_tokens is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Upload coordination unavailable during finalize; retry",
+            )
+        _verify_staging_complete(
+            staging_root,
+            active_upload_tokens=active_upload_tokens,
+        )
     except HTTPException:
         try:
             db.execute(text("""
@@ -2530,10 +4620,11 @@ def abort_browser_job(
             if staging_root.exists():
                 import shutil
                 shutil.rmtree(staging_root)
-            staging_cleaned = True
+            staging_cleaned = not staging_root.exists()
         except Exception as e:
             logger.warning(f"Abort {job_id}: staging cleanup failed (continuing): {e}")
-        _staged_bytes_clear(job_id)
+        if staging_cleaned:
+            _staged_bytes_clear(job_id)
 
     return AbortResponse(id=job_id, aborted=aborted, staging_cleaned=staging_cleaned)
 

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import io
+import threading
+import time
 from pathlib import Path
+
+import pytest
 
 import ffmpeg_wrapper
 from ffmpeg_wrapper import FFmpegMerger, merge_segments
@@ -279,6 +283,342 @@ def test_merge_cancel_check_default_none_is_no_op(tmp_path, monkeypatch):
     assert output.exists()
 
 
+class _BlockingStdin:
+    """Pipe double whose write blocks until the child is killed."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.released = threading.Event()
+        self.closed = False
+
+    def write(self, data):
+        self.entered.set()
+        if not self.released.wait(timeout=2):
+            raise TimeoutError("test stdin writer was not released")
+        raise BrokenPipeError
+
+    def close(self):
+        self.closed = True
+
+
+class _BlockingStdinPopen:
+    def __init__(self, command, stdin=None, stdout=None, stderr=None, **kwargs):
+        self.command = list(command)
+        self.returncode = None
+        self.killed = False
+        self.stdin = _BlockingStdin()
+        self.stdout = None
+        self.stderr = io.BytesIO(b"")
+        Path(self.command[-1]).write_bytes(b"partial")
+
+    def wait(self, timeout=None):
+        if self.killed:
+            self.returncode = -9
+            return self.returncode
+        raise ffmpeg_wrapper.subprocess.TimeoutExpired(self.command, timeout)
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+        self.stdin.released.set()
+
+    def poll(self):
+        return self.returncode
+
+
+def _patch_blocking_stdin_popen(monkeypatch):
+    captured = {"instances": []}
+
+    def factory(command, **kwargs):
+        process = _BlockingStdinPopen(command, **kwargs)
+        captured["instances"].append(process)
+        return process
+
+    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "Popen", factory)
+    monkeypatch.setattr(ffmpeg_wrapper, "_COPY_MERGE_POLL_SECONDS", 0.01)
+    return captured
+
+
+def test_merge_cancel_interrupts_blocking_stdin_write(tmp_path, monkeypatch):
+    """Cancellation must still be observed while the feeder is blocked."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+    captured = _patch_blocking_stdin_popen(monkeypatch)
+
+    def cancel_once_write_is_blocked():
+        return bool(captured["instances"] and captured["instances"][0].stdin.entered.is_set())
+
+    started_at = time.monotonic()
+    ok = merge_segments(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+        cancel_check=cancel_once_write_is_blocked,
+    )
+
+    assert ok is False
+    assert time.monotonic() - started_at < 1
+    assert captured["instances"][0].killed is True
+    assert not output.exists()
+
+
+def test_merge_deadline_interrupts_blocking_stdin_write(tmp_path, monkeypatch):
+    """The 15-minute budget starts before stdin feeding, not after it."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr(ffmpeg_wrapper, "_COPY_MERGE_TIMEOUT_SECONDS", 0.05)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+    captured = _patch_blocking_stdin_popen(monkeypatch)
+
+    started_at = time.monotonic()
+    ok = merge_segments(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+    )
+
+    assert ok is False
+    assert time.monotonic() - started_at < 1
+    assert captured["instances"][0].killed is True
+    assert not output.exists()
+
+
+def test_merge_deadline_does_not_close_pipe_held_by_stuck_feeder(
+    tmp_path, monkeypatch,
+):
+    """A failed kill must not turn finally/close into an unbounded wait."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr(ffmpeg_wrapper, "_COPY_MERGE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(ffmpeg_wrapper, "_COPY_MERGE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(ffmpeg_wrapper, "_PIPE_THREAD_JOIN_SECONDS", 0.01)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+
+    class StuckPipe(_BlockingStdin):
+        def close(self):
+            # A real BufferedWriter close waits for its write lock. Model that
+            # here so calling close() from the supervisor would fail the
+            # elapsed-time assertion below.
+            self.released.wait(timeout=1.5)
+            self.closed = True
+
+    class KillCannotReleasePipe(_BlockingStdinPopen):
+        def __init__(self, command, **kwargs):
+            super().__init__(command, **kwargs)
+            self.stdin = StuckPipe()
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            # Deliberately do not release stdin: this is the OS/process-control
+            # failure path the supervisor still has to return from.
+
+    captured = {"process": None}
+
+    def factory(command, **kwargs):
+        captured["process"] = KillCannotReleasePipe(command, **kwargs)
+        return captured["process"]
+
+    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "Popen", factory)
+
+    started_at = time.monotonic()
+    ok = merge_segments(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+    )
+    elapsed = time.monotonic() - started_at
+
+    # Let the daemon feeder unwind before tmp_path teardown.
+    captured["process"].stdin.released.set()
+    assert ok is False
+    assert elapsed < 0.5
+    assert captured["process"].killed is True
+    assert not output.exists()
+
+
+def test_merge_nonzero_exit_removes_partial_output(tmp_path, monkeypatch):
+    """A failed copy must not strand a non-empty reserved final file."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+
+    class NonzeroPopen(_FakePopen):
+        def __init__(self, command, **kwargs):
+            super().__init__(command, **kwargs)
+            self.returncode = 1
+            output.write_bytes(b"large partial")
+
+    monkeypatch.setattr(
+        ffmpeg_wrapper.subprocess,
+        "Popen",
+        lambda command, **kwargs: NonzeroPopen(command, **kwargs),
+    )
+
+    assert merge_segments(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+    ) is False
+    assert not output.exists()
+
+
+def test_merge_supervisor_exception_removes_partial_output(tmp_path, monkeypatch):
+    """Unexpected supervisor errors must free the reserved output name."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+
+    class RaisingWaitPopen(_FakePopen):
+        def __init__(self, command, **kwargs):
+            super().__init__(command, **kwargs)
+            self.returncode = None
+            output.write_bytes(b"partial")
+
+        def wait(self, timeout=None):
+            raise OSError("wait failed")
+
+    captured = {"process": None}
+
+    def factory(command, **kwargs):
+        captured["process"] = RaisingWaitPopen(command, **kwargs)
+        return captured["process"]
+
+    monkeypatch.setattr(
+        ffmpeg_wrapper.subprocess,
+        "Popen",
+        factory,
+    )
+
+    assert merge_segments(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=False,
+    ) is False
+    assert captured["process"].returncode == -9
+    assert not output.exists()
+
+
+def test_copy_failure_preserves_reserved_name_until_reencode(
+    tmp_path, monkeypatch,
+):
+    """Fallback must not unlink the worker's O_EXCL-reserved pathname."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+    output.write_bytes(b"")  # stand in for worker._reserve_output_path()
+
+    output_unlinks = []
+    original_unlink = Path.unlink
+
+    def spy_unlink(path, *args, **kwargs):
+        if path == output:
+            output_unlinks.append(path)
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", spy_unlink)
+
+    calls = {"count": 0, "saw_empty_reservation": False}
+
+    class CopyThenReencodePopen:
+        def __init__(self, command, stdin=None, stdout=None, stderr=None, **kwargs):
+            self.command = list(command)
+            self.stderr = io.BytesIO(b"")
+            self.stdout = None
+            calls["count"] += 1
+            if calls["count"] == 1:
+                self.stdin = _CapturingBytesIO()
+                self.returncode = 1
+                output.write_bytes(b"partial copy")
+            else:
+                self.stdin = None
+                self.returncode = 0
+                calls["saw_empty_reservation"] = (
+                    output.exists() and output.stat().st_size == 0
+                )
+                output.write_bytes(b"re-encoded")
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        ffmpeg_wrapper.subprocess,
+        "Popen",
+        lambda command, **kwargs: CopyThenReencodePopen(command, **kwargs),
+    )
+
+    assert merge_segments(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+        try_re_encode=True,
+    ) is True
+    assert calls == {"count": 2, "saw_empty_reservation": True}
+    assert output_unlinks == []
+    assert output.read_bytes() == b"re-encoded"
+
+
+@pytest.mark.parametrize("create_empty_output", [False, True])
+def test_reencode_zero_exit_requires_nonempty_output(
+    tmp_path, monkeypatch, create_empty_output,
+):
+    """Exit code zero alone cannot publish a missing/zero-byte result."""
+    monkeypatch.setattr(ffmpeg_wrapper.shutil, "which", lambda name: "ffmpeg" if name == "ffmpeg" else None)
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+
+    class EmptySuccessPopen:
+        def __init__(self, command, stdout=None, stderr=None, **kwargs):
+            self.command = list(command)
+            self.returncode = 0
+            self.stderr = io.BytesIO(b"")
+            if create_empty_output:
+                output.write_bytes(b"")
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr(
+        ffmpeg_wrapper.subprocess,
+        "Popen",
+        lambda command, **kwargs: EmptySuccessPopen(command, **kwargs),
+    )
+
+    merger = FFmpegMerger(
+        [str(seg)],
+        str(output),
+        concat_dir=str(tmp_path),
+    )
+    assert merger.merge_with_re_encode() is False
+    assert not output.exists()
+
+
 def test_merge_with_re_encode_skipped_for_fmp4(tmp_path, monkeypatch):
     """The re-encode fallback uses the concat demuxer, which can't handle
     .m4s segments without inline init. is_fmp4 → return False without
@@ -351,12 +691,17 @@ def test_merge_with_reencode_kills_ffmpeg_when_cancelled(tmp_path, monkeypatch):
             self.command = list(command)
             self.returncode = None
             self.killed = False
+            self.stderr = type(
+                "SilentStderr",
+                (),
+                {"read": lambda _self, _size: b""},
+            )()
             output.write_bytes(b"partial")
 
-        def communicate(self, timeout=None):
+        def wait(self, timeout=None):
             if self.killed:
                 self.returncode = -9
-                return (b"", b"cancelled")
+                return self.returncode
             raise ffmpeg_wrapper.subprocess.TimeoutExpired(self.command, timeout)
 
         def kill(self):
@@ -382,3 +727,55 @@ def test_merge_with_reencode_kills_ffmpeg_when_cancelled(tmp_path, monkeypatch):
     assert len(captured["instances"]) == 1
     assert captured["instances"][0].killed is True
     assert not output.exists(), "partial re-encode output should be removed after cancellation"
+
+
+def test_reencode_supervisor_exception_kills_and_reaps_child(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        ffmpeg_wrapper.shutil,
+        "which",
+        lambda name: "ffmpeg" if name == "ffmpeg" else None,
+    )
+
+    seg = tmp_path / "segment_00000.ts"
+    seg.write_bytes(b"x" * 376)
+    output = tmp_path / "out.mp4"
+
+    class RaisingWaitPopen:
+        def __init__(self, command, stdout=None, stderr=None, **kwargs):
+            self.command = list(command)
+            self.returncode = None
+            self.killed = False
+            self.wait_after_kill = False
+            self.stderr = io.BytesIO(b"")
+            output.write_bytes(b"partial")
+
+        def poll(self):
+            raise OSError("poll failed")
+
+        def wait(self, timeout=None):
+            if self.killed:
+                self.wait_after_kill = True
+                self.returncode = -9
+                return self.returncode
+            raise OSError("supervisor wait failed")
+
+        def kill(self):
+            self.killed = True
+
+    captured = {"process": None}
+
+    def factory(command, **kwargs):
+        captured["process"] = RaisingWaitPopen(command, **kwargs)
+        return captured["process"]
+
+    monkeypatch.setattr(ffmpeg_wrapper.subprocess, "Popen", factory)
+    merger = FFmpegMerger(
+        [str(seg)], str(output), concat_dir=str(tmp_path),
+    )
+
+    assert merger.merge_with_re_encode() is False
+    assert captured["process"].killed is True
+    assert captured["process"].wait_after_kill is True
+    assert not output.exists()

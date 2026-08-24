@@ -1,4 +1,5 @@
 import threading
+import time
 from typing import List
 
 import pytest
@@ -6,6 +7,9 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 from downloader import (
+    NonRetryableKeyResourceError,
+    NonRetryableSegmentResourceError,
+    RequiredSegmentFailed,
     SegmentDownloader,
     TS_PACKET_SIZE,
     TS_SYNC_BYTE,
@@ -137,15 +141,26 @@ def test_decrypt_segment_with_key_prefers_provided_iv(tmp_path):
 class _FakeResponse:
     """Minimal stand-in for a session.get() response."""
 
-    def __init__(self, status_code=200, content=b"", headers=None, cookies=None):
+    def __init__(
+        self, status_code=200, content=b"", headers=None, cookies=None,
+        stream_chunks=None,
+    ):
         self.status_code = status_code
         self.content = content
         self.headers = headers or {}
         self.cookies = cookies or {}
+        self.stream_chunks = [content] if stream_chunks is None else stream_chunks
+        self.closed = False
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
+
+    def iter_content(self, chunk_size=64 * 1024):
+        yield from self.stream_chunks
+
+    def close(self):
+        self.closed = True
 
 
 class _RaisingSession:
@@ -185,6 +200,59 @@ def test_try_download_reraises_transport_errors(tmp_path):
     )
     with pytest.raises(_TRANSPORT_ERRORS):
         d._try_download_with_headers("https://example.com/seg.ts", {}, index=0)
+
+
+def test_host_capacity_timeout_does_not_replay_strategies_or_segment_retries(
+    monkeypatch, tmp_path,
+):
+    from types import SimpleNamespace
+    import downloader as downloader_mod
+    from host_throttle import HostThrottleCapacityTimeout
+
+    state = {"acquires": 0, "requests": 0}
+
+    class _Throttle:
+        def acquire(self, _url, **_kwargs):
+            state["acquires"] += 1
+            raise HostThrottleCapacityTimeout("cap stayed full")
+
+        def release(self, _url):
+            pytest.fail("no slot was acquired")
+
+    class _NoRequestSession:
+        def get(self, *_args, **_kwargs):
+            state["requests"] += 1
+            pytest.fail("capacity timeout must happen before network I/O")
+
+    monkeypatch.setattr(
+        downloader_mod,
+        "_host_throttle",
+        SimpleNamespace(
+            get=lambda: _Throttle(),
+            HostThrottleCancelled=downloader_mod.HostThrottleCancelled,
+            HostThrottleCapacityTimeout=HostThrottleCapacityTimeout,
+        ),
+    )
+    monkeypatch.setattr(
+        downloader_mod.time,
+        "sleep",
+        lambda *_args: pytest.fail("must not enter recursive retry backoff"),
+    )
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        max_retries=3,
+        session=_NoRequestSession(),
+    )
+
+    result = downloader.download_segment({
+        "url": "https://cdn.example/seg.ts",
+        "index": 0,
+    })
+
+    assert result is None
+    assert state == {"acquires": 1, "requests": 0}
+    assert len(downloader.failed_segments) == 1
 
 
 def test_try_download_returns_none_on_anti_hotlink_image(tmp_path):
@@ -247,13 +315,155 @@ def test_try_download_returns_bytes_on_success(tmp_path):
     assert out == payload
 
 
+def test_try_download_streams_non_range_body_instead_of_content_property(
+    tmp_path,
+):
+    payload = _make_valid_ts_sample(packet_count=3)
+    response = _FakeResponse(
+        status_code=200,
+        content=b"",
+        stream_chunks=[payload[:200], payload[200:]],
+        headers={"Content-Type": "video/mp2t"},
+    )
+    d = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=_StaticSession(response),
+    )
+
+    out = d._try_download_with_headers(
+        "https://example.com/seg.ts", {}, index=0,
+    )
+
+    assert out == payload
+    assert response.closed is True
+
+
+def test_try_download_rejects_stream_body_over_segment_cap(monkeypatch, tmp_path):
+    import downloader as dl
+
+    payload = _make_valid_ts_sample(packet_count=3)
+    monkeypatch.setattr(dl, "MAX_SEGMENT_RESPONSE_BYTES", len(payload) - 1)
+    response = _FakeResponse(
+        status_code=200,
+        content=b"",
+        stream_chunks=[payload],
+        headers={"Content-Type": "video/mp2t"},
+    )
+    d = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=_StaticSession(response),
+    )
+
+    with pytest.raises(
+        NonRetryableSegmentResourceError,
+        match="response body exceeded",
+    ):
+        d._try_download_with_headers(
+            "https://example.com/seg.ts", {}, index=0,
+        )
+    assert response.closed is True
+
+
+def test_try_download_rejects_oversized_content_length_before_body(
+    monkeypatch, tmp_path,
+):
+    import downloader as dl
+
+    monkeypatch.setattr(dl, "MAX_SEGMENT_RESPONSE_BYTES", 100)
+    response = _FakeResponse(
+        status_code=200,
+        content=b"",
+        stream_chunks=[],
+        headers={"Content-Length": "101"},
+    )
+    response.iter_content = lambda **_kwargs: pytest.fail(
+        "oversized body must not be iterated"
+    )
+    d = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=_StaticSession(response),
+    )
+
+    with pytest.raises(
+        NonRetryableSegmentResourceError,
+        match="Content-Length 101 exceeds",
+    ):
+        d._try_download_with_headers(
+            "https://example.com/seg.ts", {}, index=0,
+        )
+    assert response.closed is True
+
+
+def test_segment_buffer_budget_blocks_second_retained_body_until_release(
+    tmp_path,
+):
+    import downloader as dl
+
+    payload = _make_valid_ts_sample(packet_count=3)
+    responses = [
+        _FakeResponse(
+            status_code=200,
+            content=payload,
+            headers={
+                "Content-Type": "video/mp2t",
+                "Content-Length": str(len(payload)),
+            },
+        )
+        for _ in range(2)
+    ]
+
+    class _SequenceSession:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def get(self, *_args, **_kwargs):
+            with self._lock:
+                return responses.pop(0)
+
+    budget = dl._WeightedByteBudget(len(payload))
+    lease_one = dl._BufferLease(budget)
+    lease_two = dl._BufferLease(budget)
+    downloader = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=_SequenceSession(),
+    )
+
+    first = downloader._try_download_with_headers(
+        "https://example.com/one.ts", {}, index=0,
+        memory_lease=lease_one,
+    )
+    assert first == payload
+    assert budget.used == len(payload)
+
+    finished = threading.Event()
+    result = {}
+
+    def download_second():
+        result["body"] = downloader._try_download_with_headers(
+            "https://example.com/two.ts", {}, index=1,
+            memory_lease=lease_two,
+        )
+        finished.set()
+
+    thread = threading.Thread(target=download_second, daemon=True)
+    thread.start()
+    assert not finished.wait(timeout=0.2)
+    lease_one.release()
+    assert finished.wait(timeout=2)
+    thread.join(timeout=2)
+    assert result["body"] == payload
+    lease_two.release()
+    assert budget.used == 0
+
+
 def test_try_download_honors_segment_byte_range(tmp_path):
     """HLS EXT-X-BYTERANGE segments must send Range and require 206."""
     payload = _make_valid_ts_sample(packet_count=3)
     response = _FakeResponse(
         status_code=206,
         content=payload,
-        headers={"Content-Type": "video/mp2t"},
+        headers={
+            "Content-Type": "video/mp2t",
+            "Content-Range": (
+                f"bytes 100-{100 + len(payload) - 1}/*"
+            ),
+        },
     )
 
     class _CapturingSession:
@@ -283,6 +493,50 @@ def test_try_download_honors_segment_byte_range(tmp_path):
     assert kwargs["stream"] is True
     assert kwargs["headers"]["Range"] == f"bytes=100-{100 + len(payload) - 1}"
     assert "range" not in kwargs["headers"]
+    assert response.closed is True
+
+
+def test_try_download_reads_streamed_range_instead_of_empty_content_property(
+    tmp_path,
+):
+    """curl_cffi stream=True exposes bytes only through iter_content()."""
+    payload = _make_valid_ts_sample(packet_count=3)
+    response = _FakeResponse(
+        status_code=206,
+        content=b"",
+        stream_chunks=[payload[:200], payload[200:]],
+        headers={
+            "Content-Type": "video/mp2t",
+            "Content-Range": f"bytes 0-{len(payload) - 1}/*",
+        },
+    )
+    d = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=_StaticSession(response),
+    )
+
+    out = d._try_download_with_headers(
+        "https://example.com/media.bin",
+        {},
+        index=0,
+        byte_range={"offset": 0, "length": len(payload)},
+    )
+
+    assert out == payload
+    assert response.closed is True
+
+
+def test_try_download_closes_streamed_range_on_early_rejection(tmp_path):
+    response = _FakeResponse(status_code=474, content=b"")
+    d = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=_StaticSession(response),
+    )
+    assert d._try_download_with_headers(
+        "https://example.com/media.bin",
+        {},
+        index=0,
+        byte_range={"offset": 0, "length": 188},
+    ) is None
+    assert response.closed is True
 
 
 def test_try_download_rejects_unhonored_byte_range(tmp_path):
@@ -297,13 +551,88 @@ def test_try_download_rejects_unhonored_byte_range(tmp_path):
         output_dir=str(tmp_path),
         session=_StaticSession(response),
     )
-    out = d._try_download_with_headers(
-        "https://example.com/media.bin",
-        {},
-        index=0,
-        byte_range={"offset": 0, "length": len(payload)},
+    with pytest.raises(
+        NonRetryableSegmentResourceError,
+        match="byte-range request not honored",
+    ):
+        d._try_download_with_headers(
+            "https://example.com/media.bin",
+            {},
+            index=0,
+            byte_range={"offset": 0, "length": len(payload)},
+        )
+
+
+@pytest.mark.parametrize(
+    "content_range",
+    [
+        None,
+        "bytes 1-564/*",
+        "bytes 0-563/563",
+        "items 0-563/*",
+    ],
+)
+def test_try_download_rejects_missing_or_wrong_content_range(
+    tmp_path, content_range,
+):
+    payload = _make_valid_ts_sample(packet_count=3)
+    headers = {"Content-Type": "video/mp2t"}
+    if content_range is not None:
+        headers["Content-Range"] = content_range
+    response = _FakeResponse(
+        status_code=206,
+        content=payload,
+        headers=headers,
     )
-    assert out is None
+    d = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=_StaticSession(response),
+    )
+
+    with pytest.raises(
+        NonRetryableSegmentResourceError,
+        match="byte-range response invalid",
+    ):
+        d._try_download_with_headers(
+            "https://example.com/media.bin",
+            {},
+            index=0,
+            byte_range={"offset": 0, "length": len(payload)},
+        )
+    assert response.closed is True
+
+
+def test_range_416_skips_referer_strategies_and_recursive_retries(
+    monkeypatch, tmp_path,
+):
+    import downloader as dl
+
+    monkeypatch.setattr(
+        dl.time,
+        "sleep",
+        lambda *_args: pytest.fail("HTTP 416 must not enter retry backoff"),
+    )
+    response = _FakeResponse(status_code=416)
+
+    class _CountingSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            return response
+
+    session = _CountingSession()
+    d = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), max_retries=3, session=session,
+    )
+
+    assert d.download_segment({
+        "url": "https://example.com/media.bin",
+        "index": 0,
+        "byte_range": {"offset": 0, "length": TS_PACKET_SIZE},
+    }) is None
+    assert session.calls == 1
+    assert len(d.failed_segments) == 1
 
 
 # --- Backoff jitter --------------------------------------------------------
@@ -966,6 +1295,175 @@ def test_download_all_cleans_pacing_state_for_touched_hosts(tmp_path):
     )
 
 
+def test_download_all_keeps_future_submission_window_bounded(monkeypatch, tmp_path):
+    import downloader as dl
+
+    real_executor = dl.ThreadPoolExecutor
+    gate = threading.Event()
+    initial_window_filled = threading.Event()
+    submitted = 0
+    submitted_lock = threading.Lock()
+
+    class TrackingExecutor(real_executor):
+        def submit(self, fn, /, *args, **kwargs):
+            nonlocal submitted
+            future = super().submit(fn, *args, **kwargs)
+            with submitted_lock:
+                submitted += 1
+                if submitted == 4:  # max_workers=2, window=2x workers
+                    initial_window_filled.set()
+            return future
+
+    monkeypatch.setattr(dl, "ThreadPoolExecutor", TrackingExecutor)
+    segments = [
+        {"url": f"https://host.test/{index}.m4s", "index": index}
+        for index in range(100)
+    ]
+    downloader = SegmentDownloader(
+        segments=segments,
+        output_dir=str(tmp_path),
+        max_workers=2,
+    )
+
+    def blocked_download(segment):
+        assert gate.wait(timeout=5), "test gate timed out"
+        return str(tmp_path / f"{segment['index']}.m4s")
+
+    monkeypatch.setattr(downloader, "download_segment", blocked_download)
+    result_holder = {}
+
+    def run_download():
+        result_holder["files"] = downloader.download_all()
+
+    thread = threading.Thread(target=run_download, daemon=True)
+    thread.start()
+    assert initial_window_filled.wait(timeout=2)
+    with submitted_lock:
+        assert submitted == 4
+
+    gate.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(result_holder["files"]) == len(segments)
+
+
+def test_download_all_require_all_stops_after_first_definitive_failure(
+    monkeypatch, tmp_path,
+):
+    """DASH-style all-or-nothing downloads must not drain a doomed MPD.
+
+    At most the already-submitted 2x-worker window may have started when the
+    first missing required segment is observed; no replacement work may be
+    submitted afterward.
+    """
+    segments = [
+        {"url": f"https://host.test/{index}.m4s", "index": index}
+        for index in range(100)
+    ]
+    downloader = SegmentDownloader(
+        segments=segments,
+        output_dir=str(tmp_path),
+        max_workers=2,
+        require_all=True,
+        session=object(),
+    )
+    attempted = []
+    attempted_lock = threading.Lock()
+
+    def definitive_failure(segment):
+        with attempted_lock:
+            attempted.append(segment["index"])
+        return None
+
+    monkeypatch.setattr(downloader, "download_segment", definitive_failure)
+
+    with pytest.raises(RequiredSegmentFailed, match="Required segment"):
+        downloader.download_all()
+
+    assert downloader._stop_event.is_set()
+    assert 1 <= len(attempted) <= downloader.max_workers * 2
+    assert len(attempted) < len(segments)
+
+
+def test_segment_body_cap_violation_skips_strategies_and_recursive_retries(
+    monkeypatch, tmp_path,
+):
+    import downloader as dl
+
+    monkeypatch.setattr(dl, "MAX_SEGMENT_RESPONSE_BYTES", TS_PACKET_SIZE)
+    monkeypatch.setattr(
+        dl.time,
+        "sleep",
+        lambda *_args: pytest.fail("deterministic size rejection must not back off"),
+    )
+    response = _FakeResponse(
+        status_code=200,
+        content=b"",
+        stream_chunks=[b"x" * (TS_PACKET_SIZE + 1)],
+    )
+
+    class _CountingSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            return response
+
+    session = _CountingSession()
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        max_retries=3,
+        session=session,
+    )
+
+    assert downloader.download_segment({
+        "url": "https://host.test/0.m4s",
+        "index": 0,
+    }) is None
+    assert session.calls == 1
+    assert response.closed is True
+    assert len(downloader.failed_segments) == 1
+
+
+def test_oversized_byte_range_is_rejected_before_request_or_retry(
+    monkeypatch, tmp_path,
+):
+    import downloader as dl
+
+    monkeypatch.setattr(dl, "MAX_SEGMENT_RESPONSE_BYTES", TS_PACKET_SIZE)
+    monkeypatch.setattr(
+        dl.time,
+        "sleep",
+        lambda *_args: pytest.fail("deterministic range rejection must not back off"),
+    )
+
+    class _NoRequestSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            pytest.fail("oversized declared range must fail before network I/O")
+
+    session = _NoRequestSession()
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        max_retries=3,
+        session=session,
+    )
+
+    assert downloader.download_segment({
+        "url": "https://host.test/0.m4s",
+        "index": 0,
+        "byte_range": {"offset": 0, "length": TS_PACKET_SIZE + 1},
+    }) is None
+    assert session.calls == 0
+    assert len(downloader.failed_segments) == 1
+
+
 def test_download_all_cleans_pacing_state_even_on_callback_exception(tmp_path):
     """download_all's finally must run even when the progress_callback
     raises (the abort-via-exception path used by worker.py for hotlink/
@@ -986,6 +1484,12 @@ def test_download_all_cleans_pacing_state_even_on_callback_exception(tmp_path):
                     return b"\x47" * 376  # valid TS sync bytes
 
                 def raise_for_status(self):
+                    pass
+
+                def iter_content(self, chunk_size=64 * 1024):
+                    yield self.content
+
+                def close(self):
                     pass
 
             return _R()
@@ -1197,6 +1701,231 @@ def test_get_key_bytes_no_overrides_uses_default_headers(monkeypatch, tmp_path):
     assert "X-Auth-Token" not in session.calls[0]["headers"]
 
 
+def test_cross_origin_hls_key_uses_final_playlist_referer_without_secrets(
+    monkeypatch, tmp_path,
+):
+    import downloader as downloader_mod
+
+    monkeypatch.setattr(downloader_mod, "_HOST_HEADERS_BY_HOST", {})
+    response = _FakeResponse(status_code=200, content=b"\x22" * 16)
+    session = _CapturingSession(response)
+    playlist_url = "https://media.cdn.example/final/index.m3u8"
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={
+            "Cookie": "sid=secret",
+            "Authorization": "Bearer captured",
+            "Referer": "https://source.example/watch?token=secret",
+            "Origin": "https://source.example",
+            "User-Agent": "browser",
+        },
+        m3u8_url=playlist_url,
+        header_trust_base="https://source.example/start.m3u8?token=secret",
+        referer_trust_base=playlist_url,
+        session=session,
+    )
+
+    key = downloader._get_key_bytes(
+        "https://media.cdn.example/final/key.bin",
+    )
+
+    assert key == b"\x22" * 16
+    assert session.calls[0]["headers"] == {
+        "User-Agent": "browser",
+        "Referer": playlist_url,
+        "Origin": "https://media.cdn.example",
+    }
+
+
+def test_hls_key_generated_headers_replace_lowercase_captured_casing(
+    monkeypatch, tmp_path,
+):
+    import downloader as downloader_mod
+
+    monkeypatch.setattr(downloader_mod, "_HOST_HEADERS_BY_HOST", {})
+    response = _FakeResponse(status_code=200, content=b"\x24" * 16)
+    session = _CapturingSession(response)
+    playlist_url = "https://media.cdn.example/final/index.m3u8"
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={
+            "referer": "https://captured.example/stale-ref",
+            "origin": "https://captured.example",
+            "User-Agent": "browser",
+        },
+        m3u8_url=playlist_url,
+        header_trust_base=playlist_url,
+        referer_trust_base=playlist_url,
+        session=session,
+    )
+
+    downloader._get_key_bytes("https://media.cdn.example/final/key.bin")
+
+    assert session.calls[0]["headers"] == {
+        "User-Agent": "browser",
+        "Referer": playlist_url,
+        "Origin": "https://media.cdn.example",
+    }
+
+
+def test_hls_key_preserves_case_insensitive_host_referer_override(
+    monkeypatch, tmp_path,
+):
+    import downloader as downloader_mod
+
+    monkeypatch.setattr(
+        downloader_mod,
+        "_HOST_HEADERS_BY_HOST",
+        {
+            "media.cdn.example": {
+                "referer": "https://operator.example/custom-ref",
+                "ORIGIN": "https://operator.example",
+            },
+        },
+    )
+    response = _FakeResponse(status_code=200, content=b"\x33" * 16)
+    session = _CapturingSession(response)
+    playlist_url = "https://media.cdn.example/final/index.m3u8"
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={"User-Agent": "browser"},
+        m3u8_url=playlist_url,
+        header_trust_base="https://source.example/start.m3u8",
+        referer_trust_base=playlist_url,
+        session=session,
+    )
+
+    downloader._get_key_bytes("https://media.cdn.example/final/key.bin")
+
+    assert session.calls[0]["headers"] == {
+        "User-Agent": "browser",
+        "referer": "https://operator.example/custom-ref",
+        "ORIGIN": "https://operator.example",
+    }
+
+
+def test_invalid_aes_key_size_does_not_redownload_media_or_retry(
+    monkeypatch, tmp_path,
+):
+    import downloader as downloader_mod
+
+    monkeypatch.setattr(
+        downloader_mod.time,
+        "sleep",
+        lambda *_args: pytest.fail(
+            "deterministic AES key shape rejection must not back off"
+        ),
+    )
+    media_url = "https://media.cdn.example/segment.ts"
+    key_url = "https://media.cdn.example/key.bin"
+    media_response = _FakeResponse(
+        status_code=200,
+        content=_make_valid_ts_sample(),
+        headers={"Content-Type": "video/mp2t"},
+    )
+    key_response = _FakeResponse(
+        status_code=200,
+        content=b"x" * 17,
+        headers={"Content-Length": "17"},
+    )
+
+    class _MediaAndKeySession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append(url)
+            return key_response if url == key_url else media_response
+
+    session = _MediaAndKeySession()
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        max_retries=3,
+        m3u8_url="https://media.cdn.example/index.m3u8",
+        session=session,
+    )
+
+    with pytest.raises(
+        NonRetryableKeyResourceError,
+        match="Content-Length: 17",
+    ):
+        downloader.download_segment({
+            "url": media_url,
+            "index": 0,
+            "sequence": 0,
+            "key": {"method": "AES-128", "uri": key_url, "iv": None},
+        })
+    assert session.calls == [media_url, key_url]
+    assert media_response.closed is True
+    assert key_response.closed is True
+    assert downloader.failed_segments == []
+
+
+def test_invalid_shared_aes_key_fails_fast_with_one_single_flight_get(
+    tmp_path,
+):
+    media_urls = [
+        f"https://media.cdn.example/{index}.ts" for index in range(8)
+    ]
+    key_url = "https://media.cdn.example/key.bin"
+    lock = threading.Lock()
+
+    class _ConcurrentSession:
+        def __init__(self):
+            self.media_calls = 0
+            self.key_calls = 0
+
+        def get(self, url, **kwargs):
+            if url == key_url:
+                with lock:
+                    self.key_calls += 1
+                # Keep the owner in flight long enough for the other media
+                # futures to join the same Future instead of issuing new GETs.
+                time.sleep(0.05)
+                return _FakeResponse(
+                    status_code=200,
+                    content=b"x" * 17,
+                    headers={"Content-Length": "17"},
+                )
+            with lock:
+                self.media_calls += 1
+            return _FakeResponse(
+                status_code=200,
+                content=_make_valid_ts_sample(),
+                headers={"Content-Type": "video/mp2t"},
+            )
+
+    session = _ConcurrentSession()
+    segments = [
+        {
+            "url": url,
+            "index": index,
+            "sequence": index,
+            "key": {"method": "AES-128", "uri": key_url, "iv": None},
+        }
+        for index, url in enumerate(media_urls)
+    ]
+    downloader = SegmentDownloader(
+        segments=segments,
+        output_dir=str(tmp_path),
+        max_workers=4,
+        max_retries=3,
+        m3u8_url="https://media.cdn.example/index.m3u8",
+        session=session,
+    )
+
+    with pytest.raises(NonRetryableKeyResourceError):
+        downloader.download_all()
+
+    assert downloader._stop_event.is_set()
+    assert session.key_calls == 1
+    assert session.media_calls <= downloader.max_workers * 2
+
+
 def test_get_key_bytes_overrides_apply_per_host_not_per_segment_host(
     monkeypatch, tmp_path
 ):
@@ -1221,6 +1950,406 @@ def test_get_key_bytes_overrides_apply_per_host_not_per_segment_host(
     )
     d._get_key_bytes("https://keys.example.test/k.bin")
     assert session.calls[0]["headers"].get("X-Key-Auth") == "for-keys-only"
+
+
+def test_get_key_bytes_is_single_flight_for_concurrent_cache_miss(tmp_path):
+    key = bytes(range(16))
+    release_response = threading.Event()
+    request_started = threading.Event()
+
+    class _KeyResponse(_FakeResponse):
+        def iter_content(self, chunk_size=17):
+            assert release_response.wait(timeout=2)
+            yield key
+
+    class _CountingSession:
+        def __init__(self):
+            self.calls = 0
+            self._lock = threading.Lock()
+
+        def get(self, *_args, **_kwargs):
+            with self._lock:
+                self.calls += 1
+            request_started.set()
+            return _KeyResponse(
+                status_code=200,
+                content=b"",
+                headers={"Content-Length": "16"},
+                stream_chunks=[],
+            )
+
+    session = _CountingSession()
+    downloader = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=session,
+    )
+    start = threading.Barrier(11)
+    results = []
+    errors = []
+
+    def fetch_key():
+        try:
+            start.wait(timeout=2)
+            results.append(
+                downloader._get_key_bytes("https://keys.example.test/key.bin")
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=fetch_key, daemon=True) for _ in range(10)
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=2)
+    assert request_started.wait(timeout=2)
+    release_response.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert errors == []
+    assert results == [key] * 10
+    assert session.calls == 1
+
+
+def test_unique_rotating_key_urls_share_the_host_concurrency_cap(
+    monkeypatch, tmp_path,
+):
+    import time
+    from types import SimpleNamespace
+    import downloader as downloader_mod
+
+    key = bytes(range(16))
+    semaphore = threading.Semaphore(2)
+    state_lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    class _Throttle:
+        def acquire(self, _url, **_kwargs):
+            assert semaphore.acquire(timeout=2)
+            return True
+
+        def release(self, _url):
+            semaphore.release()
+
+    class _KeyResponse(_FakeResponse):
+        def iter_content(self, chunk_size=17):
+            with state_lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            try:
+                time.sleep(0.03)
+                yield key
+            finally:
+                with state_lock:
+                    state["active"] -= 1
+
+    class _Session:
+        def get(self, *_args, **_kwargs):
+            return _KeyResponse(
+                status_code=200,
+                content=b"",
+                headers={"Content-Length": "16"},
+                stream_chunks=[],
+            )
+
+    monkeypatch.setattr(
+        downloader_mod,
+        "_host_throttle",
+        SimpleNamespace(get=lambda: _Throttle()),
+    )
+    downloader = SegmentDownloader(
+        segments=[], output_dir=str(tmp_path), session=_Session(),
+    )
+    start = threading.Barrier(5)
+    errors = []
+
+    def fetch_unique_key(index):
+        try:
+            start.wait(timeout=2)
+            downloader._get_key_bytes(
+                f"https://keys.example.test/key-{index}.bin"
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=fetch_unique_key, args=(index,), daemon=True)
+        for index in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert errors == []
+    assert state["peak"] == 2
+
+
+def test_successful_key_fetch_decays_key_host_adaptive_delay(tmp_path):
+    key_host = "keys-only.example.test"
+    _adaptive_delay.report_failure(key_host)
+    before = _adaptive_delay.get_ms(key_host)
+    response = _FakeResponse(status_code=200, content=bytes(range(16)))
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        session=_CapturingSession(response),
+    )
+
+    downloader._get_key_bytes(f"https://{key_host}/key.bin")
+
+    assert _adaptive_delay.get_ms(key_host) < before
+
+
+def test_foreign_mpd_origin_never_receives_captured_credentials(
+    monkeypatch, tmp_path,
+):
+    import downloader as downloader_mod
+
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={
+            "Cookie": "sid=secret",
+            "Authorization": "Bearer captured",
+            "X-Playback-Token": "captured",
+            "Referer": "https://trusted.example/watch?token=secret",
+            "User-Agent": "browser",
+        },
+        m3u8_url="https://trusted.example/manifest.mpd",
+        header_trust_base="https://trusted.example/manifest.mpd",
+        session=object(),
+    )
+    target = "https://attacker.example/collect/segment.m4s"
+
+    assert downloader._headers_for_target(downloader.headers, target) == {
+        "User-Agent": "browser",
+    }
+    names = [
+        item["name"] for item in downloader._get_referer_strategies(target)
+    ]
+    assert "m3u8_url" not in names
+
+    # Cross-CDN credentials require an explicit per-host operator override;
+    # captured credentials are still stripped before this trusted config is
+    # added.
+    monkeypatch.setattr(
+        downloader_mod,
+        "_HOST_HEADERS_BY_HOST",
+        {"attacker.example": {"Authorization": "Bearer explicit"}},
+    )
+    assert downloader._headers_for_target(downloader.headers, target) == {
+        "User-Agent": "browser",
+        "Authorization": "Bearer explicit",
+    }
+
+
+def test_redirected_mpd_cdn_gets_generated_referer_without_credentials(
+    monkeypatch, tmp_path,
+):
+    import downloader as downloader_mod
+
+    monkeypatch.setattr(downloader_mod, "_HOST_HEADERS_BY_HOST", {})
+    manifest_url = "https://media.cdn.example/final/stream.mpd"
+    segment_url = "https://media.cdn.example/final/chunk-1.m4s"
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={
+            "Cookie": "sid=secret",
+            "Authorization": "Bearer captured",
+            "Referer": "https://source.example/watch?token=secret",
+            "Origin": "https://source.example",
+            "User-Agent": "browser",
+        },
+        m3u8_url=manifest_url,
+        header_trust_base="https://source.example/start.mpd",
+        referer_trust_base=manifest_url,
+        session=object(),
+    )
+
+    strategy = next(
+        item for item in downloader._get_referer_strategies(segment_url)
+        if item["name"] == "m3u8_url"
+    )
+    request_headers = downloader._captured_headers_for_target(
+        downloader.headers,
+        segment_url,
+    )
+    request_headers["Referer"] = strategy["Referer"]
+    request_headers["Origin"] = strategy["Origin"]
+    scoped = downloader._headers_for_redirect_hop(
+        segment_url,
+        request_headers,
+    )
+
+    assert scoped == {
+        "User-Agent": "browser",
+        "Referer": manifest_url,
+        "Origin": "https://media.cdn.example",
+    }
+
+
+def test_cached_strategy_replaces_lowercase_captured_referer_and_origin(
+    tmp_path,
+):
+    payload = _make_valid_ts_sample()
+    response = _FakeResponse(
+        status_code=200,
+        content=payload,
+        headers={"Content-Type": "video/mp2t"},
+    )
+    session = _CapturingSession(response)
+    manifest_url = "https://media.cdn.example/final/index.m3u8"
+    segment_url = "https://media.cdn.example/final/chunk.ts"
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={
+            "referer": "https://captured.example/old-ref",
+            "origin": "https://captured.example",
+            "User-Agent": "browser",
+        },
+        m3u8_url=manifest_url,
+        header_trust_base=manifest_url,
+        referer_trust_base=manifest_url,
+        session=session,
+    )
+    downloader.working_referer_strategy = {
+        "name": "m3u8_url",
+        "Referer": manifest_url,
+        "Origin": "https://media.cdn.example",
+    }
+
+    assert downloader.download_segment({
+        "url": segment_url,
+        "index": 0,
+    }) is not None
+
+    assert session.calls[0]["headers"] == {
+        "User-Agent": "browser",
+        "Referer": manifest_url,
+        "Origin": "https://media.cdn.example",
+    }
+
+
+def test_referer_strategies_read_lowercase_captured_headers(tmp_path):
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={
+            "referer": "https://source.example/watch",
+            "origin": "https://source.example",
+        },
+        header_trust_base="https://media.example/index.m3u8",
+        session=object(),
+    )
+
+    source_strategy = downloader._get_referer_strategies(
+        "https://media.example/chunk.ts"
+    )[0]
+    assert source_strategy["Referer"] == "https://source.example/watch"
+    assert source_strategy["Origin"] == "https://source.example"
+
+
+def test_redirect_hop_preserves_case_insensitive_host_referer_override(
+    monkeypatch, tmp_path,
+):
+    import downloader as downloader_mod
+
+    manifest_url = "https://media.cdn.example/final/stream.mpd"
+    segment_url = "https://media.cdn.example/final/chunk.m4s"
+    monkeypatch.setattr(
+        downloader_mod,
+        "_HOST_HEADERS_BY_HOST",
+        {
+            "media.cdn.example": {
+                "referer": "https://operator.example/ref",
+                "ORIGIN": "https://operator.example",
+            },
+        },
+    )
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={"User-Agent": "browser"},
+        m3u8_url=manifest_url,
+        header_trust_base="https://source.example/start.mpd",
+        referer_trust_base=manifest_url,
+        session=object(),
+    )
+
+    scoped = downloader._headers_for_redirect_hop(
+        segment_url,
+        {
+            "User-Agent": "browser",
+            "Referer": manifest_url,
+            "Origin": "https://media.cdn.example",
+        },
+    )
+
+    assert scoped == {
+        "User-Agent": "browser",
+        "referer": "https://operator.example/ref",
+        "ORIGIN": "https://operator.example",
+    }
+
+
+def test_redirect_replaces_per_host_override_instead_of_forwarding_it(
+    monkeypatch, tmp_path,
+):
+    import downloader as downloader_mod
+    from shared.security import guarded_get
+
+    monkeypatch.setattr(
+        downloader_mod,
+        "_HOST_HEADERS_BY_HOST",
+        {
+            "cdn1.trusted.example": {"Authorization": "Bearer cdn-one"},
+            "cdn2.trusted.example": {"Authorization": "Bearer cdn-two"},
+        },
+    )
+    first = "https://cdn1.trusted.example/segment"
+    second = "https://cdn2.trusted.example/segment"
+    redirect = _FakeResponse(
+        status_code=302,
+        headers={"location": second},
+    )
+    final = _FakeResponse(status_code=200, content=b"ok")
+
+    class _RedirectSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, headers=None, **_kwargs):
+            self.calls.append((url, dict(headers or {})))
+            return redirect if url == first else final
+
+    session = _RedirectSession()
+    downloader = SegmentDownloader(
+        segments=[],
+        output_dir=str(tmp_path),
+        headers={"Cookie": "sid=captured", "User-Agent": "browser"},
+        m3u8_url="https://trusted.example/manifest.mpd",
+        header_trust_base="https://trusted.example/manifest.mpd",
+        session=session,
+    )
+    # Crucially, the immutable base contains captured headers only. Each hop
+    # callback overlays that host's explicit configuration from scratch.
+    base = downloader._captured_headers_for_target(downloader.headers, first)
+    response = guarded_get(
+        session,
+        first,
+        headers=base,
+        stream=True,
+        headers_for_url=downloader._headers_for_redirect_hop,
+    )
+    response.close()
+
+    assert session.calls[0][1]["Authorization"] == "Bearer cdn-one"
+    assert session.calls[1][1]["Authorization"] == "Bearer cdn-two"
+    assert "cdn-one" not in repr(session.calls[1][1])
 
 
 # --- v2.3.16: mobile_ua fallback strategy -----------
@@ -1384,6 +2513,12 @@ def test_validated_success_does_shrink_pacing_delay(tmp_path):
                 content = bytes(valid_ts)
 
                 def raise_for_status(self):
+                    pass
+
+                def iter_content(self, chunk_size=64 * 1024):
+                    yield self.content
+
+                def close(self):
                     pass
 
             return _R()

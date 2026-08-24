@@ -7,6 +7,7 @@ private prefix still signals "do not import from outside the parser".
 """
 from shared.parsers.dash import (  # noqa: F401
     MAX_SEGMENTS_PER_TRACK,
+    MPDFallbackUnsafeError,
     MPDParseError,
     extract_all_mpd_urls,
     parse_mpd,
@@ -19,5 +20,6 @@ from shared.parsers.dash import (  # noqa: F401
     _max_representation_bandwidth,
     _is_trickmode_adapt_set,
     _merge_segment_templates,
+    _next_explicit_t_boundaries,
     _parse_one_track,
 )

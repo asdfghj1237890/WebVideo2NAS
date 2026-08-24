@@ -10,11 +10,44 @@ import m3u8
 import urllib3
 from shared.ssl import create_legacy_session, tls_verify_enabled
 from shared.security import guarded_get
+from shared.security import is_trusted_for_captured_headers
+from shared.security import scoped_captured_headers
 
 if not tls_verify_enabled():
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
+
+MAX_M3U8_PLAYLIST_BYTES = 10 * 1024 * 1024
+_M3U8_READ_CHUNK_BYTES = 64 * 1024
+MAX_M3U8_MEDIA_ENTRIES = 100_000
+MAX_M3U8_LINE_CHARS = 64 * 1024
+MAX_M3U8_UNIQUE_KEYS = 1024
+MAX_M3U8_KEY_COMPARISON_WORK = 1_100_000
+MAX_M3U8_KEY_SEGMENT_PRODUCT = 1_000_000
+MAX_M3U8_MASTER_VARIANTS = 1024
+MAX_M3U8_MEDIA_RENDITIONS = 1024
+_M3U8_LINE_BREAKS = frozenset(
+    ("\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+)
+
+
+def _iter_m3u8_lines(text: str):
+    """Yield lines with ``str.splitlines`` semantics without a line list."""
+    start = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] not in _M3U8_LINE_BREAKS:
+            index += 1
+            continue
+        yield text[start:index]
+        if text[index] == "\r" and index + 1 < length and text[index + 1] == "\n":
+            index += 1
+        index += 1
+        start = index
+    if start < length:
+        yield text[start:]
 
 # Check if brotli is available for requests
 try:
@@ -28,12 +61,35 @@ except ImportError:
 class M3U8Parser:
     """Parse m3u8 playlists and extract segment URLs"""
 
-    def __init__(self, url: str, headers: Optional[Dict] = None, session=None):
+    def __init__(
+        self,
+        url: str,
+        headers: Optional[Dict] = None,
+        session=None,
+        request_slot=None,
+        headers_for_url=None,
+    ):
         self.url = url
+        self.final_url = url
         self.headers = self._sanitize_headers(headers or {})
         self.base_url = self._get_base_url(url)
         # Use provided session to preserve cookies / TLS fingerprint across playlist+key+segments.
         self.session = session if session is not None else create_legacy_session()
+        self.request_slot = request_slot
+        if headers_for_url is None:
+            # Even with SSRF_GUARD disabled, force guarded_get's manual redirect
+            # loop so browser-captured Cookie/Authorization cannot be forwarded
+            # by the HTTP client's automatic redirect handling to a foreign
+            # playlist host.
+            self.headers_for_url = lambda target, captured: (
+                scoped_captured_headers(
+                    captured,
+                    target,
+                    self.url,
+                )
+            )
+        else:
+            self.headers_for_url = headers_for_url
 
     def _sanitize_headers(self, headers: Dict) -> Dict:
         """
@@ -133,23 +189,36 @@ class M3U8Parser:
 
     def fetch_playlist(self) -> str:
         """Fetch m3u8 playlist content with early validation"""
+        response = None
         try:
             logger.info(f"Fetching playlist: {self.url}")
 
-            # NOTE: Use non-streaming reads for compatibility across session backends
-            # (requests vs curl_cffi BrowserSession). m3u8 playlists should be small.
             # guarded_get re-validates the host on every redirect hop when the
             # SSRF guard is enabled (a master playlist and its variant URLs come
-            # from untrusted manifest text); it is a plain pass-through otherwise.
+            # from untrusted manifest text). Stream into a hard ceiling so a
+            # chunked response cannot allocate an unbounded body before the
+            # parser gets a chance to enforce its limit.
             response = guarded_get(
                 self.session,
                 self.url,
                 headers=self.headers,
                 timeout=30,
                 allow_redirects=True,
-                stream=False,
+                stream=True,
+                request_slot=self.request_slot,
+                headers_for_url=self.headers_for_url,
             )
             response.raise_for_status()
+
+            response_url = getattr(response, 'url', None)
+            if isinstance(response_url, str):
+                parsed_response_url = urlparse(response_url)
+                if (
+                    parsed_response_url.scheme in ('http', 'https')
+                    and parsed_response_url.netloc
+                ):
+                    self.final_url = response_url
+                    self.base_url = self._get_base_url(response_url)
 
             # Check content-type header for early detection
             content_type = response.headers.get('Content-Type', '').lower()
@@ -160,15 +229,43 @@ class M3U8Parser:
                 if 'video' in content_type or 'octet-stream' in content_type:
                     logger.warning(f"Content-Type suggests this is not an m3u8 playlist: {content_type}")
 
-            # Check content-length to detect large files (likely not m3u8)
+            # Check content-length before reading, then enforce the same cap
+            # incrementally for chunked/misdeclared responses.
             content_length = response.headers.get('Content-Length')
             if content_length:
-                size_mb = int(content_length) / (1024 * 1024)
-                if size_mb > 1:  # m3u8 playlists are typically < 1MB
-                    logger.warning(f"Response is {size_mb:.1f}MB - likely not an m3u8 playlist")
-                    raise ValueError(f"Response too large ({size_mb:.1f}MB) - this appears to be a video file, not an m3u8 playlist")
+                try:
+                    declared_size = int(content_length)
+                except (TypeError, ValueError):
+                    declared_size = None
+                if (
+                    declared_size is not None
+                    and declared_size > MAX_M3U8_PLAYLIST_BYTES
+                ):
+                    size_mb = declared_size / (1024 * 1024)
+                    logger.warning(
+                        f"Response is {size_mb:.1f}MB - likely not an m3u8 playlist"
+                    )
+                    raise ValueError(
+                        f"Response too large ({size_mb:.1f}MB) - this appears "
+                        "to be a video file, not an m3u8 playlist"
+                    )
 
-            raw = response.content or b""
+            chunks = []
+            received = 0
+            for chunk in response.iter_content(
+                chunk_size=_M3U8_READ_CHUNK_BYTES,
+            ):
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > MAX_M3U8_PLAYLIST_BYTES:
+                    raise ValueError(
+                        "Response too large while streaming "
+                        f"(>{MAX_M3U8_PLAYLIST_BYTES} bytes) - this appears "
+                        "to be a video file, not an m3u8 playlist"
+                    )
+                chunks.append(chunk)
+            raw = b''.join(chunks)
             if not raw:
                 raise ValueError("Empty response - not a valid m3u8 playlist")
 
@@ -196,16 +293,120 @@ class M3U8Parser:
                 preview = first_text[:200] if len(first_text) > 200 else first_text
                 logger.warning(f"Content doesn't start with #EXTM3U: {preview}")
 
-            # Decode full content (with reasonable limit)
-            max_size = 10 * 1024 * 1024  # 10MB max for m3u8
-            if len(raw) > max_size:
-                raise ValueError(f"Response exceeds {max_size // 1024 // 1024}MB limit - not a valid m3u8 playlist")
-
             return raw.decode("utf-8")
 
         except Exception as e:
             logger.error(f"Failed to fetch playlist: {e}")
             raise
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _enforce_media_entry_cap(content: str, *, label: str) -> None:
+        """Constant-retained-memory preflight before ``m3u8.loads``.
+
+        The dependency retains URI entries plus several tag families, and its
+        unique-key bookkeeping performs list membership comparisons. Bound all
+        of those signals before it can materialize or compare the objects.
+        """
+        uri_entries = 0
+        media_entries = 0
+        variant_entries = 0
+        auxiliary_entries = 0
+        media_renditions = 0
+        key_entries = 0
+        unique_key_lines = set()
+        raw_line_count = 0
+        max_raw_lines = MAX_M3U8_MEDIA_ENTRIES * 16 + 1024
+        retained_object_prefixes = (
+            "#EXT-X-KEY",
+            "#EXT-X-I-FRAME-STREAM-INF",
+            "#EXT-X-IMAGE-STREAM-INF",
+            "#EXT-X-TILES",
+            "#EXT-X-MEDIA",
+            "#EXT-X-MAP",
+            "#EXT-X-RENDITION-REPORT",
+            "#EXT-X-PART",
+            "#EXT-X-SESSION-DATA",
+            "#EXT-X-SESSION-KEY",
+            "#EXT-X-DATERANGE",
+        )
+        for raw_line in _iter_m3u8_lines(content):
+            raw_line_count += 1
+            if raw_line_count > max_raw_lines:
+                raise ValueError(
+                    f"{label} raw line count exceeds limit {max_raw_lines}"
+                )
+            if len(raw_line) > MAX_M3U8_LINE_CHARS:
+                raise ValueError(
+                    f"{label} line length exceeds "
+                    f"MAX_M3U8_LINE_CHARS={MAX_M3U8_LINE_CHARS}"
+                )
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#EXTINF"):
+                media_entries += 1
+            elif line.startswith("#EXT-X-STREAM-INF"):
+                variant_entries += 1
+                if variant_entries > MAX_M3U8_MASTER_VARIANTS:
+                    raise ValueError(
+                        f"{label} master variant count exceeds "
+                        f"MAX_M3U8_MASTER_VARIANTS={MAX_M3U8_MASTER_VARIANTS}"
+                    )
+            elif line.startswith("#EXT-X-MEDIA"):
+                auxiliary_entries += 1
+                media_renditions += 1
+                if media_renditions > MAX_M3U8_MEDIA_RENDITIONS:
+                    raise ValueError(
+                        f"{label} media rendition count exceeds "
+                        f"MAX_M3U8_MEDIA_RENDITIONS={MAX_M3U8_MEDIA_RENDITIONS}"
+                    )
+            elif line.startswith("#EXT-X-KEY"):
+                auxiliary_entries += 1
+                key_entries += 1
+                unique_key_lines.add(line)
+                if len(unique_key_lines) > MAX_M3U8_UNIQUE_KEYS:
+                    raise ValueError(
+                        f"{label} unique key count exceeds "
+                        f"MAX_M3U8_UNIQUE_KEYS={MAX_M3U8_UNIQUE_KEYS}"
+                    )
+                if (
+                    key_entries * len(unique_key_lines)
+                    > MAX_M3U8_KEY_COMPARISON_WORK
+                ):
+                    raise ValueError(
+                        f"{label} key comparison work exceeds "
+                        f"MAX_M3U8_KEY_COMPARISON_WORK="
+                        f"{MAX_M3U8_KEY_COMPARISON_WORK}"
+                    )
+            elif line.startswith(retained_object_prefixes):
+                auxiliary_entries += 1
+            elif not line.startswith('#'):
+                uri_entries += 1
+            if (
+                len(unique_key_lines) * media_entries
+                > MAX_M3U8_KEY_SEGMENT_PRODUCT
+            ):
+                raise ValueError(
+                    f"{label} key x segment work exceeds "
+                    f"MAX_M3U8_KEY_SEGMENT_PRODUCT="
+                    f"{MAX_M3U8_KEY_SEGMENT_PRODUCT}"
+                )
+            if max(
+                uri_entries,
+                media_entries,
+                variant_entries,
+                uri_entries + auxiliary_entries,
+            ) > MAX_M3U8_MEDIA_ENTRIES:
+                raise ValueError(
+                    f"{label} media entry count exceeds "
+                    f"MAX_M3U8_MEDIA_ENTRIES={MAX_M3U8_MEDIA_ENTRIES}"
+                )
 
     def parse(self) -> Dict:
         """
@@ -221,13 +422,19 @@ class M3U8Parser:
         try:
             # Fetch playlist content
             content = self.fetch_playlist()
+            self._enforce_media_entry_cap(content, label="Playlist")
 
             # Log first 500 chars of content to diagnose parsing issues
             content_preview = content[:500] if len(content) > 500 else content
             logger.info(f"Playlist content preview ({len(content)} bytes):\n{content_preview}")
 
             # Parse with m3u8 library
-            playlist = m3u8.loads(content, uri=self.url)
+            playlist = m3u8.loads(content, uri=self.final_url)
+            if len(playlist.segments) > MAX_M3U8_MEDIA_ENTRIES:
+                raise ValueError(
+                    "Playlist segment count exceeds "
+                    f"MAX_M3U8_MEDIA_ENTRIES={MAX_M3U8_MEDIA_ENTRIES}"
+                )
 
             # Check if this is a master playlist (with variants)
             if playlist.is_variant:
@@ -237,7 +444,9 @@ class M3U8Parser:
                 logger.info("Media playlist detected")
                 # Debug: log segment count before parsing
                 logger.debug(f"Raw playlist has {len(playlist.segments)} segments, {len(playlist.playlists)} playlists")
-                return self._parse_media_playlist(playlist, content)
+                result = self._parse_media_playlist(playlist, content)
+                result['playlist_url'] = self.final_url
+                return result
 
         except Exception as e:
             logger.error(f"Failed to parse m3u8: {e}")
@@ -265,16 +474,65 @@ class M3U8Parser:
             resolution = f"{width}x{height}"
 
         # Get absolute URL for variant playlist
-        variant_url = urljoin(self.url, best_variant.uri)
+        variant_url = urljoin(self.final_url, best_variant.uri)
+
+        # Captured credentials remain governed by the caller's original trust
+        # anchor, but a master that redirected to a public CDN needs a browser-
+        # style Referer/Origin when it fetches a relative variant on that final
+        # CDN. Keep these two sources separate so adding the generated referrer
+        # cannot also forward Cookie/Authorization from the source origin.
+        def variant_headers_for_url(target_url: str, captured: Dict) -> Dict:
+            if self.headers_for_url is not None:
+                scoped = dict(
+                    self.headers_for_url(target_url, captured) or {}
+                )
+            else:
+                scoped = scoped_captured_headers(
+                    captured,
+                    target_url,
+                    self.url,
+                )
+            if is_trusted_for_captured_headers(target_url, self.final_url):
+                present = {
+                    str(name).strip().lower() for name in scoped
+                }
+                final_parts = urlparse(self.final_url)
+                if "referer" not in present:
+                    scoped["Referer"] = self.final_url
+                if "origin" not in present:
+                    scoped["Origin"] = (
+                        f"{final_parts.scheme}://{final_parts.netloc}"
+                    )
+            return scoped
 
         # Parse the selected variant (media playlist)
-        variant_parser = M3U8Parser(variant_url, self.headers, session=self.session)
+        variant_parser = M3U8Parser(
+            variant_url,
+            self.headers,
+            session=self.session,
+            request_slot=self.request_slot,
+            headers_for_url=variant_headers_for_url,
+        )
         variant_content = variant_parser.fetch_playlist()
-        variant_playlist = m3u8.loads(variant_content, uri=variant_url)
+        self._enforce_media_entry_cap(
+            variant_content,
+            label="Variant playlist",
+        )
+        variant_final_url = variant_parser.final_url
+        variant_playlist = m3u8.loads(
+            variant_content,
+            uri=variant_final_url,
+        )
+        if len(variant_playlist.segments) > MAX_M3U8_MEDIA_ENTRIES:
+            raise ValueError(
+                "Variant playlist segment count exceeds "
+                f"MAX_M3U8_MEDIA_ENTRIES={MAX_M3U8_MEDIA_ENTRIES}"
+            )
 
         result = self._parse_media_playlist(variant_playlist, variant_content)
         result['resolution'] = resolution
-        result['selected_variant_url'] = variant_url
+        result['selected_variant_url'] = variant_final_url
+        result['playlist_url'] = variant_final_url
 
         return result
 
@@ -467,7 +725,13 @@ class M3U8Parser:
         return info.get('key') if info else None
 
 
-def parse_m3u8(url: str, headers: Optional[Dict] = None, session=None) -> Dict:
+def parse_m3u8(
+    url: str,
+    headers: Optional[Dict] = None,
+    session=None,
+    request_slot=None,
+    headers_for_url=None,
+) -> Dict:
     """
     Convenience function to parse m3u8 URL
 
@@ -478,5 +742,11 @@ def parse_m3u8(url: str, headers: Optional[Dict] = None, session=None) -> Dict:
     Returns:
         Dict with segment information
     """
-    parser = M3U8Parser(url, headers, session=session)
+    parser = M3U8Parser(
+        url,
+        headers,
+        session=session,
+        request_slot=request_slot,
+        headers_for_url=headers_for_url,
+    )
     return parser.parse()

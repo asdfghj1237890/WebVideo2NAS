@@ -12,8 +12,125 @@ const {
   hexToBytes, ivFromSequence, withRetry, runWithConcurrency,
   KeyCache, isTrustedForCredentials, scopedRequestHeaders,
   byteRangeHeader, mediaFetchHeaders, readBodyWithCap, buildNasUrl,
+  resolveJobConcurrency, createTransferTimings, beginTransferStage,
+  endTransferStage, timeTransferStage, transferTimingSnapshot,
+  retryAfterMsFromResponse,
+  uploadResponseError,
   MAX_SEGMENT_BYTES, MAX_KEY_BYTES,
 } = _internals;
+
+
+describe('job concurrency selection', () => {
+  it('uses the legacy 6 without a recommendation and only opts direct DASH into 12 explicitly', () => {
+    expect(resolveJobConcurrency({ direct_range_concat: true })).toBe(6);
+    expect(resolveJobConcurrency({
+      direct_range_concat: true,
+      recommended_concurrency: 12,
+    })).toBe(12);
+    expect(resolveJobConcurrency({ container: 'dash' })).toBe(6);
+    expect(resolveJobConcurrency({ container: 'hls' })).toBe(6);
+    expect(resolveJobConcurrency({ direct_range_concat: true }, 3)).toBe(3);
+    expect(resolveJobConcurrency({ direct_range_concat: true }, 12)).toBe(6);
+  });
+
+  it('treats malformed direct DASH recommendations as absent', () => {
+    for (const recommendation of [null, NaN, 0, -1, 1.5, '12', true]) {
+      expect(resolveJobConcurrency({
+        direct_range_concat: true,
+        recommended_concurrency: recommendation,
+      })).toBe(6);
+    }
+  });
+
+  it('clamps direct DASH to the API-recommended safe concurrency', () => {
+    const plan = { direct_range_concat: true, recommended_concurrency: 5 };
+    expect(resolveJobConcurrency(plan)).toBe(5);
+    expect(resolveJobConcurrency(plan, 12)).toBe(5);
+    expect(resolveJobConcurrency(plan, 3)).toBe(3);
+    expect(resolveJobConcurrency({
+      direct_range_concat: true,
+      recommended_concurrency: 99,
+    })).toBe(12);
+  });
+
+  it('also clamps ordinary manifest jobs to the API upload cap', () => {
+    const plan = { container: 'hls', recommended_concurrency: 3 };
+    expect(resolveJobConcurrency(plan)).toBe(3);
+    expect(resolveJobConcurrency(plan, 6)).toBe(3);
+    expect(resolveJobConcurrency(plan, 2)).toBe(2);
+  });
+
+  it('rejects unsafe or non-integer overrides', () => {
+    for (const value of [0, -1, 12.5, 13, 'many']) {
+      expect(() => resolveJobConcurrency({}, value)).toThrow(/between 1 and 12/);
+    }
+  });
+});
+
+
+describe('transfer timing aggregation', () => {
+  it('counts overlapping requests once in active wall time but sums request time', () => {
+    const timings = createTransferTimings();
+    const first = beginTransferStage(timings, 'cdn', 100);
+    const second = beginTransferStage(timings, 'cdn', 110);
+
+    endTransferStage(first, { bytes: 8 * 1024 * 1024 }, 150);
+    endTransferStage(second, { bytes: 8 * 1024 * 1024 }, 170);
+
+    const snapshot = transferTimingSnapshot(timings, 170).cdn;
+    expect(snapshot).toMatchObject({
+      bytes: 16 * 1024 * 1024,
+      requests: 2,
+      failures: 0,
+      requestMs: 110,
+      activeMs: 70,
+    });
+    expect(snapshot.mbPerSecond).toBeCloseTo(16 / 0.07, 6);
+  });
+
+  it('includes open requests in live request time and exposes in-flight count', () => {
+    const timings = createTransferTimings();
+    const first = beginTransferStage(timings, 'cdn', 100);
+    beginTransferStage(timings, 'cdn', 110);
+    endTransferStage(first, { bytes: 4 * 1024 * 1024 }, 150);
+
+    const live = transferTimingSnapshot(timings, 160).cdn;
+    expect(live).toMatchObject({
+      bytes: 4 * 1024 * 1024,
+      attemptedBytes: 4 * 1024 * 1024,
+      requests: 1,
+      failures: 0,
+      inFlight: 1,
+      requestMs: 100,
+      activeMs: 60,
+    });
+  });
+
+  it('records a fail-fast sibling abort as cancelled, not as another failure', async () => {
+    const timings = createTransferTimings();
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const abortError = Object.assign(new Error('cancelled'), { name: 'AbortError' });
+
+    await expect(timeTransferStage(
+      timings,
+      'nas',
+      async () => { throw abortError; },
+      8 * 1024 * 1024,
+      null,
+      ctrl.signal,
+    )).rejects.toThrow('cancelled');
+
+    expect(transferTimingSnapshot(timings).nas).toMatchObject({
+      bytes: 0,
+      attemptedBytes: 0,
+      requests: 1,
+      failures: 0,
+      cancelled: 1,
+      inFlight: 0,
+    });
+  });
+});
 
 
 describe('hexToBytes', () => {
@@ -103,6 +220,41 @@ describe('withRetry', () => {
     await expect(withRetry(fn, 'test', ctrl.signal)).rejects.toThrow(/cancelled/);
     expect(fn).not.toHaveBeenCalled();
   });
+
+  it('interrupts an exponential-backoff wait when the job is aborted', async () => {
+    const ctrl = new AbortController();
+    const fn = vi.fn().mockRejectedValue(new Error('transient'));
+    const started = Date.now();
+    setTimeout(() => ctrl.abort(), 30);
+    await expect(withRetry(fn, 'test', ctrl.signal)).rejects.toThrow(/cancelled/);
+    expect(Date.now() - started).toBeLessThan(400);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('parses Retry-After seconds and caps excessive server delays', () => {
+    expect(retryAfterMsFromResponse({ headers: new Headers({ 'Retry-After': '2' }) })).toBe(2000);
+    expect(retryAfterMsFromResponse({ headers: new Headers({ 'Retry-After': '999' }) })).toBe(60_000);
+    expect(retryAfterMsFromResponse({ headers: new Headers() })).toBe(0);
+  });
+
+  it('does not wait for a stalled NAS error response body', async () => {
+    const cancel = vi.fn(() => Promise.resolve());
+    const text = vi.fn(() => new Promise(() => {}));
+    const response = {
+      status: 503,
+      headers: new Headers({ 'Retry-After': '1' }),
+      body: { cancel },
+      text,
+    };
+
+    const err = await uploadResponseError('PUT segment failed', response);
+
+    expect(err.message).toBe('PUT segment failed (503)');
+    expect(err.httpStatus).toBe(503);
+    expect(err.retryAfterMs).toBe(1000);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(text).not.toHaveBeenCalled();
+  });
 });
 
 
@@ -135,6 +287,20 @@ describe('runWithConcurrency', () => {
       async () => 3,
     ];
     await expect(runWithConcurrency(tasks, 2)).rejects.toThrow('boom');
+  });
+
+  it('calls the fail-fast hook once and stops scheduling queued work', async () => {
+    const onFirstError = vi.fn();
+    const neverStarted = vi.fn(async () => 3);
+    const tasks = [
+      async () => { throw new Error('boom'); },
+      neverStarted,
+      vi.fn(async () => 4),
+    ];
+    await expect(runWithConcurrency(tasks, 1, onFirstError)).rejects.toThrow('boom');
+    expect(onFirstError).toHaveBeenCalledTimes(1);
+    expect(neverStarted).not.toHaveBeenCalled();
+    expect(tasks[2]).not.toHaveBeenCalled();
   });
 
   it('handles empty task list', async () => {
@@ -207,6 +373,19 @@ describe('KeyCache', () => {
     fetch.mockResolvedValue({ ok: false, status: 403 });
     const cache = new KeyCache();
     await expect(cache.getKey('https://k.example.com/forbidden', {})).rejects.toThrow(/Key fetch failed/);
+  });
+
+  it('evicts a rejected key promise so a later retry can fetch again', async () => {
+    const keyBytes = new Uint8Array(16).fill(0x24);
+    fetch
+      .mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockResolvedValueOnce({ ok: true, arrayBuffer: async () => keyBytes.buffer });
+    const cache = new KeyCache();
+    const uri = 'https://k.example.com/transient';
+
+    await expect(cache.getKey(uri, {})).rejects.toThrow(/Key fetch failed/);
+    await expect(cache.getKey(uri, {})).resolves.toBeDefined();
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -565,6 +744,8 @@ describe('runJob: finalizeAttempted error annotation (two-generals invariant)', 
 
     expect(caught).not.toBeNull();
     expect(caught.finalizeAttempted).toBe(false);
+    expect(caught.done).toBe(0);
+    expect(caught.total).toBe(1);
   });
 
   it('annotates err.finalizeAttempted=true when finalize POST fails', async () => {
@@ -1885,6 +2066,178 @@ describe('runJob: onProgress callback (browser-side progress pipeline)', () => {
     });
     expect(secondEventReceived).toBe(true);  // upload completed despite throw
   });
+
+  it('reports CDN fetch and NAS upload timings separately', async () => {
+    let now = 1_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      setFetchRouter((url, opts) => {
+        if (opts && opts.method === 'PUT') {
+          now += 20;
+          return ok('uploaded');
+        }
+        if (url.includes('/finalize')) {
+          now += 5;
+          return ok('finalized');
+        }
+        now += 100;
+        return ok('DATA');
+      });
+
+      const events = [];
+      const summary = await runJob({
+        jobId: 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+        nasEndpoint: 'http://nas/', apiKey: 'k',
+        plan: {
+          direct_range_concat: true,
+          source_url: 'https://cdn.example.com/video.m4s',
+          tracks: {
+            video: {
+              segments: [{ url: 'https://cdn.example.com/video.m4s', seq: 0 }],
+            },
+          },
+        },
+        onProgress: (info) => events.push(info),
+        concurrency: 1,
+      });
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ done: 1, total: 1, concurrency: 1 });
+      expect(events[0].transferTimings.cdn).toMatchObject({
+        bytes: 4, requests: 1, failures: 0, requestMs: 100, activeMs: 100,
+      });
+      expect(events[0].transferTimings.nas).toMatchObject({
+        bytes: 4, requests: 1, failures: 0, requestMs: 20, activeMs: 20,
+      });
+      expect(summary.concurrency).toBe(1);
+      expect(summary.transferTimings).toEqual(events[0].transferTimings);
+      expect(summary.transferTimings.nas.mbPerSecond)
+        .toBeGreaterThan(summary.transferTimings.cdn.mbPerSecond);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('retries a transient NAS upload without downloading the CDN bytes again', async () => {
+    let cdnFetches = 0;
+    let nasUploads = 0;
+    setFetchRouter((url, opts) => {
+      if (opts && opts.method === 'PUT') {
+        nasUploads += 1;
+        return nasUploads === 1 ? ok('busy', 429) : ok('uploaded');
+      }
+      if (url.includes('/finalize')) return ok('finalized');
+      cdnFetches += 1;
+      return ok('DATA');
+    });
+
+    const summary = await runJob({
+      jobId: '12121212-1212-1212-1212-121212121212',
+      nasEndpoint: 'http://nas/', apiKey: 'k',
+      plan: {
+        source_url: 'https://cdn.example.com/video.m4s',
+        tracks: { video: { segments: [{ url: 'https://cdn.example.com/video.m4s', seq: 0 }] } },
+      },
+      concurrency: 1,
+    });
+
+    expect(cdnFetches).toBe(1);
+    expect(nasUploads).toBe(2);
+    expect(summary.transferTimings.cdn).toMatchObject({
+      bytes: 4, attemptedBytes: 4, requests: 1, failures: 0,
+    });
+    expect(summary.transferTimings.nas).toMatchObject({
+      bytes: 4, attemptedBytes: 8, requests: 2, failures: 1,
+    });
+  });
+
+  it('re-fetches and retries when AES decryption transiently rejects', async () => {
+    let segmentFetches = 0;
+    let keyFetches = 0;
+    let nasUploads = 0;
+    const decryptSpy = vi.spyOn(crypto.subtle, 'decrypt')
+      .mockRejectedValueOnce(new DOMException('bad transient body', 'OperationError'))
+      .mockResolvedValueOnce(new TextEncoder().encode('DATA').buffer);
+    try {
+      setFetchRouter((url, opts) => {
+        if (opts && opts.method === 'PUT') {
+          nasUploads += 1;
+          return ok('uploaded');
+        }
+        if (url.includes('/finalize')) return ok('finalized');
+        if (url.endsWith('/key.bin')) {
+          keyFetches += 1;
+          return ok('0123456789abcdef');
+        }
+        segmentFetches += 1;
+        return ok('0123456789abcdef');
+      });
+
+      const summary = await runJob({
+        jobId: '14141414-1414-1414-1414-141414141414',
+        nasEndpoint: 'http://nas/', apiKey: 'k',
+        plan: {
+          source_url: 'https://cdn.example.com/master.m3u8',
+          tracks: {
+            video: {
+              segments: [{
+                url: 'https://cdn.example.com/s0.ts', seq: 0,
+                key: { uri: 'https://cdn.example.com/key.bin', iv: '00000000000000000000000000000000' },
+              }],
+            },
+          },
+        },
+        concurrency: 1,
+      });
+
+      expect(segmentFetches).toBe(2);
+      expect(keyFetches).toBe(1);
+      expect(nasUploads).toBe(1);
+      expect(summary.transferTimings.cdn).toMatchObject({
+        bytes: 32, attemptedBytes: 32, requests: 2,
+      });
+    } finally {
+      decryptSpy.mockRestore();
+    }
+  });
+
+  it('counts a range-validation rejection as a failed CDN attempt', async () => {
+    setFetchRouter((url) => {
+      if (url.includes('/finalize')) return ok('finalized');
+      // Range requests must receive 206; a full-body 200 is unsafe even when
+      // its current byte length happens to match the requested range.
+      return ok('DATA', 200);
+    });
+
+    let thrown;
+    try {
+      await runJob({
+        jobId: '13131313-1313-1313-1313-131313131313',
+        nasEndpoint: 'http://nas/', apiKey: 'k',
+        plan: {
+          direct_range_concat: true,
+          source_url: 'https://cdn.example.com/video.m4s',
+          tracks: {
+            video: {
+              segments: [{
+                url: 'https://cdn.example.com/video.m4s', seq: 0,
+                byte_range: { offset: 0, length: 4 },
+              }],
+            },
+          },
+        },
+        concurrency: 1,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeDefined();
+    expect(thrown.transferTimings.cdn).toMatchObject({
+      bytes: 0, attemptedBytes: 12, requests: 3, failures: 3,
+    });
+    expect(thrown.transferTimings.nas.requests).toBe(0);
+  }, 10000);
 
   it('omitting onProgress is fine — runJob runs to completion', async () => {
     setFetchRouter(() => ok('OK'));

@@ -21,11 +21,17 @@ from typing import List, Optional
 from urllib.parse import urlparse
 import signal
 import ipaddress
+from contextlib import contextmanager
 
 from job_strategy import JobKind, classify_job_kind
+from host_throttle import HostThrottleCancelled
 from shared.security import is_ip_public as _shared_is_ip_public
+from shared.security import guarded_get
+from shared.security import is_trusted_for_captured_headers
 from shared.security import redacted_headers_for_log as _shared_redacted_headers_for_log
 from shared.security import resolve_host_ips as _shared_resolve_host_ips
+from shared.security import SsrfBlocked
+from shared.security import scoped_captured_headers
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/m3u8_db")
@@ -40,6 +46,39 @@ SSRF_GUARD_ENABLED = os.getenv("SSRF_GUARD", "false").strip().lower() in ("1", "
 # in which abandoned browser staging leaks disk between restarts.
 # 0 disables the periodic sweep (startup-only, legacy behavior).
 REAPER_INTERVAL_SECONDS = int(os.getenv("REAPER_INTERVAL_SECONDS", "900"))
+# Keep worker-side MPD fetches aligned with the browser planner/M3U8 parser.
+# curl_cffi must stream into this ceiling; reading Response.content first lets
+# an untrusted endpoint allocate an arbitrarily large body before parse caps.
+MAX_MPD_MANIFEST_BYTES = 10 * 1024 * 1024
+_MPD_READ_CHUNK_BYTES = 64 * 1024
+MAX_MPD_DERIVED_ORIGINS = 64
+try:
+    MAX_INIT_SEGMENT_BYTES = int(
+        os.getenv("MAX_INIT_SEGMENT_BYTES", str(16 * 1024 * 1024))
+    )
+except (TypeError, ValueError):
+    MAX_INIT_SEGMENT_BYTES = 16 * 1024 * 1024
+if MAX_INIT_SEGMENT_BYTES <= 0:
+    MAX_INIT_SEGMENT_BYTES = 16 * 1024 * 1024
+MPD_FFMPEG_IO_TIMEOUT_SECONDS = max(
+    1, int(os.getenv("MPD_FFMPEG_IO_TIMEOUT_SECONDS", "60")),
+)
+MPD_FFMPEG_TOTAL_TIMEOUT_SECONDS = max(
+    MPD_FFMPEG_IO_TIMEOUT_SECONDS,
+    int(os.getenv("MPD_FFMPEG_TOTAL_TIMEOUT_SECONDS", "21600")),
+)
+
+
+class NonRetryableManifestError(Exception):
+    """A deterministic manifest-policy/parser rejection.
+
+    Keep this typed until retry classification so malformed, unsupported, DRM,
+    live, or over-limit manifests are not fetched and parsed three times.
+    """
+
+
+class NonRetryableMediaResourceError(Exception):
+    """A deterministic init/media resource shape or size rejection."""
 
 
 def _utcnow_naive() -> datetime:
@@ -152,22 +191,374 @@ def _enforce_ssrf_guard(url: str) -> None:
     parsed = urlparse(url)
     hostname = parsed.hostname
     if not hostname:
-        raise Exception("Invalid URL host")
+        raise SsrfBlocked("Invalid URL host")
     if hostname.lower() in ("localhost",):
-        raise Exception("URL host not allowed")
+        raise SsrfBlocked("URL host not allowed")
     try:
         ips = _resolve_host_ips(hostname)
-    except Exception:
-        raise Exception("URL host could not be resolved")
+    except Exception as exc:
+        raise SsrfBlocked("URL host could not be resolved") from exc
     if not ips:
-        raise Exception("URL host could not be resolved")
+        raise SsrfBlocked("URL host could not be resolved")
     for ip in ips:
         if not _is_ip_public(ip):
-            raise Exception("URL host not allowed")
+            raise SsrfBlocked("URL host not allowed")
+
+
+def _raise_mpd_url_policy_error(exc: SsrfBlocked) -> None:
+    """Keep transient DNS failures retryable; fail fixed policy blocks once."""
+    if str(exc) == "URL host could not be resolved":
+        raise exc
+    raise NonRetryableManifestError(
+        f"MPD URL policy rejected: {exc}"
+    ) from exc
+
+
+def _enforce_mpd_url_policy(url: str) -> None:
+    try:
+        _enforce_ssrf_guard(url)
+    except SsrfBlocked as exc:
+        _raise_mpd_url_policy_error(exc)
+
+
+@contextmanager
+def _host_request_slot(url: str, *, should_cancel=None):
+    """Apply the distributed per-host cap to non-segment worker fetches."""
+    throttle = None
+    acquired = False
+    try:
+        if should_cancel is not None and should_cancel():
+            raise HostThrottleCancelled(
+                "Cancelled before waiting for host concurrency slot"
+            )
+        import host_throttle
+
+        throttle = host_throttle.get()
+        acquired = (
+            throttle.acquire(
+                url,
+                should_cancel=should_cancel,
+                fail_open=False,
+            )
+            if throttle is not None else False
+        )
+        if should_cancel is not None and should_cancel():
+            raise HostThrottleCancelled(
+                "Cancelled before network fetch"
+            )
+        yield
+    finally:
+        if acquired and throttle is not None:
+            throttle.release(url)
 
 
 def _redacted_headers_for_log(headers: dict) -> dict:
     return _shared_redacted_headers_for_log(headers)
+
+
+def _worker_header_present_ci(headers: dict, name: str) -> bool:
+    target = str(name).strip().lower()
+    return any(
+        str(existing).strip().lower() == target
+        for existing in (headers or {})
+    )
+
+
+def _replace_worker_header_ci(
+    headers: dict,
+    name: str,
+    value,
+) -> None:
+    target = str(name).strip().lower()
+    for existing in list(headers):
+        if str(existing).strip().lower() == target:
+            headers.pop(existing, None)
+    if value is not None:
+        headers[name] = value
+
+
+def _scoped_worker_media_headers(
+    headers: dict,
+    target_url: str,
+    trusted_base_url: Optional[str],
+    referer_trust_base: Optional[str] = None,
+) -> dict:
+    """Scope captured credentials and generated media referrer separately.
+
+    ``trusted_base_url`` anchors browser-captured secrets to the original job
+    URL. ``referer_trust_base`` anchors the worker-generated Referer/Origin to
+    the final manifest URL after redirects. Keeping the two boundaries
+    separate lets a redirected public CDN receive the referrer it requires
+    without also receiving cookies or authorization captured on the source
+    origin.
+    """
+    scoped = scoped_captured_headers(
+        headers,
+        target_url,
+        trusted_base_url,
+    )
+    if (
+        referer_trust_base
+        and is_trusted_for_captured_headers(
+            target_url,
+            referer_trust_base,
+        )
+    ):
+        parsed_referer = urlparse(referer_trust_base)
+        if not _worker_header_present_ci(scoped, "Referer"):
+            scoped["Referer"] = referer_trust_base
+        if not _worker_header_present_ci(scoped, "Origin"):
+            scoped["Origin"] = (
+                f"{parsed_referer.scheme}://{parsed_referer.netloc}"
+            )
+    try:
+        from downloader import get_host_headers_for
+
+        host = urlparse(target_url).hostname or ""
+        overrides = get_host_headers_for(host)
+        if overrides:
+            for override_name, override_value in overrides.items():
+                _replace_worker_header_ci(
+                    scoped, override_name, override_value,
+                )
+    except ImportError:
+        pass
+    return scoped
+
+
+def _read_bounded_mpd_body(response) -> bytes:
+    """Read a streamed MPD response without exceeding the manifest cap."""
+    headers = getattr(response, "headers", {}) or {}
+    declared = None
+    try:
+        raw_declared = headers.get("Content-Length") or headers.get(
+            "content-length"
+        )
+        if raw_declared is not None:
+            declared = int(raw_declared)
+    except (TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > MAX_MPD_MANIFEST_BYTES:
+        raise NonRetryableManifestError(
+            f"MPD response Content-Length {declared} exceeds "
+            f"MAX_MPD_MANIFEST_BYTES={MAX_MPD_MANIFEST_BYTES}"
+        )
+
+    chunks = []
+    received = 0
+    for chunk in response.iter_content(chunk_size=_MPD_READ_CHUNK_BYTES):
+        if not chunk:
+            continue
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        received += len(chunk)
+        if received > MAX_MPD_MANIFEST_BYTES:
+            raise NonRetryableManifestError(
+                f"MPD response body exceeds MAX_MPD_MANIFEST_BYTES="
+                f"{MAX_MPD_MANIFEST_BYTES}"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _read_bounded_binary_body(
+    response,
+    *,
+    max_bytes: int,
+    label: str,
+    expected_bytes: Optional[int] = None,
+) -> bytes:
+    """Read a streamed binary response with early and incremental bounds."""
+    if expected_bytes is not None and (
+        expected_bytes <= 0 or expected_bytes > max_bytes
+    ):
+        raise ValueError(
+            f"{label} expected length {expected_bytes} exceeds limit {max_bytes}"
+        )
+    headers = getattr(response, "headers", {}) or {}
+    declared = None
+    try:
+        raw_declared = headers.get("Content-Length") or headers.get(
+            "content-length"
+        )
+        if raw_declared is not None:
+            declared = int(raw_declared)
+    except (AttributeError, TypeError, ValueError):
+        declared = None
+    if declared is not None and (declared < 0 or declared > max_bytes):
+        raise ValueError(
+            f"{label} Content-Length {declared} exceeds limit {max_bytes}"
+        )
+    if (
+        expected_bytes is not None
+        and declared is not None
+        and declared != expected_bytes
+    ):
+        raise ValueError(
+            f"{label} Content-Length mismatch: got {declared}, "
+            f"expected {expected_bytes}"
+        )
+
+    iterator = getattr(response, "iter_content", None)
+    if not callable(iterator):
+        raise ValueError(f"{label} streaming response has no iter_content")
+    body = bytearray()
+    effective_limit = expected_bytes if expected_bytes is not None else max_bytes
+    for chunk in iterator(chunk_size=_MPD_READ_CHUNK_BYTES):
+        if not chunk:
+            continue
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        if len(body) + len(chunk) > effective_limit:
+            raise ValueError(
+                f"{label} body exceeds limit {effective_limit} bytes"
+            )
+        body.extend(chunk)
+    if expected_bytes is not None and len(body) != expected_bytes:
+        raise ValueError(
+            f"{label} length mismatch: got {len(body)}, "
+            f"expected {expected_bytes}"
+        )
+    return bytes(body)
+
+
+def _kill_and_reap(process) -> None:
+    """Best-effort bounded child cleanup used by ffmpeg supervision."""
+    if process.poll() is None:
+        try:
+            process.kill()
+        except Exception:
+            pass
+    try:
+        process.wait(timeout=5)
+    except TypeError:
+        # Lightweight test doubles and older wrappers may omit timeout=.
+        process.wait()
+    except Exception:
+        pass
+
+
+def _monitor_ffmpeg_process(
+    process,
+    *,
+    should_stop,
+    on_progress,
+    total_duration: Optional[float],
+    timeout_seconds: int,
+) -> tuple[int, str, bool]:
+    """Drain stderr off-thread while polling cancellation and a deadline.
+
+    ffmpeg status output commonly uses carriage returns and can stop entirely
+    during a remote stall. A request thread blocked on ``readline()`` cannot
+    observe cancellation. The daemon reader only drains the pipe; this loop
+    remains responsive even if that reader is blocked in an OS read.
+    """
+    import queue
+    from collections import deque
+
+    # Bound stderr buffering. A chatty or hostile ffmpeg input can emit data
+    # faster than the supervisor consumes it; an unbounded Queue both grows
+    # memory indefinitely and can keep the inner drain loop busy forever,
+    # delaying cancellation and the total deadline. Keep only the newest
+    # ~1 MiB (256 * 4 KiB) and check control state after every small batch.
+    chunks = queue.Queue(maxsize=256)
+    reader_done = threading.Event()
+
+    def enqueue_latest(chunk: str) -> None:
+        while True:
+            try:
+                chunks.put_nowait(chunk)
+                return
+            except queue.Full:
+                try:
+                    chunks.get_nowait()
+                except queue.Empty:
+                    # The consumer freed the slot between Full and get().
+                    continue
+
+    def drain_stderr() -> None:
+        try:
+            stream = process.stderr
+            read_chunk = getattr(stream, "read1", None) or stream.read
+            while True:
+                chunk = read_chunk(4096)
+                if not chunk:
+                    break
+                if isinstance(chunk, bytes):
+                    chunk = chunk.decode("utf-8", errors="replace")
+                enqueue_latest(chunk)
+        except Exception as exc:
+            enqueue_latest(f"[stderr reader failed: {exc}]")
+        finally:
+            reader_done.set()
+
+    reader = threading.Thread(
+        target=drain_stderr,
+        name="wv2nas-ffmpeg-stderr",
+        daemon=True,
+    )
+    reader.start()
+
+    stderr_tail = deque(maxlen=128)
+    progress_buffer = ""
+    time_pattern = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
+    deadline = time.monotonic() + timeout_seconds
+    cancelled = False
+    timed_out = False
+    try:
+        while True:
+            drained_any = False
+            for _ in range(32):
+                try:
+                    chunk = chunks.get_nowait()
+                except queue.Empty:
+                    break
+                drained_any = True
+                stderr_tail.append(chunk)
+                progress_buffer = (progress_buffer + chunk)[-8192:]
+                matches = list(time_pattern.finditer(progress_buffer))
+                if matches and total_duration and total_duration > 0:
+                    match = matches[-1]
+                    h, minute, second, centisecond = (
+                        int(match.group(index)) for index in range(1, 5)
+                    )
+                    current = (
+                        h * 3600 + minute * 60 + second + centisecond / 100.0
+                    )
+                    on_progress(current)
+
+            if should_stop():
+                cancelled = True
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+
+            return_code = process.poll()
+            if return_code is not None and reader_done.is_set() and chunks.empty():
+                break
+            # A short event wait avoids a busy spin but never delegates control
+            # to the potentially-blocked stderr reader.
+            if not drained_any:
+                if reader_done.is_set():
+                    time.sleep(0.1)
+                else:
+                    reader_done.wait(0.1)
+    finally:
+        if cancelled or timed_out or process.poll() is None:
+            _kill_and_reap(process)
+        reader.join(timeout=1.0)
+        while True:
+            try:
+                stderr_tail.append(chunks.get_nowait())
+            except queue.Empty:
+                break
+
+    if timed_out:
+        raise TimeoutError(
+            f"FFmpeg DASH fallback exceeded total timeout {timeout_seconds}s"
+        )
+    return int(process.wait()), "".join(stderr_tail), cancelled
 
 
 # Defense-in-depth path validation. Even though the API normalizes/validates
@@ -570,8 +961,9 @@ class DownloadWorker:
             if status == "downloading" and progress == 0:
                 updates["started_at"] = _utcnow_naive()
             
-            if status == "completed":
+            if status in ("completed", "failed", "cancelled"):
                 updates["completed_at"] = _utcnow_naive()
+            if status == "completed":
                 updates["progress"] = 100
             
             if error_message:
@@ -601,6 +993,50 @@ class DownloadWorker:
             logger.error(f"Failed to update job status: {e}")
             self.db.rollback()
             return None
+
+    def _commit_published_output(
+        self,
+        job_id: str,
+        output_file: str,
+        file_size: int,
+        *,
+        context: str,
+    ) -> bool:
+        """CAS a published file to completed and close the cancel race.
+
+        DELETE can win after a final in-process cancellation check but before
+        the completed UPDATE. If that CAS misses a cancelled row, remove the
+        already-published file so the NAS cannot retain an untracked orphan.
+        An indeterminate DB failure with a non-cancelled row preserves the file
+        for operator inspection instead of risking deletion of valid output.
+        """
+        completed = self.update_job_status(
+            job_id,
+            "completed",
+            progress=100,
+            file_path=output_file,
+            file_size=file_size,
+        )
+        if completed is True:
+            return True
+        if self.is_job_cancelled(job_id):
+            logger.info(
+                f"{context} {job_id} lost completion race to cancel; "
+                "discarding published output"
+            )
+            try:
+                Path(output_file).unlink(missing_ok=True)
+            except Exception as cleanup_error:
+                logger.error(
+                    f"Failed to discard cancelled {context} output "
+                    f"{output_file}: {cleanup_error}"
+                )
+        else:
+            logger.error(
+                f"{context} {job_id} published output but completed status "
+                "update did not succeed; preserving it for inspection"
+            )
+        return False
     
     def get_job_details(self, job_id: str):
         """Get job details from database"""
@@ -711,8 +1147,15 @@ class DownloadWorker:
         ffmpeg is used only for the final video+audio mux (or video-only
         passthrough when the MPD has no audio AdaptationSet).
         """
-        from mpd_parser import parse_mpd, MPDParseError
-        from downloader import SegmentDownloader
+        from mpd_parser import (
+            MPDFallbackUnsafeError,
+            MPDParseError,
+            parse_mpd,
+        )
+        from downloader import (
+            NonRetryableSegmentResourceError,
+            SegmentDownloader,
+        )
         from ffmpeg_wrapper import merge_segments
         from ssl_adapter import create_impersonated_session
         import tempfile
@@ -720,7 +1163,7 @@ class DownloadWorker:
         temp_dir = None
 
         try:
-            _enforce_ssrf_guard(job["url"])
+            _enforce_mpd_url_policy(job["url"])
 
             self.update_job_status(job_id, "downloading", progress=0)
             logger.info(f"Starting MPD download: {job['url']}")
@@ -750,70 +1193,90 @@ class DownloadWorker:
             # --- Step 1: fetch + parse MPD ---
             logger.info("Step 1: Fetching and parsing MPD")
             shared_session = create_impersonated_session()
-            mpd_response = shared_session.get(
-                job['url'], headers=headers, timeout=30, stream=False,
+            job_request_slot = lambda url: _host_request_slot(
+                url,
+                should_cancel=lambda: (
+                    self.is_job_cancelled(job_id)
+                ),
             )
-            mpd_response.raise_for_status()
-            mpd_xml = mpd_response.content.decode('utf-8', errors='replace')
+            try:
+                mpd_response = guarded_get(
+                    shared_session,
+                    job['url'],
+                    headers=headers,
+                    timeout=30,
+                    allow_redirects=True,
+                    stream=True,
+                    request_slot=job_request_slot,
+                    headers_for_url=lambda target, captured: (
+                        _scoped_worker_media_headers(
+                            captured,
+                            target,
+                            job['url'],
+                        )
+                    ),
+                )
+            except SsrfBlocked as exc:
+                _raise_mpd_url_policy_error(exc)
+            try:
+                mpd_response.raise_for_status()
 
-            # Codex review #17 (round 8): if the MPD endpoint redirected,
-            # use the final URL as the base for relative segment resolution
-            # — otherwise relative paths point at the wrong place and
-            # downloads either fail or fetch the wrong objects. ffmpeg's
-            # native DASH path uses the final URL by default; matching
-            # that for parity.
-            manifest_url = getattr(mpd_response, 'url', None) or job['url']
-            if SSRF_GUARD_ENABLED and manifest_url != job['url']:
-                # Re-validate the final URL — a redirect could have moved
-                # us to an internal host.
-                _enforce_ssrf_guard(manifest_url)
+                # Codex review #17 (round 8): if the MPD endpoint redirected,
+                # use the final URL as the base for relative segment resolution
+                # — otherwise relative paths point at the wrong place and
+                # downloads either fail or fetch the wrong objects. ffmpeg's
+                # native DASH path uses the final URL by default; matching
+                # that for parity.
+                manifest_url = getattr(mpd_response, 'url', None) or job['url']
+                if SSRF_GUARD_ENABLED and manifest_url != job['url']:
+                    # Re-validate the final URL — a redirect could have moved
+                    # us to an internal host.
+                    _enforce_mpd_url_policy(manifest_url)
+                mpd_xml = _read_bounded_mpd_body(mpd_response).decode(
+                    'utf-8', errors='replace',
+                )
+            finally:
+                try:
+                    mpd_response.close()
+                except Exception:
+                    pass
 
             try:
                 manifest = parse_mpd(mpd_xml, manifest_url)
+            except MPDFallbackUnsafeError as e:
+                # Resource ceilings and selected-track integrity checks are
+                # always fail-closed.
+                raise NonRetryableManifestError(f"MPD: {e}") from e
             except MPDParseError as e:
-                # Codex review #14: don't hard-fail on unsupported-but-valid
-                # MPD shapes (SegmentList, SegmentBase, multi-period, etc.)
-                # that ffmpeg's native DASH support handles fine. Falling
-                # back preserves the v2.3.x DASH capability.
-                #
-                # Genuine show-stoppers (DRM, live streams) re-raise — we
-                # can't process those even via ffmpeg.
                 err_str = str(e)
-                if 'encrypted content' in err_str or 'live streams are rejected' in err_str:
-                    raise Exception(f"MPD: {err_str}")
-
-                # Codex review #18 (round 9, [high]): the ffmpeg fallback
-                # re-fetches the MPD URL itself via ffmpeg's HTTP stack
-                # and then follows BaseURL/SegmentURL/Initialization
-                # references inside it on its own. None of that traffic
-                # goes through `_enforce_ssrf_guard`. A pre-scan of the
-                # *current* mpd_xml is also insufficient because:
-                #   1. TOCTOU — the server can serve different content
-                #      to curl_cffi vs to ffmpeg's second fetch
-                #   2. ffmpeg follows redirects independently and can
-                #      land on internal hosts the pre-scan never saw
-                #   3. URLs in MPD shapes our parser doesn't understand
-                #      may not appear in the XML walker either
-                # Under SSRF guard the only safe option is to refuse
-                # unsupported manifest shapes outright. Without the guard
-                # the operator has accepted the SSRF risk, so fall back.
-                if SSRF_GUARD_ENABLED:
-                    raise Exception(
-                        f"MPD: unsupported manifest shape ({err_str}); "
-                        f"ffmpeg fallback disabled under SSRF_GUARD because "
-                        f"it would bypass URL validation"
-                    )
-
-                logger.warning(
-                    f"MPD parser couldn't handle this manifest ({err_str}); "
-                    f"falling back to ffmpeg native DASH path. Note: ffmpeg "
-                    f"path bypasses host_throttle/adaptive_delay/strategy "
-                    f"infrastructure that the parsed-MPD path provides."
-                )
-                return self._process_mpd_with_ffmpeg(job_id, job, headers)
+                # Never hand the source URL back to native ffmpeg. It would
+                # fetch the manifest a second time outside guarded_get and all
+                # parser/resource limits. Besides URL-policy bypass, the second
+                # response can differ (TOCTOU) and evade the 10 MiB XML,
+                # template, URL and segment-count ceilings even when the first
+                # response was safe. Unsupported shapes therefore fail closed.
+                raise NonRetryableManifestError(
+                    f"MPD: unsupported or invalid manifest ({err_str}); "
+                    "native ffmpeg URL fallback is disabled because it "
+                    "bypasses validated manifest bytes and resource limits"
+                ) from e
 
             video = manifest['video']
             audio = manifest.get('audio')
+            media_headers = dict(headers)
+            if not any(
+                str(name).lower() == "referer"
+                for name in media_headers
+            ):
+                media_headers["Referer"] = manifest_url
+            if not any(
+                str(name).lower() == "origin"
+                for name in media_headers
+            ):
+                manifest_parts = urlparse(manifest_url)
+                media_headers["Origin"] = (
+                    f"{manifest_parts.scheme}://{manifest_parts.netloc}"
+                )
 
             # Codex review #5 (round 2, [high]): SSRF defense for MPD-controlled
             # URLs. The MPD itself was checked, but its BaseURL/SegmentTemplate
@@ -821,8 +1284,7 @@ class DownloadWorker:
             # localhost or AWS metadata (169.254.169.254). Re-validate every
             # derived URL against the same guard before any fetch happens.
             # Cheap when SSRF_GUARD is disabled (the helper short-circuits).
-            for derived_url in self._collect_mpd_urls(video, audio):
-                _enforce_ssrf_guard(derived_url)
+            self._validate_mpd_derived_origins(video, audio)
             logger.info(
                 f"MPD parsed: video {video['segment_count']} segments "
                 f"({video.get('resolution', 'unknown')}, {video['bandwidth']} bps), "
@@ -855,8 +1317,11 @@ class DownloadWorker:
             video_init_path = None
             if video['init_segment_url']:
                 video_init_path = self._download_init_segment(
-                    video['init_segment_url'], headers, shared_session, temp_dir,
+                    video['init_segment_url'], media_headers, shared_session, temp_dir,
                     filename="video_init.mp4",
+                    request_slot=job_request_slot,
+                    trusted_base_url=job['url'],
+                    referer_trust_base=manifest_url,
                 )
                 if video_init_path is None:
                     raise Exception("Failed to download video init segment")
@@ -864,8 +1329,11 @@ class DownloadWorker:
             audio_init_path = None
             if audio and audio['init_segment_url']:
                 audio_init_path = self._download_init_segment(
-                    audio['init_segment_url'], headers, shared_session, temp_dir,
+                    audio['init_segment_url'], media_headers, shared_session, temp_dir,
                     filename="audio_init.mp4",
+                    request_slot=job_request_slot,
+                    trusted_base_url=job['url'],
+                    referer_trust_base=manifest_url,
                 )
                 if audio_init_path is None:
                     # Codex review #3: don't silently downgrade to video-only.
@@ -885,10 +1353,13 @@ class DownloadWorker:
             video_downloader = SegmentDownloader(
                 segments=video['segments'],
                 output_dir=video_dir,
-                headers=headers,
+                headers=media_headers,
                 max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 10)),
-                m3u8_url=job['url'],
+                m3u8_url=manifest_url,
+                header_trust_base=job['url'],
+                referer_trust_base=manifest_url,
                 session=shared_session,
+                require_all=True,
             )
 
             # Progress: video gets 5-50%, audio (if present) 50-80%, mux 80-95%
@@ -936,10 +1407,13 @@ class DownloadWorker:
                 audio_downloader = SegmentDownloader(
                     segments=audio['segments'],
                     output_dir=audio_dir,
-                    headers=headers,
+                    headers=media_headers,
                     max_workers=int(os.getenv('MAX_DOWNLOAD_WORKERS', 10)),
-                    m3u8_url=job['url'],
+                    m3u8_url=manifest_url,
+                    header_trust_base=job['url'],
+                    referer_trust_base=manifest_url,
                     session=shared_session,
+                    require_all=True,
                 )
 
                 audio_progress_state = {"next_check_time": time.monotonic() + check_interval_sec,
@@ -1058,65 +1532,56 @@ class DownloadWorker:
             if audio_only_path:
                 logger.info(f"Step 6: Muxing video + audio into {output_file}")
                 ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+                mux_partial = output_dir / f".{job_id}.mpd-mux.partial.mp4"
+                mux_partial.unlink(missing_ok=True)
                 mux_cmd = [
                     ffmpeg_path,
                     '-i', video_only_path,
                     '-i', audio_only_path,
                     '-c:v', 'copy', '-c:a', 'copy',
                     '-map', '0:v:0', '-map', '1:a:0',
-                    '-y', output_file,
+                    '-y', str(mux_partial),
                 ]
-                # Codex review #9: use Popen + poll cancellation instead of
-                # subprocess.run(timeout=600). A user-cancelled job would
-                # otherwise keep ffmpeg running for up to 10 minutes before
-                # noticing. With Popen we kill it immediately when we see
-                # the cancellation flag.
-                mux_proc = subprocess.Popen(
-                    mux_cmd,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                )
-                mux_poll_interval = 1.0
-                mux_deadline = time.monotonic() + 600.0  # same overall cap as before
-                stderr_chunks: List[bytes] = []
-
-                def _drain_stderr():
-                    try:
-                        while True:
-                            chunk = mux_proc.stderr.read(65536)
-                            if not chunk:
-                                break
-                            stderr_chunks.append(chunk)
-                    except Exception:
-                        pass
-
-                drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
-                drain_thread.start()
                 try:
-                    while True:
-                        ret = mux_proc.poll()
-                        if ret is not None:
-                            break
-                        if self.is_job_cancelled(job_id):
-                            logger.info(f"Job {job_id} cancelled during mux, killing ffmpeg")
-                            mux_proc.kill()
-                            mux_proc.wait()
-                            if Path(output_file).exists():
-                                Path(output_file).unlink()
-                            return
-                        if time.monotonic() > mux_deadline:
-                            logger.error(f"Job {job_id} mux exceeded 600s, killing ffmpeg")
-                            mux_proc.kill()
-                            mux_proc.wait()
-                            raise Exception("FFmpeg mux exceeded 600s timeout")
-                        time.sleep(mux_poll_interval)
+                    mux_proc = subprocess.Popen(
+                        mux_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
+                    rc, stderr_text, cancelled = _monitor_ffmpeg_process(
+                        mux_proc,
+                        should_stop=lambda: (
+                            self.is_job_cancelled(job_id)
+                        ),
+                        on_progress=lambda _seconds: None,
+                        total_duration=None,
+                        timeout_seconds=600,
+                    )
+                    if cancelled:
+                        logger.info(f"Job {job_id} cancelled/stopped during mux")
+                        return
+                    if rc != 0:
+                        raise Exception(
+                            f"FFmpeg mux failed (exit {rc}): {stderr_text[-500:]}"
+                        )
+                    if not mux_partial.exists() or mux_partial.stat().st_size == 0:
+                        raise Exception("FFmpeg mux produced empty output")
+                    # Publish atomically only after a clean exit. Timeout/nonzero
+                    # paths can leave large partial MP4s and must never replace
+                    # the reserved final filename.
+                    os.replace(mux_partial, output_file)
                 finally:
-                    drain_thread.join(timeout=2.0)
-                if mux_proc.returncode != 0:
-                    stderr_text = b"".join(stderr_chunks).decode('utf-8', errors='replace')
-                    raise Exception(f"FFmpeg mux failed (exit {mux_proc.returncode}): {stderr_text[-500:]}")
+                    try:
+                        mux_partial.unlink(missing_ok=True)
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            f"Failed to remove MPD mux partial {mux_partial}: "
+                            f"{cleanup_error}"
+                        )
             else:
-                # video-only — just rename
-                shutil.move(video_only_path, output_file)
+                # video-only track merge already completed in temp space;
+                # publish it atomically over the empty reservation.
+                os.replace(video_only_path, output_file)
 
             self.update_job_status(job_id, "processing", progress=95)
 
@@ -1130,27 +1595,46 @@ class DownloadWorker:
 
             file_size = Path(output_file).stat().st_size
             duration_seconds = self._probe_duration_seconds(output_file)
+            if not self._commit_published_output(
+                job_id,
+                output_file,
+                file_size,
+                context="MPD",
+            ):
+                return
             if duration_seconds is not None:
-                self.db.execute(
-                    text("""
-                        INSERT INTO job_metadata (job_id, duration)
-                        VALUES (:job_id, :duration)
-                        ON CONFLICT (job_id)
-                        DO UPDATE SET duration = EXCLUDED.duration
-                    """),
-                    {"job_id": job_id, "duration": duration_seconds},
-                )
-                self.db.commit()
-
-            self.update_job_status(
-                job_id, "completed", progress=100,
-                file_path=output_file, file_size=file_size,
-            )
+                try:
+                    self.db.execute(
+                        text("""
+                            INSERT INTO job_metadata (job_id, duration)
+                            VALUES (:job_id, :duration)
+                            ON CONFLICT (job_id)
+                            DO UPDATE SET duration = EXCLUDED.duration
+                        """),
+                        {"job_id": job_id, "duration": duration_seconds},
+                    )
+                    self.db.commit()
+                except Exception as metadata_error:
+                    logger.warning(
+                        f"Failed to save MPD duration for {job_id}: "
+                        f"{metadata_error}"
+                    )
+                    try:
+                        self.db.rollback()
+                    except Exception:
+                        pass
             logger.info(f"Job {job_id} completed (MPD): {output_file} ({file_size / 1024 / 1024:.2f} MB)")
 
+        except NonRetryableSegmentResourceError as e:
+            wrapped = NonRetryableMediaResourceError(str(e))
+            logger.error(
+                f"Job {job_id} MPD segment resource rejected: {e}",
+                exc_info=True,
+            )
+            self._handle_job_failure(job_id, job, wrapped)
         except Exception as e:
             logger.error(f"Job {job_id} MPD download failed: {e}", exc_info=True)
-            self._handle_job_failure(job_id, job, str(e))
+            self._handle_job_failure(job_id, job, e)
         finally:
             if temp_dir and Path(temp_dir).exists():
                 try:
@@ -1498,27 +1982,29 @@ class DownloadWorker:
                 )
                 self.db.commit()
             
-            # Mark as completed
-            self.update_job_status(
+            # Publish completion through the same CAS used by DASH. A DELETE
+            # may win after the cancellation check above; in that case the
+            # already-written file must not survive as an untracked orphan.
+            if not self._commit_published_output(
                 job_id,
-                "completed",
-                progress=100,
-                file_path=output_file,
-                file_size=file_size
-            )
+                output_file,
+                file_size,
+                context="direct",
+            ):
+                return
             
             logger.info(f"Job {job_id} completed successfully: {output_file} ({file_size / 1024 / 1024:.2f} MB)")
         
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}", exc_info=True)
-            self._handle_job_failure(job_id, job, str(e))
+            self._handle_job_failure(job_id, job, e)
     
     def _process_mpd_with_ffmpeg(self, job_id: str, job: dict, headers: dict):
         """Fallback DASH path: hand the MPD URL to ffmpeg directly.
 
-        Used by `_process_mpd_download` when our parse_mpd can't handle the
-        manifest (Codex review #14 — preserve v2.3.x DASH capability for
-        SegmentList, SegmentBase, multi-period, $Time$-templates, etc.).
+        Legacy helper retained for focused regression tests only. Production
+        `_process_mpd_download` deliberately never calls it: re-fetching an
+        MPD URL here cannot preserve the validated-byte/resource-cap contract.
 
         Tradeoff: ffmpeg's HTTP client doesn't go through SegmentDownloader
         so we lose host_throttle, adaptive_delay, referer/mobile_ua
@@ -1542,7 +2028,12 @@ class DownloadWorker:
         base_name = safe_title
         # Atomic reservation (see _reserve_output_path) instead of the racy
         # exists()-then-write loop shared by every download path.
-        output_file = str(_reserve_output_path(output_dir, base_name))
+        reserved_output = _reserve_output_path(output_dir, base_name)
+        output_file = str(reserved_output)
+        # Keep the temporary basename independent of the (up to 240-byte)
+        # title stem; appending a UUID/suffix to that stem can exceed the
+        # filesystem's 255-byte single-name limit for CJK titles.
+        partial_output = output_dir / f".{job_id}.mpd.partial.mp4"
         self._track_reservation(output_file)
 
         # Probe duration for progress display
@@ -1568,73 +2059,116 @@ class DownloadWorker:
         cmd = [ffmpeg_path]
         if header_str:
             cmd += ["-headers", header_str]
-        cmd += ["-i", job['url'], "-c", "copy", "-y", output_file]
+        cmd += [
+            "-rw_timeout",
+            str(MPD_FFMPEG_IO_TIMEOUT_SECONDS * 1_000_000),
+            "-progress",
+            "pipe:2",
+            "-nostats",
+            "-i",
+            job['url'],
+            "-c",
+            "copy",
+            "-y",
+            str(partial_output),
+        ]
 
         logger.info(f"FFmpeg DASH fallback: {output_file}")
         self.update_job_status(job_id, "downloading", progress=5)
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        last_progress = 5
-        time_pattern = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
-        check_interval_sec = 2.0
-        next_check_time = time.monotonic() + check_interval_sec
-        stderr_lines: List[str] = []
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=False,
+            )
+            last_progress = 5
 
-        while True:
-            line = process.stderr.readline()
-            if not line and process.poll() is not None:
-                break
-            if line:
-                stderr_lines.append(line)
-                m = time_pattern.search(line)
-                if m and total_duration and total_duration > 0:
-                    h, mi, s, cs = (int(m.group(i)) for i in range(1, 5))
-                    current = h * 3600 + mi * 60 + s + cs / 100.0
-                    progress = min(int(5 + (current / total_duration) * 85), 90)
-                    if progress > last_progress:
-                        last_progress = progress
-                        self.update_job_status(job_id, "downloading", progress=progress)
-            now = time.monotonic()
-            if now >= next_check_time:
-                next_check_time = now + check_interval_sec
-                if self.is_job_cancelled(job_id):
-                    logger.info(f"Job {job_id} cancelled during MPD ffmpeg fallback, killing")
-                    process.kill()
-                    process.wait()
-                    if Path(output_file).exists():
-                        Path(output_file).unlink()
+            def report_progress(current_seconds: float) -> None:
+                nonlocal last_progress
+                if not total_duration or total_duration <= 0:
                     return
+                progress = min(
+                    int(5 + (current_seconds / total_duration) * 85), 90,
+                )
+                if progress > last_progress:
+                    last_progress = progress
+                    self.update_job_status(
+                        job_id, "downloading", progress=progress,
+                    )
 
-        rc = process.wait()
-        if rc != 0:
-            stderr_text = "".join(stderr_lines[-20:])
-            raise Exception(f"FFmpeg DASH fallback failed (exit {rc}): {stderr_text}")
-        if not Path(output_file).exists() or Path(output_file).stat().st_size == 0:
-            raise Exception("FFmpeg DASH fallback produced empty output")
+            rc, stderr_text, cancelled = _monitor_ffmpeg_process(
+                process,
+                should_stop=lambda: self.is_job_cancelled(job_id),
+                on_progress=report_progress,
+                total_duration=total_duration,
+                timeout_seconds=MPD_FFMPEG_TOTAL_TIMEOUT_SECONDS,
+            )
+            if cancelled:
+                logger.info(
+                    f"Job {job_id} cancelled/stopped during MPD ffmpeg fallback"
+                )
+                if Path(output_file).exists():
+                    Path(output_file).unlink()
+                return
+            if rc != 0:
+                raise Exception(
+                    f"FFmpeg DASH fallback failed (exit {rc}): {stderr_text}"
+                )
+            if not partial_output.exists() or partial_output.stat().st_size == 0:
+                raise Exception("FFmpeg DASH fallback produced empty output")
 
-        if self.is_job_cancelled(job_id):
-            if Path(output_file).exists():
-                Path(output_file).unlink()
+            if self.is_job_cancelled(job_id):
+                if Path(output_file).exists():
+                    Path(output_file).unlink()
+                return
+
+            file_size = partial_output.stat().st_size
+            duration_seconds = self._probe_duration_seconds(str(partial_output))
+
+            # Publish only a fully successful ffmpeg result. Timeout/non-zero
+            # exits can leave gigabytes of partial bytes; writing those into the
+            # reserved final path made retries leak files and choose "(1)".
+            os.replace(partial_output, reserved_output)
+        finally:
+            try:
+                partial_output.unlink(missing_ok=True)
+            except Exception as cleanup_error:
+                logger.warning(
+                    f"Failed to remove MPD fallback partial {partial_output}: "
+                    f"{cleanup_error}"
+                )
+
+        if not self._commit_published_output(
+            job_id,
+            output_file,
+            file_size,
+            context="MPD fallback",
+        ):
             return
 
-        file_size = Path(output_file).stat().st_size
-        duration_seconds = self._probe_duration_seconds(output_file)
         if duration_seconds is not None:
-            self.db.execute(
-                text("""
-                    INSERT INTO job_metadata (job_id, duration)
-                    VALUES (:job_id, :duration)
-                    ON CONFLICT (job_id)
-                    DO UPDATE SET duration = EXCLUDED.duration
-                """),
-                {"job_id": job_id, "duration": duration_seconds},
-            )
-            self.db.commit()
-
-        self.update_job_status(
-            job_id, "completed", progress=100,
-            file_path=output_file, file_size=file_size,
-        )
+            try:
+                self.db.execute(
+                    text("""
+                        INSERT INTO job_metadata (job_id, duration)
+                        VALUES (:job_id, :duration)
+                        ON CONFLICT (job_id)
+                        DO UPDATE SET duration = EXCLUDED.duration
+                    """),
+                    {"job_id": job_id, "duration": duration_seconds},
+                )
+                self.db.commit()
+            except Exception as metadata_error:
+                logger.warning(
+                    f"Failed to save MPD fallback duration for {job_id}: "
+                    f"{metadata_error}"
+                )
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
         logger.info(f"Job {job_id} completed (MPD ffmpeg fallback): {output_file} ({file_size / 1024 / 1024:.2f} MB)")
 
     @staticmethod
@@ -1661,6 +2195,43 @@ class DownloadWorker:
                 if seg.get('url'):
                     yield seg['url']
 
+    @staticmethod
+    def _validate_mpd_derived_origins(video: dict, audio: Optional[dict]) -> None:
+        """Preflight each distinct derived origin once before any download.
+
+        SegmentDownloader's guarded_get still validates every real request and
+        redirect hop. This early all-or-nothing pass exists to catch a private
+        BaseURL before the first public segment is fetched, but resolving the
+        same host for all 100k URLs is wasteful. A small distinct-origin cap
+        also prevents manifests from turning preflight into an unbounded DNS
+        fan-out.
+        """
+        if not SSRF_GUARD_ENABLED:
+            return
+        seen = set()
+        for derived_url in DownloadWorker._collect_mpd_urls(video, audio):
+            parsed = urlparse(derived_url)
+            scheme = parsed.scheme.lower()
+            hostname = (parsed.hostname or "").lower()
+            if scheme not in ("http", "https") or not hostname:
+                raise NonRetryableManifestError("Invalid derived MPD URL")
+            try:
+                port = parsed.port
+            except ValueError as exc:
+                raise NonRetryableManifestError(
+                    "Invalid derived MPD URL port"
+                ) from exc
+            origin = (scheme, hostname, port)
+            if origin in seen:
+                continue
+            seen.add(origin)
+            if len(seen) > MAX_MPD_DERIVED_ORIGINS:
+                raise NonRetryableManifestError(
+                    f"MPD derived origin count exceeds "
+                    f"MAX_MPD_DERIVED_ORIGINS={MAX_MPD_DERIVED_ORIGINS}"
+                )
+            _enforce_mpd_url_policy(derived_url)
+
     def _download_init_segment(
         self,
         url: str,
@@ -1669,6 +2240,9 @@ class DownloadWorker:
         temp_dir: str,
         filename: str = "init.mp4",
         byte_range: Optional[dict] = None,
+        request_slot=None,
+        trusted_base_url: Optional[str] = None,
+        referer_trust_base: Optional[str] = None,
     ) -> Optional[str]:
         """Download the HLS-fMP4 init segment (referenced by #EXT-X-MAP).
 
@@ -1683,7 +2257,8 @@ class DownloadWorker:
 
         Retries up to 3 times with simple backoff. No Referer-strategy
         fallback (the same Referer that works for media segments works for
-        init), no concurrency throttle (one request, can't burst).
+        init). Each attempt shares the distributed per-host connection cap
+        with manifest, key, and media-segment requests.
 
         `filename` lets MPD callers pass distinct names for video and audio
         init segments. Default "init.mp4" is fine for HLS-fMP4 (one init
@@ -1692,11 +2267,16 @@ class DownloadWorker:
         bytes to ffmpeg, producing corrupt output (Codex review #7).
         """
         from pathlib import Path
+        from downloader import _validate_single_byte_content_range
         init_path = Path(temp_dir) / filename
         max_attempts = 3
         last_err: Optional[str] = None
         for attempt in range(max_attempts):
+            response = None
             try:
+                # Keep explicit HOST_HEADERS_FILE values out of the immutable
+                # redirect base. The per-hop callback scopes captured headers
+                # then adds only the override for the current hostname.
                 request_headers = dict(headers or {})
                 for name in list(request_headers.keys()):
                     if isinstance(name, str) and name.lower() == "range":
@@ -1706,37 +2286,80 @@ class DownloadWorker:
                         offset = int(byte_range["offset"])
                         length = int(byte_range["length"])
                     except (KeyError, TypeError, ValueError) as e:
-                        raise ValueError(f"Invalid init byte_range metadata: {byte_range!r}") from e
+                        raise NonRetryableMediaResourceError(
+                            f"Invalid init byte_range metadata: {byte_range!r}"
+                        ) from e
                     if offset < 0 or length <= 0:
-                        raise ValueError(f"Invalid init byte_range metadata: {byte_range!r}")
+                        raise NonRetryableMediaResourceError(
+                            f"Invalid init byte_range metadata: {byte_range!r}"
+                        )
+                    if length > MAX_INIT_SEGMENT_BYTES:
+                        raise NonRetryableMediaResourceError(
+                            f"Init segment byte range length {length} exceeds "
+                            f"MAX_INIT_SEGMENT_BYTES={MAX_INIT_SEGMENT_BYTES}"
+                        )
                     request_headers["Range"] = f"bytes={offset}-{offset + length - 1}"
-                response = session.get(
-                    url,
-                    headers=request_headers,
-                    timeout=30,
-                    stream=bool(byte_range),
-                )
-                if byte_range and response.status_code != 206:
+                try:
+                    response = guarded_get(
+                        session,
+                        url,
+                        headers=request_headers,
+                        timeout=30,
+                        stream=True,
+                        request_slot=request_slot or _host_request_slot,
+                        headers_for_url=lambda target, captured: (
+                            _scoped_worker_media_headers(
+                                captured,
+                                target,
+                                trusted_base_url,
+                                referer_trust_base,
+                            )
+                        ),
+                    )
+                    if byte_range and response.status_code != 206:
+                        raise NonRetryableMediaResourceError(
+                            f"Init segment byte-range request not honored "
+                            f"(HTTP {response.status_code})"
+                        )
+                    if byte_range:
+                        try:
+                            _validate_single_byte_content_range(
+                                response.headers,
+                                expected_offset=offset,
+                                expected_length=length,
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise NonRetryableMediaResourceError(
+                                f"Init segment byte-range response invalid: {exc}"
+                            ) from exc
+                    response.raise_for_status()
                     try:
-                        response.close()
-                    except Exception:
-                        pass
-                    raise ValueError(
-                        f"Init segment byte-range request not honored "
-                        f"(HTTP {response.status_code})"
-                    )
-                response.raise_for_status()
-                content = response.content
-                if byte_range and len(content) != int(byte_range["length"]):
-                    raise ValueError(
-                        f"Init segment byte-range length mismatch: "
-                        f"got {len(content)}, expected {byte_range['length']}"
-                    )
+                        content = _read_bounded_binary_body(
+                            response,
+                            max_bytes=MAX_INIT_SEGMENT_BYTES,
+                            label="init segment",
+                            expected_bytes=(
+                                int(byte_range["length"])
+                                if byte_range else None
+                            ),
+                        )
+                    except ValueError as exc:
+                        raise NonRetryableMediaResourceError(
+                            str(exc)
+                        ) from exc
+                finally:
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
                 if not content or len(content) < 16:
-                    raise ValueError(f"Init segment too small: {len(content)} bytes")
+                    raise NonRetryableMediaResourceError(
+                        f"Init segment too small: {len(content)} bytes"
+                    )
                 # Sanity: an init segment must start with 'ftyp' box at offset 4
                 if content[4:8] != b'ftyp':
-                    raise ValueError(
+                    raise NonRetryableMediaResourceError(
                         f"Init segment doesn't look like fMP4 (offset 4 = {content[4:8]!r}, expected 'ftyp')"
                     )
                 with open(init_path, 'wb') as f:
@@ -1746,6 +2369,11 @@ class DownloadWorker:
             except Exception as e:
                 last_err = str(e)
                 logger.warning(f"Init segment download attempt {attempt + 1}/{max_attempts} failed: {e}")
+                if isinstance(
+                    e,
+                    (HostThrottleCancelled, NonRetryableMediaResourceError),
+                ):
+                    raise
                 if attempt < max_attempts - 1:
                     time.sleep(1.0 * (attempt + 1))
         logger.error(f"Init segment download failed after {max_attempts} attempts: {last_err}")
@@ -1754,7 +2382,13 @@ class DownloadWorker:
     def _process_m3u8_download(self, job_id: str, job: dict):
         """Process m3u8 stream download"""
         from m3u8_parser import parse_m3u8
-        from downloader import SegmentDownloader, TransportThrottleAbort, classify_failures, explain_failures
+        from downloader import (
+            NonRetryableKeyResourceError,
+            SegmentDownloader,
+            TransportThrottleAbort,
+            classify_failures,
+            explain_failures,
+        )
         from ffmpeg_wrapper import merge_segments
         from ssl_adapter import create_impersonated_session
         import tempfile
@@ -1887,7 +2521,39 @@ class DownloadWorker:
             # cookies and browser-like TLS fingerprint. Some sites gate the "full"
             # playlist and segments behind this continuity.
             shared_session = create_impersonated_session()
-            playlist_info = parse_m3u8(job['url'], headers, session=shared_session)
+            job_request_slot = lambda url: _host_request_slot(
+                url,
+                should_cancel=lambda: (
+                    self.is_job_cancelled(job_id)
+                ),
+            )
+            try:
+                playlist_info = parse_m3u8(
+                    job['url'],
+                    headers,
+                    session=shared_session,
+                    request_slot=job_request_slot,
+                    headers_for_url=lambda target, captured: (
+                        _scoped_worker_media_headers(
+                            captured,
+                            target,
+                            job['url'],
+                        )
+                    ),
+                )
+            except ValueError as exc:
+                # Parser/body/resource-policy errors are deterministic for the
+                # captured manifest bytes. Keep transport, HTTP, DNS and
+                # SsrfBlocked exceptions retryable, but do not fetch and parse
+                # an oversized or malformed playlist three more times.
+                raise NonRetryableManifestError(
+                    f"HLS: invalid or over-limit playlist ({exc})"
+                ) from exc
+            media_playlist_url = (
+                playlist_info.get('playlist_url')
+                or playlist_info.get('selected_variant_url')
+                or job['url']
+            )
             self.update_job_status(job_id, "downloading", progress=5)
             
             # Update metadata
@@ -1932,6 +2598,9 @@ class DownloadWorker:
                 init_segment_path = self._download_init_segment(
                     init_segment_url, segment_headers, shared_session, temp_dir,
                     byte_range=playlist_info.get('init_segment_byte_range'),
+                    request_slot=job_request_slot,
+                    trusted_base_url=job['url'],
+                    referer_trust_base=media_playlist_url,
                 )
                 if init_segment_path is None:
                     raise Exception("Failed to download fMP4 init segment — cannot merge fragmented MP4 stream")
@@ -1944,7 +2613,12 @@ class DownloadWorker:
                 # Per-segment keys/IVs are included in segment metadata now.
                 encryption_key=None,
                 encryption_iv=None,
-                m3u8_url=job['url'],  # Pass m3u8 URL for Referer strategies
+                # Use the final media-playlist URL after master/HTTP redirects
+                # for generated Referer/Origin. Captured secrets remain scoped
+                # to the original job URL via header_trust_base.
+                m3u8_url=media_playlist_url,
+                header_trust_base=job['url'],
+                referer_trust_base=media_playlist_url,
                 session=shared_session,
             )
             
@@ -2164,14 +2838,14 @@ class DownloadWorker:
                 suspect_reason=suspect_reason,
             )
 
-            # Mark as completed
-            self.update_job_status(
+            # Close the final-check -> completed-UPDATE cancellation race.
+            if not self._commit_published_output(
                 job_id,
-                "completed",
-                progress=100,
-                file_path=output_file,
-                file_size=file_size
-            )
+                output_file,
+                file_size,
+                context="HLS",
+            ):
+                return
 
             if suspect_reason:
                 logger.warning(
@@ -2181,9 +2855,16 @@ class DownloadWorker:
             else:
                 logger.info(f"Job {job_id} completed successfully: {output_file} ({file_size / 1024 / 1024:.2f} MB)")
         
+        except NonRetryableKeyResourceError as e:
+            wrapped = NonRetryableMediaResourceError(str(e))
+            logger.error(
+                f"Job {job_id} HLS key resource rejected: {e}",
+                exc_info=True,
+            )
+            self._handle_job_failure(job_id, job, wrapped)
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}", exc_info=True)
-            self._handle_job_failure(job_id, job, str(e))
+            self._handle_job_failure(job_id, job, e)
         
         finally:
             # Cleanup temp directory
@@ -2194,8 +2875,34 @@ class DownloadWorker:
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp directory: {e}")
     
-    def _handle_job_failure(self, job_id: str, job: dict, error_str: str):
+    def _handle_job_failure(self, job_id: str, job: dict, error):
         """Handle job failure with retry logic"""
+        error_str = str(error)
+        if isinstance(error, HostThrottleCancelled):
+            logger.info(
+                f"Job {job_id} stopped while waiting for a host slot; "
+                "no retry"
+            )
+            return
+        # Typed deterministic manifest errors take precedence over legacy
+        # substring classification. Parser messages can contain attacker-
+        # controlled identifiers, so text such as "cancelled by user" inside a
+        # Representation id must not leave the row stuck in downloading.
+        if isinstance(
+            error,
+            (NonRetryableManifestError, NonRetryableMediaResourceError),
+        ):
+            logger.warning(
+                f"Job {job_id} failed with non-retryable manifest error: "
+                f"{error_str[:120]}"
+            )
+            self.update_job_status(
+                job_id,
+                "failed",
+                error_message=error_str,
+            )
+            return
+
         # Check if job was cancelled by user - don't update status or retry
         if "cancelled by user" in error_str.lower():
             logger.info(f"Job {job_id} was cancelled by user, no action needed")
@@ -2205,7 +2912,10 @@ class DownloadWorker:
         # (anti-hotlinking, 401/403/474 token failures, or sub-threshold success ratio).
         # Retrying never helps these — the source URLs/tokens are dead. Mark failed
         # immediately so the user sees it and can refresh the source page.
-        if "Download aborted" in error_str or "URL expired or blocked" in error_str:
+        if (
+            "Download aborted" in error_str
+            or "URL expired or blocked" in error_str
+        ):
             logger.warning(f"Job {job_id} failed with non-retryable error - not retrying: {error_str[:120]}")
             self.update_job_status(
                 job_id,
@@ -2219,12 +2929,18 @@ class DownloadWorker:
             if retry_count < MAX_RETRY_ATTEMPTS:
                 # Retry: put back in queue
                 logger.info(f"Retrying job {job_id} (attempt {retry_count})")
-                self.db.execute(text("""
+                retry_update = self.db.execute(text("""
                     UPDATE jobs SET retry_count = :retry_count, status = 'pending'
-                    WHERE id = :job_id
+                    WHERE id = :job_id AND status != 'cancelled'
                 """), {"retry_count": retry_count, "job_id": job_id})
                 self.db.commit()
-                redis_client.rpush("download_queue", job_id)
+                if retry_update.rowcount > 0:
+                    redis_client.rpush("download_queue", job_id)
+                else:
+                    logger.info(
+                        f"Job {job_id} was cancelled before retry CAS; "
+                        "not requeued"
+                    )
             else:
                 # Max retries reached: mark as failed
                 self.update_job_status(
@@ -2594,7 +3310,7 @@ def _resolve_browser_staging_dir(staging_dir, job_id: str) -> Optional[Path]:
     return actual
 
 
-def _safe_cleanup_browser_staging(staging_dir, job_id: str) -> None:
+def _safe_cleanup_browser_staging(staging_dir, job_id: str) -> bool:
     """Job-bound staging rmtree for browser-finalize cleanup.
 
     Mirrors the reapers' guard pattern — only removes paths under the
@@ -2614,17 +3330,33 @@ def _safe_cleanup_browser_staging(staging_dir, job_id: str) -> None:
     """
     sd = _resolve_browser_staging_dir(staging_dir, job_id)
     if sd is None:
-        return
+        return False
     try:
         if sd.is_dir():
             shutil.rmtree(sd)
             logger.info(
                 f"Browser finalize {job_id}: cleaned staging {sd}"
             )
+        # Only discard accounting after the filesystem is confirmed gone.
+        # Clearing it after a failed rmtree hid leaked bytes from diagnostics
+        # and left no retry signal in the old cancel/abort paths.
+        try:
+            redis_client.delete(
+                f"wv2nas:staged_bytes:{job_id}",
+                f"wv2nas:staged_bytes_dirty:{job_id}",
+                f"wv2nas:upload_leases:{job_id}",
+            )
+        except Exception as e:
+            logger.warning(
+                f"Browser finalize {job_id}: staging accounting cleanup "
+                f"failed: {e}"
+            )
+        return True
     except Exception as e:
         logger.warning(
             f"Browser finalize {job_id}: rmtree {str(staging_dir)!r} failed: {e}"
         )
+        return False
 
 
 def _reap_zombie_jobs() -> None:
@@ -2763,17 +3495,24 @@ def _reap_zombie_jobs() -> None:
 
 
 def _reap_stale_browser_jobs() -> None:
-    """Codex review #3 v3: clean up browser-mode jobs that never reached
-    finalize. Covers the cases the extension's abort path can't:
+    """Clean abandoned and terminal browser-mode staging directories.
+
+    Covers the cases the extension's abort path can't:
       - tab closed mid-upload (extension never got the catch block to run)
       - browser crash
       - extension uninstalled / disabled mid-job
       - chrome offscreen evicted before completion message reached SW
 
-    Targets jobs where:
+    Active targets are jobs where:
       - mode='browser' AND status IN ('browser_pending', 'browser_uploading',
         'browser_finalizing')
-      - created >6h ago
+      - created/activity/finalize lease >6h ago
+
+    It also retries cleanup for terminal ``failed``, ``cancelled`` and
+    ``completed`` browser jobs older than 6h. A cancel/abort can race an
+    already-open upload on filesystems that refuse rmtree while a handle is
+    open; the status transition succeeds but the one-shot cleanup fails. The
+    terminal sweep makes that failure recoverable on every periodic pass.
 
     Codex review #7: 'browser_finalizing' rows that are STILL QUEUED in
     redis must NOT be reaped. The CAS allowed-set in
@@ -2880,22 +3619,50 @@ def _reap_stale_browser_jobs() -> None:
 
             updated = conn.execute(stmt, params).fetchall()
 
-            if not updated:
-                return
+            stale_to_reap = []
+            if updated:
+                reaped_ids = [r.id for r in updated]
+                stale_to_reap = conn.execute(text("""
+                    SELECT j.id AS id, jm.staging_dir AS staging_dir
+                    FROM jobs j JOIN job_metadata jm ON jm.job_id = j.id
+                    WHERE j.id IN :ids
+                """).bindparams(
+                    __import__("sqlalchemy").bindparam("ids", expanding=True)
+                ), {"ids": reaped_ids}).fetchall()
 
-            reaped_ids = [r.id for r in updated]
-            stale_to_reap = conn.execute(text("""
+                logger.warning(
+                    f"Reaped {len(reaped_ids)} stale browser-mode job(s) "
+                    f"(>6h pre-finalize)"
+                )
+
+            # Terminal rows never transition back to an upload-owned state.
+            # Select them separately because UPDATE ... RETURNING only covers
+            # the active rows that were just changed above. Cleanup remains
+            # job-bound and outside the transaction; concurrent reapers are
+            # harmless and a failed rmtree is retried next pass.
+            # Older rows may predate terminal timestamps. Stamp them when
+            # first observed instead of treating an ancient created_at as a
+            # cleanup lease: a worker can have *just* completed an old job in
+            # the tiny gap before this query. The next pass may clean them
+            # after the full terminal grace window.
+            conn.execute(text("""
+                UPDATE jobs
+                SET completed_at = :now
+                WHERE completed_at IS NULL
+                  AND status IN ('failed', 'cancelled', 'completed')
+                  AND id IN (
+                      SELECT job_id FROM job_metadata WHERE mode = 'browser'
+                  )
+            """), {"now": params["now"]})
+
+            terminal_to_reap = conn.execute(text("""
                 SELECT j.id AS id, jm.staging_dir AS staging_dir
                 FROM jobs j JOIN job_metadata jm ON jm.job_id = j.id
-                WHERE j.id IN :ids
-            """).bindparams(
-                __import__("sqlalchemy").bindparam("ids", expanding=True)
-            ), {"ids": reaped_ids}).fetchall()
-
-            logger.warning(
-                f"Reaped {len(reaped_ids)} stale browser-mode job(s) "
-                f"(>6h pre-finalize)"
-            )
+                WHERE jm.mode = 'browser'
+                  AND j.status IN ('failed', 'cancelled', 'completed')
+                  AND j.completed_at IS NOT NULL
+                  AND j.completed_at < :cutoff
+            """), {"cutoff": cutoff}).fetchall()
 
         # Best-effort staging wipe for each REAPED row. Outside the
         # transaction so an rmtree failure doesn't roll back the DB flip.
@@ -2904,6 +3671,8 @@ def _reap_stale_browser_jobs() -> None:
         # UPDATE time (fresh CAS, status changed by worker, etc.) are
         # not in the list and their staging is untouched.
         for row in stale_to_reap:
+            _safe_cleanup_browser_staging(row.staging_dir or "", row.id)
+        for row in terminal_to_reap:
             _safe_cleanup_browser_staging(row.staging_dir or "", row.id)
     except Exception as e:
         logger.warning(f"Stale browser-job reaper skipped: {e}")

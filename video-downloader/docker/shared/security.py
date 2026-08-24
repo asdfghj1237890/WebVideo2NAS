@@ -62,6 +62,49 @@ class SsrfBlocked(Exception):
     """Raised when SSRF_GUARD is enabled and a URL targets a non-public host."""
 
 
+class _ScopedResponse:
+    """Delegate to a streamed response while retaining a request slot.
+
+    A per-host throttle must remain held until the caller closes/consumes the
+    streamed response. Keeping the scope on this lightweight proxy lets
+    ``guarded_get`` acquire a different host for every redirect hop without
+    changing the ordinary response API used by callers.
+    """
+
+    def __init__(self, response, request_scope):
+        object.__setattr__(self, "_response", response)
+        object.__setattr__(self, "_request_scope", request_scope)
+        object.__setattr__(self, "_scope_released", False)
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._response, name, value)
+
+    def _release_scope(self) -> None:
+        if self._scope_released:
+            return
+        object.__setattr__(self, "_scope_released", True)
+        self._request_scope.__exit__(None, None, None)
+
+    def close(self):
+        try:
+            return self._response.close()
+        finally:
+            self._release_scope()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
 def ssrf_guard_enabled() -> bool:
     """Whether the SSRF guard is active. Off by default (opt-in) so operators
     who download from LAN sources aren't broken; see docs/PRIVACY_SECURITY."""
@@ -96,7 +139,15 @@ def assert_host_allowed(url: str) -> None:
             raise SsrfBlocked("URL host not allowed")
 
 
-def guarded_get(session, url: str, *, max_redirects: int = _MAX_REDIRECT_HOPS, **kwargs):
+def guarded_get(
+    session,
+    url: str,
+    *,
+    max_redirects: int = _MAX_REDIRECT_HOPS,
+    request_slot=None,
+    headers_for_url=None,
+    **kwargs,
+):
     """``session.get`` that validates the host before the initial request and
     before following each redirect hop.
 
@@ -107,25 +158,63 @@ def guarded_get(session, url: str, *, max_redirects: int = _MAX_REDIRECT_HOPS, *
     each hop's Location host is validated before we connect to it. Works
     across both the ``requests`` and ``curl_cffi`` session backends.
     """
-    if not ssrf_guard_enabled():
+    guard_enabled = ssrf_guard_enabled()
+    if (
+        not guard_enabled
+        and request_slot is None
+        and headers_for_url is None
+    ):
         return session.get(url, **kwargs)
 
     kwargs.pop("allow_redirects", None)  # we follow redirects manually
+    streamed = bool(kwargs.get("stream", False))
+    base_headers = dict(kwargs.get("headers") or {})
     current = url
     for _ in range(max_redirects + 1):
-        assert_host_allowed(current)
-        resp = session.get(current, allow_redirects=False, **kwargs)
+        if guard_enabled:
+            assert_host_allowed(current)
+
+        scope = request_slot(current) if request_slot is not None else None
+        if scope is not None:
+            scope.__enter__()
+        try:
+            hop_kwargs = dict(kwargs)
+            if headers_for_url is not None:
+                hop_kwargs["headers"] = headers_for_url(
+                    current,
+                    dict(base_headers),
+                )
+            resp = session.get(
+                current,
+                allow_redirects=False,
+                **hop_kwargs,
+            )
+        except BaseException as exc:
+            if scope is not None:
+                scope.__exit__(type(exc), exc, exc.__traceback__)
+            raise
         if resp.status_code in _REDIRECT_STATUSES:
             location = resp.headers.get("location")
             if not location:
+                if scope is not None:
+                    if streamed:
+                        return _ScopedResponse(resp, scope)
+                    scope.__exit__(None, None, None)
                 return resp
             nxt = urljoin(current, location)
             try:
                 resp.close()
             except Exception:
                 pass
+            finally:
+                if scope is not None:
+                    scope.__exit__(None, None, None)
             current = nxt
             continue
+        if scope is not None:
+            if streamed:
+                return _ScopedResponse(resp, scope)
+            scope.__exit__(None, None, None)
         return resp
     raise SsrfBlocked(f"Too many redirects (>{max_redirects})")
 
@@ -150,6 +239,76 @@ def is_sensitive_header_name(name) -> bool:
     if lower in _SENSITIVE_HEADER_EXACT:
         return True
     return any(fragment in lower for fragment in _SENSITIVE_HEADER_FRAGMENTS)
+
+
+def is_trusted_for_captured_headers(
+    target_url: str,
+    trusted_base_url: str,
+) -> bool:
+    """Whether browser-captured headers may cross to ``target_url``.
+
+    Trust is directional: the exact origin or a deeper subdomain on the same
+    scheme is accepted. A manifest at ``media.example`` cannot grant its
+    parent ``example`` access, and HTTPS credentials never downgrade to HTTP.
+    """
+    try:
+        target = urlparse(target_url)
+        base = urlparse(trusted_base_url)
+    except Exception:
+        return False
+    if target.scheme not in ("http", "https") or base.scheme not in (
+        "http", "https",
+    ):
+        return False
+    if target.scheme != base.scheme:
+        return False
+    target_host = (target.hostname or "").lower()
+    base_host = (base.hostname or "").lower()
+    if not target_host or not base_host:
+        return False
+    if target.netloc.lower() == base.netloc.lower():
+        return True
+    return target_host.endswith("." + base_host)
+
+
+_UNTRUSTED_CAPTURED_HEADER_ALLOWLIST = frozenset({
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "pragma",
+    "range",
+    "user-agent",
+})
+
+
+def scoped_captured_headers(
+    headers: dict | None,
+    target_url: str,
+    trusted_base_url: str | None,
+) -> dict:
+    """Scope captured playback headers to their manifest trust boundary.
+
+    Foreign public origins may receive ordinary representation headers, but
+    never Cookie/Authorization/custom X-* tokens, captured Origin/Referer, or
+    Host. Operators that intentionally need credentials on a separate CDN can
+    add them for that hostname through ``HOST_HEADERS_FILE`` after this gate.
+    """
+    source = dict(headers or {})
+    if not trusted_base_url or is_trusted_for_captured_headers(
+        target_url,
+        trusted_base_url,
+    ):
+        return source
+    scoped = {}
+    for name, value in source.items():
+        lower = str(name or "").strip().lower()
+        if lower in _UNTRUSTED_CAPTURED_HEADER_ALLOWLIST:
+            scoped[name] = value
+            continue
+        if lower.startswith("sec-fetch-"):
+            scoped[name] = value
+    return scoped
 
 
 def redacted_headers_for_log(headers: dict | None) -> dict:

@@ -6,14 +6,18 @@
 //   2. if AES-128 key URI present, fetch key + decrypt via SubtleCrypto
 //   3. PUT plaintext bytes to NAS /api/jobs/{id}/segments/{seq}
 //
-// Concurrency capped to 6 (matches Chrome's per-host connection cap; higher
-// values just queue at the network layer anyway). Retries each segment up
-// to 3 times with exponential backoff before failing the whole job.
+// HLS defaults to 6 concurrent tasks. Manifest-less direct DASH can use up to
+// 12: its 8 MiB byte ranges are large enough that a single CDN connection can
+// under-fill the link, while the NAS API advertises a deployment-safe lower
+// recommendation when its upload cap or staging quota requires one. Retries
+// each network stage up to 3 times before failing the whole job.
 //
 // Exports: runJob({...}) — single async entry. Throws on unrecoverable
 // failure; caller (offscreen.js) routes the rejection back to the SW.
 
 const DEFAULT_CONCURRENCY = 6;
+const DIRECT_DASH_CONCURRENCY = 12;
+const MAX_CONCURRENCY = 12;
 const MAX_RETRIES = 3;
 const BASE_BACKOFF_MS = 500;
 
@@ -33,6 +37,153 @@ const SEGMENT_TIMEOUT_MS = 60_000;
 // allowing for header noise, anything past a few KB is wrong.
 const MAX_SEGMENT_BYTES = 500 * 1024 * 1024;
 const MAX_KEY_BYTES = 64 * 1024;
+
+
+function resolveJobConcurrency(plan, requestedConcurrency) {
+  const isDirectDash = !!(plan && plan.direct_range_concat === true);
+  const serverRecommendation = plan && plan.recommended_concurrency;
+  const hasValidRecommendation = typeof serverRecommendation === 'number'
+    && Number.isInteger(serverRecommendation)
+    && serverRecommendation > 0;
+  // Direct DASH historically ran at 6. Only a current API response with an
+  // explicit, valid recommendation may opt it into the newer ceiling of 12;
+  // otherwise a newly-updated extension could overload an older NAS whose
+  // per-job upload cap is still below 12.
+  const clientDefault = isDirectDash && hasValidRecommendation
+    ? DIRECT_DASH_CONCURRENCY
+    : DEFAULT_CONCURRENCY;
+  const planLimit = hasValidRecommendation
+    ? Math.min(clientDefault, serverRecommendation)
+    : clientDefault;
+  const fallback = planLimit;
+  const raw = requestedConcurrency == null ? fallback : Number(requestedConcurrency);
+  if (!Number.isInteger(raw) || raw < 1 || raw > MAX_CONCURRENCY) {
+    throw new Error(`runJob: concurrency must be an integer between 1 and ${MAX_CONCURRENCY}`);
+  }
+  return Math.min(raw, planLimit);
+}
+
+
+function createTransferTimings() {
+  const stage = () => ({
+    bytes: 0,
+    requests: 0,
+    failures: 0,
+    cancelled: 0,
+    attemptedBytes: 0,
+    requestMs: 0,
+    activeMs: 0,
+    activeCount: 0,
+    activeSince: null,
+    openRequests: new Set(),
+  });
+  return { cdn: stage(), nas: stage() };
+}
+
+
+function beginTransferStage(timings, stageName, now = Date.now()) {
+  const stage = timings && timings[stageName];
+  if (!stage) return null;
+  if (stage.activeCount === 0) stage.activeSince = now;
+  stage.activeCount += 1;
+  const token = { stage, startedAt: now };
+  stage.openRequests.add(token);
+  return token;
+}
+
+
+function endTransferStage(
+  token,
+  { bytes = 0, ok = true, cancelled = false } = {},
+  now = Date.now(),
+) {
+  if (!token || !token.stage) return;
+  const stage = token.stage;
+  const elapsed = Math.max(0, now - token.startedAt);
+  stage.requests += 1;
+  stage.requestMs += elapsed;
+  const byteCount = Number(bytes);
+  if (!cancelled && Number.isFinite(byteCount) && byteCount > 0) {
+    stage.attemptedBytes += byteCount;
+  }
+  if (cancelled) {
+    stage.cancelled += 1;
+  } else if (ok) {
+    if (Number.isFinite(byteCount) && byteCount > 0) stage.bytes += byteCount;
+  } else {
+    stage.failures += 1;
+  }
+  stage.openRequests.delete(token);
+  stage.activeCount = Math.max(0, stage.activeCount - 1);
+  if (stage.activeCount === 0 && stage.activeSince != null) {
+    stage.activeMs += Math.max(0, now - stage.activeSince);
+    stage.activeSince = null;
+  }
+}
+
+
+async function timeTransferStage(
+  timings,
+  stageName,
+  fn,
+  bytesHint = null,
+  validateResult = null,
+  signal = null,
+) {
+  const token = beginTransferStage(timings, stageName);
+  let resultBytes = Number(bytesHint) || 0;
+  try {
+    const result = await fn();
+    if (bytesHint == null) {
+      resultBytes = Number(result && result.bytes && result.bytes.byteLength) || 0;
+    }
+    if (validateResult) validateResult(result);
+    endTransferStage(token, { bytes: resultBytes, ok: true });
+    return result;
+  } catch (err) {
+    endTransferStage(token, {
+      bytes: resultBytes,
+      ok: false,
+      // A sibling's fail-fast abort is diagnostic cancellation, not another
+      // independent CDN/NAS failure. The first real error reaches this catch
+      // before runWithConcurrency aborts the linked job signal, so it remains
+      // counted as a failure.
+      cancelled: !!(signal && signal.aborted),
+    });
+    throw err;
+  }
+}
+
+
+function transferTimingSnapshot(timings, now = Date.now()) {
+  const snapshotStage = (stage) => {
+    const openMs = stage.activeCount > 0 && stage.activeSince != null
+      ? Math.max(0, now - stage.activeSince)
+      : 0;
+    const activeMs = stage.activeMs + openMs;
+    let openRequestMs = 0;
+    for (const token of stage.openRequests) {
+      openRequestMs += Math.max(0, now - token.startedAt);
+    }
+    return {
+      bytes: stage.bytes,
+      attemptedBytes: stage.attemptedBytes,
+      requests: stage.requests,
+      failures: stage.failures,
+      cancelled: stage.cancelled,
+      inFlight: stage.openRequests.size,
+      requestMs: stage.requestMs + openRequestMs,
+      activeMs,
+      mbPerSecond: activeMs > 0
+        ? (stage.bytes / (1024 * 1024)) / (activeMs / 1000)
+        : 0,
+    };
+  };
+  return {
+    cdn: snapshotStage(timings.cdn),
+    nas: snapshotStage(timings.nas),
+  };
+}
 
 
 /**
@@ -303,7 +454,15 @@ class KeyCache {
     })();
 
     this.cache.set(keyUri, promise);
-    return promise;
+    try {
+      return await promise;
+    } catch (error) {
+      // Do not poison all later segment retries with one rejected promise.
+      // Only delete if this is still the cache entry; a concurrent retry may
+      // already have installed a fresh promise.
+      if (this.cache.get(keyUri) === promise) this.cache.delete(keyUri);
+      throw error;
+    }
   }
 }
 
@@ -485,6 +644,30 @@ async function decryptIfNeeded(bytes, segment, keyCache, requestHeaders, signal,
  * Try a network request up to MAX_RETRIES times with exponential backoff.
  * Re-raises the final error if all attempts fail.
  */
+function sleepWithSignal(ms, signal) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) {
+    const err = new Error('cancelled');
+    err.name = 'AbortError';
+    return Promise.reject(err);
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      const err = new Error('cancelled');
+      err.name = 'AbortError';
+      reject(err);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+
 async function withRetry(fn, label, signal) {
   let lastErr;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -498,12 +681,51 @@ async function withRetry(fn, label, signal) {
       // Don't retry on explicit abort.
       if (err && err.name === 'AbortError' && signal && signal.aborted) throw err;
       if (attempt < MAX_RETRIES - 1) {
-        const delay = BASE_BACKOFF_MS * Math.pow(2, attempt);
-        await new Promise((r) => setTimeout(r, delay));
+        const exponentialDelay = BASE_BACKOFF_MS * Math.pow(2, attempt);
+        const requestedDelay = Number(err && err.retryAfterMs);
+        const delay = Number.isFinite(requestedDelay) && requestedDelay > 0
+          ? Math.max(exponentialDelay, requestedDelay)
+          : exponentialDelay;
+        await sleepWithSignal(delay, signal);
       }
     }
   }
   throw new Error(`${label} failed after ${MAX_RETRIES} attempts: ${lastErr?.message ?? lastErr}`);
+}
+
+
+function retryAfterMsFromResponse(resp) {
+  if (!resp || !resp.headers || typeof resp.headers.get !== 'function') return 0;
+  const raw = resp.headers.get('retry-after') || resp.headers.get('Retry-After');
+  if (!raw) return 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(60_000, seconds * 1000);
+  const retryAt = Date.parse(raw);
+  return Number.isFinite(retryAt)
+    ? Math.min(60_000, Math.max(0, retryAt - Date.now()))
+    : 0;
+}
+
+
+async function uploadResponseError(prefix, resp) {
+  // The upload bytes are already sent; never wait on an error response body.
+  // fetchWithTimeout's controller lifetime ends when headers arrive, so a
+  // proxy that returns 429/5xx headers and then stalls its body would otherwise
+  // pin this concurrency worker forever and ignore user cancellation. Status +
+  // Retry-After are sufficient for retry classification. Cancel the body
+  // best-effort without awaiting a potentially broken stream implementation.
+  try {
+    if (resp && resp.body && typeof resp.body.cancel === 'function') {
+      const cancellation = resp.body.cancel();
+      if (cancellation && typeof cancellation.catch === 'function') {
+        cancellation.catch(() => {});
+      }
+    }
+  } catch (_) { /* best-effort socket cleanup */ }
+  const err = new Error(`${prefix} (${resp.status})`);
+  err.httpStatus = resp.status;
+  err.retryAfterMs = retryAfterMsFromResponse(resp);
+  return err;
 }
 
 
@@ -558,7 +780,7 @@ async function uploadSegment({ nasEndpoint, apiKey, jobId, track, seq, bytes, si
     body: bytes,
   }, SEGMENT_TIMEOUT_MS, signal);
   if (!resp.ok) {
-    throw new Error(`PUT segment failed (${resp.status}): ${(await resp.text()).slice(0, 200)}`);
+    throw await uploadResponseError('PUT segment failed', resp);
   }
 }
 
@@ -579,53 +801,78 @@ async function uploadInit({ nasEndpoint, apiKey, jobId, track, bytes, signal }) 
     body: bytes,
   }, SEGMENT_TIMEOUT_MS, signal);
   if (!resp.ok) {
-    throw new Error(`PUT init failed (${resp.status}): ${(await resp.text()).slice(0, 200)}`);
+    throw await uploadResponseError('PUT init failed', resp);
   }
 }
 
 
 async function processOneSegment({
   segment, track, jobId, nasEndpoint, apiKey, requestHeaders, keyCache, signal,
-  onProgress, trustedBase,
+  onProgress, trustedBase, transferTimings,
 }) {
-  await withRetry(async () => {
-    // Codex review #9: only ride user session credentials when the
-    // segment is on the manifest's trust domain.
-    // Codex review (timeout-covers-body): fetchBytesWithTimeout keeps
-    // the abort timer active across the body read, so a CDN that
-    // stalls mid-stream after sending headers can't pin the offscreen
-    // document indefinitely.
-    // Codex review #18b: bounded streaming read. Server-side
-    // MAX_SEGMENT_BYTES enforcement only triggers on PUT, which
-    // happens AFTER the full body is buffered client-side. Without
-    // this client cap, a hostile manifest could pin the offscreen
-    // document to a multi-GB segment URL and exhaust the heap before
-    // the server ever rejects it.
-    // Codex adversarial-review: scope captured auth headers per-URL.
-    // A malicious manifest pointing segment.url at evil.com used to
-    // get Authorization / X-* bearer tokens; now untrusted hosts
-    // receive only DNR-spoofed Referer/Origin/UA, never captured
-    // auth.
-    const { resp, bytes: rawBytes } = await fetchBytesWithTimeout(segment.url, {
-      credentials: isTrustedForCredentials(segment.url, trustedBase) ? 'include' : 'omit',
-      headers: mediaFetchHeaders(segment.url, trustedBase, requestHeaders, segment.byte_range),
-      // Codex review (P1): refuse redirects. The trust decision was
-      // made for `segment.url`; a 30x to a different host bypasses
-      // that and would leak captured auth headers + cookies to the
-      // redirect target. withRetry surfaces the resulting TypeError
-      // as a segment-fetch failure.
-      redirect: 'error',
-    }, SEGMENT_TIMEOUT_MS, signal, maxBytesForRange(segment.byte_range), `segment ${segment.url}`);
-    if (!resp.ok) {
-      throw new Error(`fetch ${segment.url} -> ${resp.status}`);
-    }
-    assertRangeHonored(resp, rawBytes, segment.byte_range, `segment ${segment.url}`);
-    let bytes = rawBytes;
-    bytes = await decryptIfNeeded(bytes, segment, keyCache, requestHeaders, signal, trustedBase);
-    await uploadSegment({
-      nasEndpoint, apiKey, jobId, track, seq: segment.seq, bytes, signal,
-    });
-  }, `segment ${track}/${segment.seq} ${sanitizedUrlForError(segment.url)}`, signal);
+  // Keep CDN and NAS retries independent. Once a range has been fetched and
+  // decrypted successfully, a transient NAS 429/503 must reuse that buffer
+  // rather than downloading the same signed CDN bytes again.
+  const fetchLabel = `CDN segment ${track}/${segment.seq} ${sanitizedUrlForError(segment.url)}`;
+  const bytes = await withRetry(
+    async () => {
+      const { bytes: rawBytes } = await timeTransferStage(
+        transferTimings,
+        'cdn',
+        async () => {
+          const result = await fetchBytesWithTimeout(segment.url, {
+            credentials: isTrustedForCredentials(segment.url, trustedBase) ? 'include' : 'omit',
+            headers: mediaFetchHeaders(segment.url, trustedBase, requestHeaders, segment.byte_range),
+            // Codex review (P1): refuse redirects. The trust decision was
+            // made for `segment.url`; a 30x to a different host bypasses
+            // that and would leak captured auth headers + cookies to the
+            // redirect target. withRetry surfaces the resulting TypeError
+            // as a segment-fetch failure.
+            redirect: 'error',
+          }, SEGMENT_TIMEOUT_MS, signal, maxBytesForRange(segment.byte_range), `segment ${segment.url}`);
+          if (!result.resp.ok) {
+            throw new Error(`fetch ${segment.url} -> ${result.resp.status}`);
+          }
+          return result;
+        },
+        null,
+        ({ resp, bytes: fetchedBytes }) => assertRangeHonored(
+          resp,
+          fetchedBytes,
+          segment.byte_range,
+          `segment ${segment.url}`,
+        ),
+        signal,
+      );
+      // Decryption/content validation remains inside the CDN retry boundary.
+      // Only a successfully decrypted buffer crosses into the independent NAS
+      // retry, so transient NAS errors still never re-download the range.
+      return decryptIfNeeded(
+        rawBytes,
+        segment,
+        keyCache,
+        requestHeaders,
+        signal,
+        trustedBase,
+      );
+    },
+    fetchLabel,
+    signal,
+  );
+  await withRetry(
+    () => timeTransferStage(
+      transferTimings,
+      'nas',
+      () => uploadSegment({
+        nasEndpoint, apiKey, jobId, track, seq: segment.seq, bytes, signal,
+      }),
+      bytes.byteLength,
+      null,
+      signal,
+    ),
+    `NAS upload ${track}/${segment.seq}`,
+    signal,
+  );
 
   if (onProgress) onProgress({ track, seq: segment.seq });
 }
@@ -633,33 +880,55 @@ async function processOneSegment({
 
 async function processInitSegment({
   initUrl, byteRange, track, jobId, nasEndpoint, apiKey, requestHeaders, signal, trustedBase,
+  transferTimings,
 }) {
   if (!initUrl) return;
-  await withRetry(async () => {
-    // Codex review (timeout-covers-body): fetchBytesWithTimeout keeps
-    // the abort timer active through the body read so a stalled init
-    // download doesn't hang this concurrency worker.
-    // Codex review #18b: bounded read for init segment — same attack
-    // surface as media segments.
-    // Codex adversarial-review: same per-URL header scoping as media
-    // segments — init URI on a foreign origin must NOT receive the
-    // captured auth headers.
-    const { resp, bytes } = await fetchBytesWithTimeout(initUrl, {
-      credentials: isTrustedForCredentials(initUrl, trustedBase) ? 'include' : 'omit',
-      headers: mediaFetchHeaders(initUrl, trustedBase, requestHeaders, byteRange),
-      // Codex review (P1): refuse redirects — same rationale as
-      // segment / key fetches. Trust was decided for `initUrl`;
-      // a 30x bypasses that boundary.
-      redirect: 'error',
-    }, SEGMENT_TIMEOUT_MS, signal, maxBytesForRange(byteRange), `init ${initUrl}`);
-    if (!resp.ok) {
-      throw new Error(`init fetch ${initUrl} -> ${resp.status}`);
-    }
-    assertRangeHonored(resp, bytes, byteRange, `init ${initUrl}`);
-    await uploadInit({
-      nasEndpoint, apiKey, jobId, track, bytes, signal,
-    });
-  }, `init ${track}`, signal);
+  // Apply the same bounded, redirect-refusing fetch as media segments, but
+  // retry CDN and NAS independently so an upload retry reuses `bytes`.
+  const { bytes } = await withRetry(
+    () => timeTransferStage(
+      transferTimings,
+      'cdn',
+      async () => {
+        const result = await fetchBytesWithTimeout(initUrl, {
+          credentials: isTrustedForCredentials(initUrl, trustedBase) ? 'include' : 'omit',
+          headers: mediaFetchHeaders(initUrl, trustedBase, requestHeaders, byteRange),
+          // Codex review (P1): refuse redirects — same rationale as
+          // segment / key fetches. Trust was decided for `initUrl`;
+          // a 30x bypasses that boundary.
+          redirect: 'error',
+        }, SEGMENT_TIMEOUT_MS, signal, maxBytesForRange(byteRange), `init ${initUrl}`);
+        if (!result.resp.ok) {
+          throw new Error(`init fetch ${initUrl} -> ${result.resp.status}`);
+        }
+        return result;
+      },
+      null,
+      ({ resp, bytes: resultBytes }) => assertRangeHonored(
+        resp,
+        resultBytes,
+        byteRange,
+        `init ${initUrl}`,
+      ),
+      signal,
+    ),
+    `CDN init ${track} ${sanitizedUrlForError(initUrl)}`,
+    signal,
+  );
+  await withRetry(
+    () => timeTransferStage(
+      transferTimings,
+      'nas',
+      () => uploadInit({
+        nasEndpoint, apiKey, jobId, track, bytes, signal,
+      }),
+      bytes.byteLength,
+      null,
+      signal,
+    ),
+    `NAS init upload ${track}`,
+    signal,
+  );
 }
 
 
@@ -667,7 +936,24 @@ async function processInitSegment({
  * Cooperative concurrency limiter. Schedules `tasks` fanned out over
  * `concurrency` workers, fails fast on first error.
  */
-async function runWithConcurrency(tasks, concurrency) {
+function linkedAbortController(externalSignal) {
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener('abort', forwardAbort, { once: true });
+  }
+  return {
+    controller,
+    signal: controller.signal,
+    cleanup: () => {
+      if (externalSignal) externalSignal.removeEventListener('abort', forwardAbort);
+    },
+  };
+}
+
+
+async function runWithConcurrency(tasks, concurrency, onFirstError = null) {
   const results = [];
   let cursor = 0;
   const errors = [];
@@ -681,6 +967,9 @@ async function runWithConcurrency(tasks, concurrency) {
       } catch (err) {
         errors.push(err);
         aborted = true;
+        if (errors.length === 1 && onFirstError) {
+          try { onFirstError(err); } catch (_) { /* preserve original error */ }
+        }
       }
     }
   }
@@ -706,16 +995,18 @@ async function runWithConcurrency(tasks, concurrency) {
  * @param {Object} opts.plan - server-returned plan (tracks, segments, etc.)
  * @param {Object} [opts.requestHeaders] - sent on segment fetches (Referer/UA/etc)
  * @param {AbortSignal} [opts.signal] - cancellation signal
- * @param {Function} [opts.onProgress] - called as ({track, seq, done, total})
+ * @param {Function} [opts.onProgress] - called as
+ *   ({track, seq, done, total, concurrency, transferTimings})
  *   after each MEDIA segment uploads. `done` and `total` count media
  *   segments only (init segments are not counted — they finish before
  *   the loop starts and would skew very early progress to nonzero).
- * @param {number} [opts.concurrency=6]
+ * @param {number} [opts.concurrency] - explicit override; otherwise direct
+ *   DASH uses the server recommendation (up to 12) and other plans use 6
  */
 export async function runJob({
   jobId, nasEndpoint, apiKey, plan,
   requestHeaders = {}, signal, onProgress,
-  concurrency = DEFAULT_CONCURRENCY,
+  concurrency = null,
 } = {}) {
   if (!jobId || !nasEndpoint || !apiKey || !plan) {
     throw new Error('runJob: missing required args');
@@ -725,6 +1016,10 @@ export async function runJob({
   const tracks = plan.tracks || {};
   const trackNames = Object.keys(tracks);
   if (trackNames.length === 0) throw new Error('runJob: plan has no tracks');
+  const effectiveConcurrency = resolveJobConcurrency(plan, concurrency);
+  const transferTimings = createTransferTimings();
+  const linkedAbort = linkedAbortController(signal);
+  const jobSignal = linkedAbort.signal;
 
   // Track segment-level progress for the caller. JS is single-threaded
   // so the increment is race-free even under concurrent processOneSegment
@@ -732,12 +1027,19 @@ export async function runJob({
   // exactly the media segments scheduled below.
   let _doneCount = 0;
   let _totalCount = 0;
-  const wrappedOnProgress = onProgress ? (info) => {
+  const wrappedOnProgress = (info) => {
     _doneCount += 1;
+    if (!onProgress) return;
     try {
-      onProgress({ ...info, done: _doneCount, total: _totalCount });
+      onProgress({
+        ...info,
+        done: _doneCount,
+        total: _totalCount,
+        concurrency: effectiveConcurrency,
+        transferTimings: transferTimingSnapshot(transferTimings),
+      });
     } catch (_) { /* never let a callback bug abort the upload */ }
-  } : null;
+  };
 
   // Codex review #9: derive the trust base for credential scoping. The
   // resolved variant URL takes precedence (most specific), falling back
@@ -761,8 +1063,8 @@ export async function runJob({
         || (trackName === 'video' ? plan.init_segment_byte_range : null);
       if (initUrl) {
         await processInitSegment({
-          initUrl, byteRange: initByteRange, track: trackName, jobId, nasEndpoint, apiKey, requestHeaders, signal,
-          trustedBase,
+          initUrl, byteRange: initByteRange, track: trackName, jobId, nasEndpoint, apiKey, requestHeaders,
+          trustedBase, transferTimings, signal: jobSignal,
         });
       }
     }
@@ -775,13 +1077,18 @@ export async function runJob({
       for (const segment of segs) {
         tasks.push(() => processOneSegment({
           segment, track: trackName, jobId, nasEndpoint, apiKey,
-          requestHeaders, keyCache, signal, onProgress: wrappedOnProgress, trustedBase,
+          requestHeaders, keyCache, signal: jobSignal, onProgress: wrappedOnProgress, trustedBase,
+          transferTimings,
         }));
       }
     }
     _totalCount = tasks.length;
 
-    await runWithConcurrency(tasks, concurrency);
+    await runWithConcurrency(
+      tasks,
+      effectiveConcurrency,
+      () => linkedAbort.controller.abort(),
+    );
 
     // 3) Finalize — tells the worker to start ffmpeg mux. From here on
     // the server has the chance to have committed; ANY rejection past
@@ -816,7 +1123,7 @@ export async function runJob({
     for (let attempt = 0; attempt < FINALIZE_MAX_ATTEMPTS; attempt++) {
       let resp;
       try {
-        if (signal && signal.aborted) {
+        if (jobSignal.aborted) {
           throw new Error('Finalize cancelled before request was sent');
         }
         // Mark the attempt as ambiguous BEFORE the await — if the SW
@@ -838,16 +1145,16 @@ export async function runJob({
             body: JSON.stringify({}),
           },
           SEGMENT_TIMEOUT_MS,
-          signal,
+          jobSignal,
         );
       } catch (netErr) {
         // Network error, timeout. Re-throw on cancellation.
-        if (signal && signal.aborted) throw netErr;
+        if (jobSignal.aborted) throw netErr;
         // finalizeAttempted stays true — request status genuinely
         // unknown.
         lastNetworkErr = netErr;
         if (attempt < FINALIZE_MAX_ATTEMPTS - 1) {
-          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+          await sleepWithSignal(1000 * (attempt + 1), jobSignal);
           continue;
         }
         throw netErr;
@@ -870,7 +1177,7 @@ export async function runJob({
       // 5xx: ambiguous — the response could come from after rpush.
       // Keep finalizeAttempted=true; retry with linear backoff (1s, 2s).
       if (attempt < FINALIZE_MAX_ATTEMPTS - 1) {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        await sleepWithSignal(1000 * (attempt + 1), jobSignal);
       }
     }
     if (!succeeded) {
@@ -882,7 +1189,12 @@ export async function runJob({
       );
     }
 
-    return { jobId, totalSegments: tasks.length };
+    return {
+      jobId,
+      totalSegments: tasks.length,
+      concurrency: effectiveConcurrency,
+      transferTimings: transferTimingSnapshot(transferTimings),
+    };
   } catch (err) {
     // Annotate so offscreen → SW message-passing can carry the flag
     // through. Plain Error / TypeError both accept arbitrary string
@@ -890,22 +1202,37 @@ export async function runJob({
     // wrap it.
     if (err && typeof err === 'object') {
       err.finalizeAttempted = finalizeAttempted;
+      err.concurrency = effectiveConcurrency;
+      err.done = _doneCount;
+      err.total = _totalCount;
+      err.transferTimings = transferTimingSnapshot(transferTimings);
       throw err;
     }
     const wrapped = new Error(String(err));
     wrapped.finalizeAttempted = finalizeAttempted;
+    wrapped.concurrency = effectiveConcurrency;
+    wrapped.done = _doneCount;
+    wrapped.total = _totalCount;
+    wrapped.transferTimings = transferTimingSnapshot(transferTimings);
     throw wrapped;
+  } finally {
+    linkedAbort.cleanup();
   }
 }
 
 
 // Internals exposed for testing.
 export const _internals = {
-  hexToBytes, ivFromSequence, withRetry, runWithConcurrency,
+  hexToBytes, ivFromSequence, sleepWithSignal, withRetry, runWithConcurrency,
   KeyCache, isTrustedForCredentials, scopedRequestHeaders,
   byteRangeHeader, mediaFetchHeaders,
   readBodyWithCap, buildNasUrl,
   fetchWithTimeout, fetchBytesWithTimeout,
+  resolveJobConcurrency, createTransferTimings, beginTransferStage,
+  endTransferStage, timeTransferStage, transferTimingSnapshot,
+  linkedAbortController, retryAfterMsFromResponse,
+  uploadResponseError,
   MAX_RETRIES, BASE_BACKOFF_MS, DEFAULT_CONCURRENCY,
+  DIRECT_DASH_CONCURRENCY, MAX_CONCURRENCY,
   MAX_SEGMENT_BYTES, MAX_KEY_BYTES, SEGMENT_TIMEOUT_MS,
 };

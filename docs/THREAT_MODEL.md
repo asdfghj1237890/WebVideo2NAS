@@ -80,11 +80,16 @@ URL」(HLS variant / segment / AES-key、DASH init / media)交給位於內網的
 - `background.js:1582-1594`:`requestBody.headers` 帶著上述 cookie + token。
 - `background.js:1688-1695`:以 `POST {nasEndpoint}/api/download`、`Authorization: Bearer`
   送出。
-- 到了 API 端,`main.py:474-487` 把這些 headers 以 JSON 存入 `job_metadata.headers`;worker
-  之後 fetch 時會帶上它們(`downloader.py:750`、`downloader.py:1060` 的 `guarded_get(..., headers=...)`)。
+- 到了 API 端,`submit_download()` 把這些 headers 以 JSON 存入 `job_metadata.headers`。worker
+  發 request 前會以原始 job URL 重新套信任邊界：同 scheme 的原 origin／更深 subdomain 可使用
+  captured headers；其他 derived origin 只保留 Accept、User-Agent、Range、cache 與 Sec-Fetch
+  類，不會收到 Cookie、Authorization、自訂 X-* token、captured Referer／Origin 或 Host。
+  manifest redirect 後需要的 Referer／Origin另以最終 manifest URL產生，不會順便放行 captured
+  credential；跨 CDN credential 只可由 operator 的 `HOST_HEADERS_FILE` 明確加入。
 
 **影響**:使用者在第三方站的 session cookie / bearer token 會離開瀏覽器,經由 NAS API 落地到
-Postgres,並被 worker 用於後續對外連線。持有 NAS 資料庫存取權者可讀到這些憑證;若傳輸未加密
+Postgres,並在上述信任範圍內被 worker 用於後續對外連線。持有 NAS 資料庫存取權者仍可讀到
+完整憑證;若傳輸未加密
 (見 2.3)則更會在區網明文可見。日誌端已做遮蔽(`shared/security.py:155-163`
 `redacted_headers_for_log`、`background.js:970-976`),但**儲存與轉發本身並未遮蔽**。
 
@@ -96,8 +101,8 @@ Postgres,並被 worker 用於後續對外連線。持有 NAS 資料庫存取權�
 - `chrome.storage.sync` 的語意是:資料會**同步到使用者的 Google 帳號並跨裝置散佈**,離開本機。
 - `background.js:1452-1455` 從 `chrome.storage.sync` 讀出 `apiKey`,並在
   `background.js:1692` 以 `Authorization: Bearer ${apiKey}` 送給 API。
-- API 端以常數時間比較驗證:`main.py:381` `hmac.compare_digest(...)`,且拒絕空值 /
-  預設值 `change-this-key`(`main.py:374`)。
+- API 端由 `_verify_key_common()` 以 `hmac.compare_digest(...)` 常數時間比較驗證,且拒絕空值 /
+  預設值 `change-this-key`。
 
 **影響**:能存取 NAS 的長期 API key 被同步到 Google 帳號雲端。若該 Google 帳號被入侵、或在
 不信任的裝置上登入同一 Chrome profile,API key 即隨之外洩,等同取得對 NAS 下載通道的存取。
@@ -135,7 +140,7 @@ Worker 會主動 fetch:
 
 Guard 由環境變數 `SSRF_GUARD` 控制,**預設為關**:
 
-- `api/main.py:41`:`SSRF_GUARD_ENABLED = os.getenv("SSRF_GUARD","false")...`
+- `api/main.py` 的 `SSRF_GUARD_ENABLED` 由環境變數讀取,預設為 `false`。
 - `worker/worker.py:35`:同上,預設 `"false"`。
 - `shared/security.py:65-68`:`ssrf_guard_enabled()` 預設 off,docstring 明言 opt-in,理由是
   不想破壞從 LAN 來源下載的使用者。
@@ -166,16 +171,19 @@ Guard 由環境變數 `SSRF_GUARD` 控制,**預設為關**:
 
 - HLS playlist(master + variant 走同一 `fetch_playlist`):`shared/parsers/m3u8.py:12`
   匯入,`m3u8.py:144` 以 `guarded_get` 抓取。
-- HLS AES-128 key:`worker/downloader.py:21` 匯入,`downloader.py:750` `guarded_get`。
-- HLS / DASH segment:`worker/downloader.py:1060` `guarded_get`(此為 segment 下載主路徑;
-  檔內唯一其他 `session.get` 出現在 `downloader.py:1274` 的**註解**中,非實際呼叫)。
-- API 端 job 提交:`main.py:325` 對 `DownloadRequest.url`、`main.py:1052-1054` 對
-  browser-side init 的 `url`/`base_url` 呼叫 `_enforce_ssrf_guard()`
-  (`main.py:255-271`,guard 關閉時 no-op)。
-- DASH/MPD manifest:`worker.py:716` 以原生 `session.get` 抓取,但在 redirect 後對**最終
-  URL** 重驗(`worker.py:729-732`)、對所有衍生 init/media URL 預先重驗
-  (`worker.py:787-788`);且 guard 開啟時**停用** ffmpeg 原生 DASH fallback,因為該路徑會用
-  ffmpeg 自己的 HTTP stack 繞過驗證(`worker.py:763-768`)。
+- HLS AES-128 key：`worker/downloader.py` 以 `guarded_get(..., stream=True)` 抓取，response
+  嚴格限制為 16 bytes 並在所有路徑關閉。
+- HLS / DASH segment：`worker/downloader.py` 的 segment 主路徑使用
+  `guarded_get(..., stream=True)`；byte range 要求 206 與精確長度，非 range 也受
+  `MAX_SEGMENT_RESPONSE_BYTES` 上限約束。
+- API 端 job 提交對 `DownloadRequest.url`、browser-side init 的 `url`/`base_url` 呼叫
+  `_enforce_ssrf_guard()`（guard 關閉時 no-op）。
+- DASH/MPD manifest 與 fMP4 init 都走 `guarded_get(..., stream=True)`，逐跳檢查 redirect；
+  manifest 上限 10 MiB、init 預設上限 16 MiB，且所有 response 都在 `finally` 關閉。解析後對
+  distinct derived origins 做前置重驗，真正的每個 segment request 仍逐跳驗證。無論 guard 是否
+  開啟，都**停用** ffmpeg 原生 DASH URL fallback：它會重新抓取 manifest，第二次 response
+  可能與已驗證的 bounded bytes 不同，因而同時繞過 URL 驗證與 XML／template／segment 等
+  resource cap。parser 不支援或無法確定有限工作量的 MPD 一律 fail-closed。
 
 ### 3.5 殘留風險 (residual risk) — 誠實揭露
 
@@ -185,9 +193,9 @@ Guard 由環境變數 `SSRF_GUARD` 控制,**預設為關**:
    公開 IP(通過檢查)、第二次回應內網 IP(實際連線)。要真正關閉需 **IP-pinning**(驗證與
    連線鎖定同一顆 IP),但本專案用來模仿瀏覽器指紋的 `curl_cffi` transport 讓 IP-pinning
    難以實作,故此點被明確記為已知限制(`shared/security.py:76-79`)。
-3. **DASH manifest 初次抓取**走 `worker.py:716` 的原生 `session.get`(非 `guarded_get`),
-   其 redirect 鏈不是逐跳驗證,而是靠「最終 URL 重驗 + 衍生 URL 重驗」補救,語意上弱於
-   HLS 路徑的逐跳檢查。
+3. **DASH parser 支援範圍**：只有能由本地 parser 完整展開、套用 URL／數量／記憶體上限的
+   static single-Period `SegmentTemplate` VOD 會執行；`SegmentList`、`SegmentBase`、multi-period
+   或無法安全展開的 template 會明確失敗，不會退回另一套網路 stack。
 
 ---
 
@@ -195,32 +203,51 @@ Guard 由環境變數 `SSRF_GUARD` 控制,**預設為關**:
 
 ### 4.1 路徑穿越 (path traversal) — 已有防護
 
-- API 端 `main.py:279-302` `normalize_output_subdir()`:拒絕 `.` / `..` 元件、控制字元、
+- API 端 `normalize_output_subdir()`:拒絕 `.` / `..` 元件、控制字元、
   `<>:"|?*`、Windows 磁碟機代號、絕對路徑,長度上限 255。
 - Worker 端 `worker.py:176-207` `resolve_output_dir()` 做**縱深防禦**同樣檢查,最後以
   `candidate.relative_to(base)`(base=`/downloads`)確認解析後路徑未逃出 base,否則擲例外。
-- browser-side 的 `{job_id}` path 參數以嚴格 UUID 驗證(`main.py:781-784`),segment/staging
-  路徑均綁定在 `STAGING_DIR/{job_id}` 之下(`main.py:792-824`),避免 `..%2F` 類穿越與
+- browser-side 的 `{job_id}` path 參數以 `_validate_job_id()` 嚴格驗證 UUID,segment/staging
+  路徑均由 `BrowserJobPaths` 綁定在 `STAGING_DIR/{job_id}` 之下,避免 `..%2F` 類穿越與
   「刪到別的 job 的 staging」。
 
 ### 4.2 上傳端點濫用 (upload abuse) — 已有配額
 
-`PUT /api/jobs/{job_id}/segments/{seq}`(`main.py:1241-1340`)對惡意 / 失控客戶端有多重上限:
+`PUT /api/jobs/{job_id}/segments/{seq}` 對惡意 / 失控客戶端有多重上限:
 
-- 每個 track 的 `seq` 嚴格上界(`main.py:1266-1281`),避免灌爆非預期 segment。
-- 每 job 併發上傳槽上限 `MAX_CONCURRENT_UPLOADS_PER_JOB`(`main.py:1293-1305`,以 Redis
-  INCR 原子計數)。
-- 每 job staging 位元組配額:同時計入「已落地」與「in-flight 最壞值
-  (`slot_count × MAX_SEGMENT_BYTES`)」對照 `MAX_JOB_STAGING_BYTES`(`main.py:1313-1333`),
-  關閉多個併發 PUT 共同衝破配額的競態。
+- 每個 track 的 `seq` 依 persisted plan 嚴格設上界,避免灌爆非預期 segment。
+- 每 job 併發上傳槽上限 `MAX_CONCURRENT_UPLOADS_PER_JOB`：每個 PUT 以單一 Redis hash
+  token 同時持有到期時間與 bytes reservation；claim、reserve、heartbeat、commit、release、
+  過期 prune 都由 Lua 原子執行。過期或無法清除的 reservation 會把 staged counter 原子切到
+  dirty scan；若連 dirty marker 都無法確認，reservation 轉成不占 upload slot 的 byte-only
+  lease，避免 API crash／NAS unlink failure 後的 bytes 消失又不會把所有並行槽卡到 TTL。
+- 每 job staging 位元組配額同時計入「已落地」與 Redis 原子保留的 in-flight bytes：
+  plan 已宣告 byte range 時使用實際 `byte_range.length`；其他 segment/init 若有
+  `Content-Length` 則以該值 reservation 並在 stream hard-cap／結束時核對，否則保留
+  `MAX_SEGMENT_BYTES` 最壞值，再對照 `MAX_JOB_STAGING_BYTES`。publish 完成後，以單一 Lua
+  原子把該 token 的 reservation 轉入 staged counter；clean path 由單一 quota snapshot 讀取
+  同一 generation，dirty/cold scan 則以前後 token signature 驗證穩定性。publish→commit
+  交界保留 token-owned source hard link 或 `.publish.<token>.part` generation marker，scan 會把
+  已可見 final 歸到同一筆 positive reservation，既不 undercount、也不會短暫 double-count
+  而把緊貼 quota 的合法 sibling PUT 誤判為 413。
 - `direct_dash` 在建立 plan 前先加總 video/audio `content_length`，並用實際 chunk size 預估
-  segment count；超過 `MAX_JOB_STAGING_BYTES` 或 `MAX_BROWSER_SEGMENTS` 直接 413，避免先
-  materialize 大量重複 Range entries 才發現配額超標。
+  segment count 與 serialized bytes；超過 `MAX_JOB_STAGING_BYTES`、`MAX_BROWSER_SEGMENTS` 或
+  `MAX_BROWSER_PLAN_BYTES` 直接 413，避免先 materialize 大量重複 Range entries才發現配額
+  超標。HLS 在 `m3u8.loads` 前分別限制 URI／segment／variant，並把所有會累積 parser
+  collection 的 KEY、MAP、PART、MEDIA、DATERANGE 等輔助標籤合併計數，且 URI 對應的
+  Segment/Playlist objects 與這批 auxiliary objects 共用同一總上限；DASH 也在完整 segment
+  materialization 前限制兩軌總數。exact JSON size 與 media + manifest 的合計在落盤前再
+  檢查一次。
+- request body 停止產生資料達 `UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS`，或接收 body（含 lease
+  housekeeping）的總時間超過 `UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS`（實際值至少等於 idle
+  timeout），即 408 並刪除 attempt `.part`；deadline 不宣稱能中止已進入 kernel 的 NAS
+  write/fsync。持續傳輸則以節流 heartbeat 延長 Redis token lease，避免長連線中途失去
+  併發與容量計數，也不允許 slow-drip 永久占槽。
 - Direct-DASH 的 `content_length` 必須來自 one-byte `206` 的有效 `Content-Range` 總長；每個
   Range PUT 在發布前核對實收長度，finalize 再逐檔核對 plan 長度，避免 stale metadata 或
   被截斷的 response 變成看似完整的輸出。
-- 另有 browser-side plan 的 URL 安全檢查 `_enforce_plan_url_safety()`
-  (`main.py:847-869`、`main.py:1135`),**永遠開啟**(不受 `SSRF_GUARD` 影響),因為擴充功能
+- 另有 browser-side plan 的 URL 安全檢查 `_enforce_plan_url_safety()`,**永遠開啟**
+  (不受 `SSRF_GUARD` 影響),因為擴充功能
   會帶著憑證跨來源讀取 plan 內的每個 URL,故拒絕指向非公開位址或非 http(s) scheme 的 plan。
 
 ### 4.3 惡意網頁可誘發 job 提交
@@ -256,13 +283,12 @@ Guard 由環境變數 `SSRF_GUARD` 控制,**預設為關**:
 ### 5.1 已在位的緩解 (mitigations in place)
 
 - 共用 `guarded_get` 逐跳驗證 redirect,收斂所有 manifest 衍生 fetch(`shared/security.py:99-130`)。
-- API key 以 `hmac.compare_digest` 常數時間比較,拒絕空 / 預設值(`main.py:374-382`)。
-- 路徑穿越縱深防禦:API + worker 雙重 `output_subdir` 檢查(`main.py:279-302`、`worker.py:176-207`);
-  browser job_id 嚴格 UUID(`main.py:781-784`)。
-- 上傳配額 / 併發槽 / 每 job 位元組上限(`main.py:1266-1333`)。
-- browser-side plan URL 安全檢查永遠開啟(`main.py:847-869`)。
+- API key 以 `hmac.compare_digest` 常數時間比較,拒絕空 / 預設值。
+- 路徑穿越縱深防禦:API + worker 雙重 `output_subdir` 檢查；browser job_id 嚴格 UUID。
+- 上傳配額 / 併發槽 / 每 job 位元組上限由 token lease、staged counter 與 quota snapshot 協作。
+- browser-side plan URL 安全檢查永遠開啟。
 - 日誌對 `Cookie` / `Authorization` 遮蔽(`shared/security.py:148-163`、`background.js:970-976`)。
-- 可選的 client IP allowlist 與 rate limit(`main.py:181-244`)。
+- 可選的 client IP allowlist 與 rate limit。
 
 ### 5.2 建議 (recommended next steps)
 
@@ -275,5 +301,6 @@ Guard 由環境變數 `SSRF_GUARD` 控制,**預設為關**:
   避免長期憑證同步到 Google 帳號雲端(`options.js:569`)。
 - **加入 IP-pinning 以關閉 DNS rebinding TOCTOU**:驗證與實際連線鎖定同一顆已解析 IP。需評估
   對 `curl_cffi` 模仿式 transport 的相容性(`shared/security.py:76-79`)。
-- (延伸)考慮對轉發到 NAS 的第三方憑證做最小化 / 加密儲存,並讓 DASH manifest 初次抓取也走
-  `guarded_get` 逐跳驗證,與 HLS 路徑對齊(`worker.py:716`)。
+- (延伸)考慮對存入 Postgres 的第三方憑證做欄位最小化、短效化與 at-rest encryption；目前
+  request-time origin scoping 已避免 foreign derived URL 直接取得 captured secrets，但資料庫仍保存
+  原始值。

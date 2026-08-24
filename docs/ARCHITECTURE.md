@@ -189,11 +189,13 @@ Chrome Extension / Offscreen
 │   └─ Require one-byte 206 + authoritative Content-Range total
 │      └─ POST /api/jobs/init {direct_dash:{video,audio}, headers}
 ├─→ API builds plan and runs always-on plan URL safety checks
+│   └─ Direct DASH gets a server-safe recommendation up to 12; manifests up to 6
 ├─→ PUT /api/jobs/{id}/segments/{track}/{seq}
-│   └─ Extension fetches/decrypts media segments or contiguous ranges; API verifies declared Range length
+│   ├─ Extension times CDN fetch and NAS PUT independently; NAS retries reuse fetched bytes
+│   └─ API reserves planned bytes, verifies length, then atomically commits accounting
 ├─→ POST /api/jobs/{id}/finalize
 │   └─ API queues a browser finalize job
-└─→ BROWSER_JOB_PROGRESS → sidepanel live progress
+└─→ BROWSER_JOB_PROGRESS → session snapshot → sidepanel live progress + transfer rates
 
 Worker
 └─→ BLPOP browser finalize queue
@@ -429,11 +431,17 @@ Indexes:
      - SCARD active_jobs              # Count active
 
 4. Browser Staged Bytes (String)
-   Key: "browser_staged_bytes:{job_id}"
+   Key: "wv2nas:staged_bytes:{job_id}"
    Type: STRING
    Purpose: enforce per-job staging byte quota
 
-5. Rate Limiting (String)
+5. Browser Upload Leases (Hash)
+   Key: "wv2nas:upload_leases:{job_id}"
+   Type: HASH (token → expiry:reserved_bytes)
+   Purpose: atomically cap active PUTs, count positive in-flight bytes, and
+            mark negative retained generations for authoritative disk scans
+
+6. Rate Limiting (String)
    Key: "ratelimit:{ip}"
    Type: STRING
    Value: request_count
@@ -530,11 +538,11 @@ The Synology compose deploys **3 independent download workers** by default to ma
 
 ### 8.3 Worker Capacity
 
-Each worker container processes **one video at a time** (`MAX_CONCURRENT_DOWNLOADS` was removed in v1.8.0; concurrency now comes from running multiple worker services). Within a video, segment downloads parallelise via `MAX_DOWNLOAD_WORKERS` threads (default 20).
+Each worker container processes **one video at a time** (`MAX_CONCURRENT_DOWNLOADS` was removed in v1.8.0; concurrency now comes from running multiple worker services). Within a video, NAS-direct HLS/DASH segment downloads parallelise via `MAX_DOWNLOAD_WORKERS` threads (default 10). The executor retains at most twice that many futures, so a large manifest does not allocate one future per segment up front.
 
 **Default 3-worker setup:**
 - Parallel videos: **3** (one per worker container)
-- Per-video segment threads: 20
+- Per-video segment threads: 10
 - Recommended for NAS with 6+ CPU cores and 6 GB+ RAM
 
 ### 8.4 Scaling Workers
@@ -556,7 +564,8 @@ Both compose templates use the unified image; copy the `worker3` block into `wor
 
 What the implementation actually does:
 
-- **Per-video parallelism**: HLS segments download via a `ThreadPoolExecutor` of size `MAX_DOWNLOAD_WORKERS` (default 20) per worker container. MP4 direct downloads probe `Range` support and split into 4 parallel byte-range streams when the file is ≥ 32 MB and the origin honours `bytes=0-0` with HTTP 206.
+- **Per-video parallelism**: NAS-direct HLS/DASH segments download via a `ThreadPoolExecutor` of size `MAX_DOWNLOAD_WORKERS` (default 10) per worker container, with a bounded `2 × workers` submission window. Browser-side direct DASH separately follows the API's recommendation up to 12 uploads; ordinary browser-side manifests use up to 6. MP4 direct downloads probe `Range` support and split into 4 parallel byte-range streams when the file is ≥ 32 MB and the origin honours `bytes=0-0` with HTTP 206.
+- **Worker response bounds**: NAS-direct media and fMP4 init responses always stream into finite in-memory ceilings (`MAX_SEGMENT_RESPONSE_BYTES=64 MiB`, `MAX_INIT_SEGMENT_BYTES=16 MiB` by default). A process-local weighted budget (`MAX_INFLIGHT_SEGMENT_BYTES=128 MiB`) stays reserved through validation/decryption/file write; small identity responses reserve their authoritative `Content-Length`, while unknown bodies reserve the worst case. AES-128 keys must stream to exactly 16 bytes and same-URL cache misses are single-flight. MPD bodies, XML structure, individual BaseURLs/templates, expanded URL bytes, segment counts, fallback `SegmentURL` counts, and Period counts are independently capped before expensive expansion; the API plan-size mirror reuses the same template and URL guards.
 - **Worker scaling**: each worker container processes one video at a time. Add more `worker*` services to scale horizontally; Redis `BLPOP` distributes jobs without coordination.
 - **DB indexes** ([init-db.sql](../video-downloader/docker/init-db.sql)): `idx_jobs_status`, `idx_jobs_created_at`. Status polling and listing don't full-scan.
 - **Connection reuse**: each worker keeps a single `requests.Session` (or `curl_cffi` `BrowserSession` for TLS impersonation) for the playlist + key + segments to preserve cookies and the JA3 fingerprint.

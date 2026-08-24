@@ -7,7 +7,9 @@ constructs a self-contained MPD XML string and asserts the parsed shape.
 
 import pytest
 
+from shared.parsers import dash as shared_dash
 from mpd_parser import (
+    MPDFallbackUnsafeError,
     MPDParseError,
     _iso8601_duration_to_seconds,
     _substitute_template,
@@ -98,6 +100,136 @@ def test_template_substitutes_time():
     assert out == "chunk-12345.m4s"
 
 
+def test_template_supports_dash_literal_dollar_escape():
+    out = _substitute_template(
+        "cost-$$-$Number$-$$Number$$.m4s",
+        representation_id="x",
+        bandwidth=0,
+        number=7,
+    )
+    assert out == "cost-$-7-$Number$.m4s"
+
+
+@pytest.mark.parametrize(
+    "template,number,bandwidth,expected",
+    [
+        ("$Number$$$", 7, 0, "7$"),
+        ("$Bandwidth$$$", None, 42, "42$"),
+        ("$$$Number$", 7, 0, "$7"),
+        ("$$$$$Number$$$$$", 7, 0, "$$7$$"),
+    ],
+)
+def test_template_literal_dollar_escape_is_token_boundary_safe(
+    template, number, bandwidth, expected,
+):
+    assert _substitute_template(
+        template,
+        representation_id="x",
+        bandwidth=bandwidth,
+        number=number,
+    ) == expected
+
+
+def test_template_supports_dash_integer_format_conversions():
+    out = _substitute_template(
+        "b-$Bandwidth%05d$-n-$Number%04x$-t-$Time%03o$.m4s",
+        representation_id="x",
+        bandwidth=42,
+        number=15,
+        time_value=8,
+    )
+    assert out == "b-00042-n-000f-t-010.m4s"
+
+
+def test_template_rejects_unknown_format_conversion():
+    with pytest.raises(MPDParseError, match="Unsupported or unexpanded"):
+        _substitute_template(
+            "b-$Bandwidth%05f$.m4s",
+            representation_id="x",
+            bandwidth=42,
+        )
+
+
+@pytest.mark.parametrize("token", ["$SubNumber$", "$Foo$", "$Number%05f$"])
+def test_template_rejects_unknown_or_unsupported_identifier(token):
+    with pytest.raises(MPDParseError, match="Unsupported or unexpanded"):
+        _substitute_template(
+            f"seg-{token}.m4s",
+            representation_id="x",
+            bandwidth=42,
+            number=1,
+        )
+
+
+def test_template_allows_escaped_unknown_identifier_as_literal_text():
+    assert _substitute_template(
+        "seg-$$SubNumber$$.m4s",
+        representation_id="x",
+        bandwidth=42,
+        number=1,
+    ) == "seg-$SubNumber$.m4s"
+
+
+@pytest.mark.parametrize(
+    "representation_id,expected",
+    [
+        ("$Number$", "$Number$-7.m4s"),
+        ("$Bandwidth$", "$Bandwidth$-7.m4s"),
+        ("$$", "$$-7.m4s"),
+    ],
+)
+def test_representation_id_is_literal_data_not_a_second_template_pass(
+    representation_id, expected,
+):
+    assert _substitute_template(
+        "$RepresentationID$-$Number$.m4s",
+        representation_id=representation_id,
+        bandwidth=42,
+        number=7,
+    ) == expected
+
+
+def test_parse_mpd_preserves_template_syntax_inside_representation_id():
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT1S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="$Number$" bandwidth="42">
+          <SegmentTemplate media="$RepresentationID$-$Number$.m4s"
+                           initialization="$RepresentationID$.mp4" duration="1"/>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    parsed = parse_mpd(xml, "https://cdn.example.com/manifest.mpd")
+    assert parsed["video"]["init_segment_url"].endswith("/$Number$.mp4")
+    assert parsed["video"]["segments"][0]["url"].endswith(
+        "/$Number$-1.m4s"
+    )
+
+
+def test_parse_mpd_literal_dollar_escape_matches_init_and_media():
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT1S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">
+          <SegmentTemplate media="cost-$$-$Number$.m4s"
+                           initialization="init-$$.mp4" duration="1"/>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    parsed = parse_mpd(xml, "https://cdn.example.com/manifest.mpd")
+
+    assert parsed["video"]["init_segment_url"] == (
+        "https://cdn.example.com/init-$.mp4"
+    )
+    assert parsed["video"]["segments"][0]["url"] == (
+        "https://cdn.example.com/cost-$-1.m4s"
+    )
+
+
 def test_template_clamps_hostile_number_pad_width():
     """A malicious manifest must not be able to allocate a huge string via an
     enormous zero-pad width (OOM DoS). The width is clamped; the value is
@@ -118,6 +250,159 @@ def test_template_clamps_hostile_time_pad_width():
     )
     assert len(out) < 100
     assert out.endswith("7.m4s")
+
+
+def test_template_rejects_representation_token_amplification_before_replace():
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="before substitution",
+    ):
+        shared_dash._substitute_template(
+            "$RepresentationID$" * 20,
+            representation_id="r" * 20,
+            bandwidth=1,
+            number=1,
+            max_output_bytes=100,
+        )
+
+
+def test_template_clamps_extremely_long_pad_width_without_bigint_parse():
+    out = shared_dash._substitute_template(
+        "chunk-$Number%" + "9" * 5000 + "d$.m4s",
+        representation_id="x",
+        bandwidth=1,
+        number=7,
+    )
+    assert len(out) < 100
+
+
+def test_parse_mpd_caps_aggregate_expanded_url_bytes(monkeypatch):
+    real_budget = shared_dash._ExpandedUrlBudget
+    monkeypatch.setattr(
+        shared_dash,
+        "_ExpandedUrlBudget",
+        lambda: real_budget(limit=400),
+    )
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT20S">
+      <Period><BaseURL>https://cdn.example.com/a/long/path/</BaseURL>
+        <AdaptationSet mimeType="video/mp4">
+          <Representation id="video" bandwidth="1">
+            <SegmentTemplate media="segment-$Number$.m4s" duration="1"/>
+          </Representation>
+        </AdaptationSet>
+      </Period>
+    </MPD>"""
+
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="MAX_EXPANDED_DASH_URL_BYTES",
+    ):
+        parse_mpd(xml, "https://cdn.example.com/manifest.mpd")
+
+
+def test_parse_mpd_caps_pre_normalization_url_resolution_work(monkeypatch):
+    """A long invariant path may collapse to a tiny retained URL.
+
+    Retained-byte accounting alone therefore cannot bound repeated template
+    scanning/urljoin work.  Exercise the real parser with a small test budget
+    so the regression stays fast while preserving the hostile shape.
+    """
+    real_budget = shared_dash._ExpandedUrlBudget
+    monkeypatch.setattr(
+        shared_dash,
+        "_ExpandedUrlBudget",
+        lambda: real_budget(limit=10_000, work_limit=250),
+    )
+    shrinking_representation_id = "x/../" * 20
+    xml = f"""<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT5S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="{shrinking_representation_id}" bandwidth="1">
+          <SegmentTemplate media="$RepresentationID$s-$Number$.m4s"
+                           duration="1"/>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="URL resolution work.*MAX_DASH_URL_RESOLUTION_WORK_BYTES",
+    ):
+        parse_mpd(xml, "https://e.test/m.mpd")
+
+
+def test_parse_mpd_rejects_oversized_baseurl_before_urljoin(monkeypatch):
+    monkeypatch.setattr(shared_dash, "MAX_DASH_URL_BYTES", 64)
+    monkeypatch.setattr(
+        shared_dash,
+        "urljoin",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized BaseURL must be rejected before urljoin"
+        ),
+    )
+    xml = f"""<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT1S">
+      <Period><BaseURL>{'/' * 65}</BaseURL>
+        <AdaptationSet mimeType="video/mp4">
+          <Representation id="v" bandwidth="1">
+            <SegmentTemplate media="$Number$.m4s" duration="1"/>
+          </Representation>
+        </AdaptationSet>
+      </Period>
+    </MPD>"""
+
+    with pytest.raises(MPDFallbackUnsafeError, match="BaseURL reference"):
+        parse_mpd(xml, "https://e.test/m.mpd")
+
+
+def test_parse_mpd_rejects_oversized_media_template(monkeypatch):
+    monkeypatch.setattr(shared_dash, "MAX_DASH_TEMPLATE_BYTES", 32)
+    xml = f"""<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT1S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">
+          <SegmentTemplate media="{'x' * 33}$Number$.m4s" duration="1"/>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(MPDFallbackUnsafeError, match="SegmentTemplate"):
+        parse_mpd(xml, "https://e.test/m.mpd")
+
+
+def test_parse_mpd_applies_static_template_substitutions_once(monkeypatch):
+    real_substitute = shared_dash._substitute_template
+    calls = []
+
+    def counting_substitute(*args, **kwargs):
+        calls.append(args[0])
+        return real_substitute(*args, **kwargs)
+
+    monkeypatch.setattr(shared_dash, "_substitute_template", counting_substitute)
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT100S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="" bandwidth="1">
+          <SegmentTemplate
+            media="$RepresentationID$$RepresentationID$$Number%099999999d$.m4s"
+            duration="1"/>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    result = parse_mpd(xml, "https://e.test/m.mpd")
+
+    assert result["video"]["segment_count"] == 100
+    assert len(calls) == 1
+    assert result["video"]["segments"][0]["url"].endswith(
+        "1".zfill(20) + ".m4s"
+    )
 
 
 # --- parse_mpd: structure rejection ------------------------------------
@@ -143,7 +428,7 @@ def test_parse_mpd_rejects_xml_entities():
         </AdaptationSet>
       </Period>
     </MPD>"""
-    with pytest.raises(MPDParseError, match="not valid XML"):
+    with pytest.raises(MPDFallbackUnsafeError, match="DTD/entity.*forbidden"):
         parse_mpd(xml, "https://example.com/m.mpd")
 
 
@@ -169,6 +454,88 @@ def test_parse_mpd_rejects_multi_period():
       <Period duration="PT5S"><AdaptationSet/></Period>
     </MPD>"""
     with pytest.raises(MPDParseError, match="multi-period not supported"):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_fixed_time_template_checks_work_cap_before_feature_gap():
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT1000000H">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">
+          <SegmentTemplate media="seg-$Time$.m4s" duration="1"/>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(MPDFallbackUnsafeError, match="Computed segment count"):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_bounded_fixed_time_template_is_explicitly_unsupported():
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT2S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">
+          <SegmentTemplate media="seg-$Time$.m4s" duration="1"/>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(MPDParseError, match="with \\$Time\\$"):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        '<SegmentTemplate media="seg-$Number$.m4s" duration="1" timescale="0"/>',
+        '<SegmentTemplate media="seg-$Number$.m4s" duration="abc"/>',
+        (
+            '<SegmentTemplate media="seg-$Time$.m4s">'
+            '<SegmentTimeline><S/></SegmentTimeline>'
+            '</SegmentTemplate>'
+        ),
+    ],
+)
+def test_malformed_numeric_schema_attributes_use_typed_parser_error(template):
+    xml = f"""<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT2S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">{template}</Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(MPDParseError, match="Malformed MPD"):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+@pytest.mark.parametrize(
+    ("timescale", "duration", "repeat", "message"),
+    [
+        ("-1", "1", "0", "timescale must be positive"),
+        ("1", "0", "0", "S@d must be positive"),
+        ("1", "1", "-2", "S@r must be greater than or equal to -1"),
+    ],
+)
+def test_timeline_numeric_domains_are_rejected(
+    timescale, duration, repeat, message,
+):
+    xml = f"""<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT2S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">
+          <SegmentTemplate media="seg-$Number$.m4s" timescale="{timescale}">
+            <SegmentTimeline><S d="{duration}" r="{repeat}"/></SegmentTimeline>
+          </SegmentTemplate>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(MPDParseError, match=message):
         parse_mpd(xml, "https://example.com/m.mpd")
 
 
@@ -672,6 +1039,46 @@ def test_collect_mpd_urls_handles_video_only():
     ]
 
 
+def test_mpd_origin_preflight_deduplicates_dns_validation(monkeypatch):
+    import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "SSRF_GUARD_ENABLED", True)
+    checked = []
+    monkeypatch.setattr(
+        worker_mod,
+        "_enforce_ssrf_guard",
+        lambda url: checked.append(url),
+    )
+    video = {
+        "segments": [
+            {"url": f"https://cdn.example.com/segment-{index}.m4s"}
+            for index in range(1000)
+        ],
+    }
+
+    worker_mod.DownloadWorker._validate_mpd_derived_origins(video, None)
+    assert checked == ["https://cdn.example.com/segment-0.m4s"]
+
+
+def test_mpd_origin_preflight_caps_distinct_hosts(monkeypatch):
+    import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "SSRF_GUARD_ENABLED", True)
+    monkeypatch.setattr(worker_mod, "_enforce_ssrf_guard", lambda _url: None)
+    video = {
+        "segments": [
+            {"url": f"https://cdn-{index}.example.com/segment.m4s"}
+            for index in range(worker_mod.MAX_MPD_DERIVED_ORIGINS + 1)
+        ],
+    }
+
+    with pytest.raises(
+        worker_mod.NonRetryableManifestError,
+        match="derived origin count exceeds",
+    ):
+        worker_mod.DownloadWorker._validate_mpd_derived_origins(video, None)
+
+
 def test_download_init_segment_distinct_filenames_for_video_audio(tmp_path):
     """Codex review #7 (round 3): video + audio init must NOT both write
     to the same filename in the same temp_dir. Without the `filename`
@@ -697,9 +1104,17 @@ def test_download_init_segment_distinct_filenames_for_video_audio(tmp_path):
 
                 def __init__(self, content):
                     self.content = content
+                    self.headers = {}
+                    self.closed = False
 
                 def raise_for_status(self):
                     pass
+
+                def iter_content(self, chunk_size=64 * 1024):
+                    yield self.content
+
+                def close(self):
+                    self.closed = True
 
             payload = self.bytes_by_url.get(url, b'')
             return _R(payload)
@@ -760,8 +1175,15 @@ def test_download_init_segment_default_filename_unchanged(tmp_path):
             class _R:
                 status_code = 200
                 content = b'\x00\x00\x00\x10ftyp' + b'\x00' * 8
+                headers = {}
 
                 def raise_for_status(self):
+                    pass
+
+                def iter_content(self, chunk_size=64 * 1024):
+                    yield self.content
+
+                def close(self):
                     pass
 
             return _R()
@@ -794,8 +1216,19 @@ def test_download_init_segment_sends_byte_range(tmp_path):
             class _R:
                 status_code = 206
                 content = init_bytes
+                headers = {
+                    "Content-Range": (
+                        f"bytes 10-{10 + len(init_bytes) - 1}/*"
+                    ),
+                }
 
                 def raise_for_status(self):
+                    pass
+
+                def iter_content(self, chunk_size=64 * 1024):
+                    yield self.content
+
+                def close(self):
                     pass
 
             return _R()
@@ -814,6 +1247,232 @@ def test_download_init_segment_sends_byte_range(tmp_path):
     _, kwargs = session.calls[0]
     assert kwargs["stream"] is True
     assert kwargs["headers"]["Range"] == f"bytes=10-{10 + len(init_bytes) - 1}"
+
+
+def test_download_init_segment_rejects_wrong_content_range_without_retry(
+    monkeypatch, tmp_path,
+):
+    import worker as worker_mod
+
+    monkeypatch.setattr(
+        worker_mod.time,
+        "sleep",
+        lambda *_args: pytest.fail("range contract violation must not retry"),
+    )
+    init_bytes = b'\x00\x00\x00\x10ftyp' + b'\x00' * 8
+
+    class _Response:
+        status_code = 206
+        headers = {"Content-Range": f"bytes 0-{len(init_bytes) - 1}/*"}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=64 * 1024):
+            pytest.fail("wrong Content-Range must be rejected before body read")
+
+        def close(self):
+            pass
+
+    class _Session:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            return _Response()
+
+    session = _Session()
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+
+    with pytest.raises(
+        worker_mod.NonRetryableMediaResourceError,
+        match="Content-Range mismatch",
+    ):
+        worker._download_init_segment(
+            "https://x.test/init.mp4",
+            headers={},
+            session=session,
+            temp_dir=str(tmp_path),
+            byte_range={"offset": 10, "length": len(init_bytes)},
+        )
+    assert session.calls == 1
+
+
+def test_download_init_segment_rejects_range_over_cap_before_request(
+    monkeypatch, tmp_path,
+):
+    import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "MAX_INIT_SEGMENT_BYTES", 16)
+    monkeypatch.setattr(
+        worker_mod.time,
+        "sleep",
+        lambda *_args: pytest.fail("oversized range must not retry"),
+    )
+
+    class _NoRequestSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            pytest.fail("oversized range must fail before network I/O")
+
+    session = _NoRequestSession()
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+
+    with pytest.raises(
+        worker_mod.NonRetryableMediaResourceError,
+        match="byte range length 17 exceeds",
+    ):
+        worker._download_init_segment(
+            "https://x.test/init.mp4",
+            headers={},
+            session=session,
+            temp_dir=str(tmp_path),
+            byte_range={"offset": 0, "length": 17},
+        )
+    assert session.calls == 0
+
+
+def test_download_init_segment_streams_body_and_closes(monkeypatch, tmp_path):
+    import worker as worker_mod
+
+    init_bytes = b'\x00\x00\x00\x10ftyp' + b'\x00' * 8
+
+    class _Response:
+        status_code = 200
+        headers = {}
+        content = b""
+
+        def __init__(self):
+            self.closed = False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=64 * 1024):
+            yield init_bytes[:7]
+            yield init_bytes[7:]
+
+        def close(self):
+            self.closed = True
+
+    response = _Response()
+    guarded_calls = []
+
+    def fake_guarded_get(session, url, **kwargs):
+        guarded_calls.append((session, url, kwargs))
+        return response
+
+    monkeypatch.setattr(worker_mod, "guarded_get", fake_guarded_get)
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    path = worker._download_init_segment(
+        "https://x.test/init.mp4",
+        headers={},
+        session=object(),
+        temp_dir=str(tmp_path),
+    )
+
+    assert path == str(tmp_path / "init.mp4")
+    assert (tmp_path / "init.mp4").read_bytes() == init_bytes
+    assert guarded_calls[0][2]["stream"] is True
+    assert response.closed is True
+
+
+def test_download_init_segment_holds_host_slot_until_response_close(
+    monkeypatch, tmp_path,
+):
+    import host_throttle
+    import worker as worker_mod
+
+    init_bytes = b'\x00\x00\x00\x10ftyp' + b'\x00' * 8
+    events = []
+
+    class _Throttle:
+        def acquire(self, url, **_kwargs):
+            events.append(("acquire", url))
+            return True
+
+        def release(self, url):
+            events.append(("release", url))
+
+    class _Response:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=64 * 1024):
+            yield init_bytes
+
+        def close(self):
+            events.append(("close", "https://x.test/init.mp4"))
+
+    class _Session:
+        def get(self, url, **_kwargs):
+            events.append(("get", url))
+            return _Response()
+
+    monkeypatch.setattr(host_throttle, "get", lambda: _Throttle())
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+
+    path = worker._download_init_segment(
+        "https://x.test/init.mp4",
+        headers={},
+        session=_Session(),
+        temp_dir=str(tmp_path),
+    )
+
+    assert path == str(tmp_path / "init.mp4")
+    assert [event[0] for event in events] == [
+        "acquire", "get", "close", "release",
+    ]
+
+
+def test_download_init_segment_rejects_body_over_cap(monkeypatch, tmp_path):
+    import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "MAX_INIT_SEGMENT_BYTES", 16)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda *_args: None)
+
+    class _Response:
+        status_code = 200
+        headers = {}
+
+        def __init__(self):
+            self.closed = False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=64 * 1024):
+            yield b'\x00\x00\x00\x10ftyp' + b'x' * 9
+
+        def close(self):
+            self.closed = True
+
+    responses = []
+
+    class _Session:
+        def get(self, *_args, **_kwargs):
+            response = _Response()
+            responses.append(response)
+            return response
+
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    with pytest.raises(worker_mod.NonRetryableMediaResourceError):
+        worker._download_init_segment(
+            "https://x.test/init.mp4",
+            headers={},
+            session=_Session(),
+            temp_dir=str(tmp_path),
+        )
+    assert len(responses) == 1
+    assert all(response.closed for response in responses)
+    assert not (tmp_path / "init.mp4").exists()
 
 
 def test_extract_all_mpd_urls_finds_baseurl_text():
@@ -1059,7 +1718,7 @@ def test_parse_mpd_caps_unbounded_fixed_duration_segment_count():
         </AdaptationSet>
       </Period>
     </MPD>"""
-    with pytest.raises(MPDParseError, match="MAX_SEGMENTS_PER_TRACK"):
+    with pytest.raises(MPDFallbackUnsafeError, match="MAX_SEGMENTS_PER_TRACK"):
         parse_mpd(xml, "https://example.com/m.mpd")
 
 
@@ -1080,8 +1739,36 @@ def test_parse_mpd_caps_unbounded_segment_timeline_repeat():
         </AdaptationSet>
       </Period>
     </MPD>"""
-    with pytest.raises(MPDParseError, match="MAX_SEGMENTS_PER_TRACK"):
+    with pytest.raises(MPDFallbackUnsafeError, match="MAX_SEGMENTS_PER_TRACK"):
         parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_parse_mpd_caps_timeline_entry_count_before_negative_repeat_scan(
+    monkeypatch,
+):
+    """Many zero-expansion r=-1 entries cannot evade the timeline cap."""
+    import shared.parsers.dash as dash_parser
+
+    monkeypatch.setattr(dash_parser, "MAX_SEGMENTS_PER_TRACK", 3)
+    entries = "".join(
+        f'<S t="{index}" d="1" r="-1" />' for index in range(4)
+    )
+    xml = f"""<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT4S">
+      <Period>
+        <AdaptationSet mimeType="video/mp4">
+          <Representation id="v" bandwidth="100">
+            <SegmentTemplate media="$Time$.m4s" timescale="1">
+              <SegmentTimeline>{entries}</SegmentTimeline>
+            </SegmentTemplate>
+          </Representation>
+        </AdaptationSet>
+      </Period>
+    </MPD>"""
+
+    with pytest.raises(MPDFallbackUnsafeError, match="entry count 4 exceeds"):
+        parse_mpd(xml, "https://example.com/manifest.mpd")
 
 
 def test_parse_mpd_allows_count_at_cap_boundary():
@@ -1135,6 +1822,103 @@ def test_parse_mpd_audio_parse_failure_propagates_not_swallowed():
         parse_mpd(xml, "https://example.com/m.mpd")
 
 
+def test_parse_mpd_rejects_declared_audio_track_with_zero_segments():
+    """NAS-direct must not silently turn a declared audio track into video-only."""
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT10S">
+      <Period duration="PT10S">
+        <AdaptationSet mimeType="video/mp4">
+          <Representation id="v" bandwidth="100">
+            <SegmentTemplate media="v-$Number$.m4s" duration="2" timescale="1"/>
+          </Representation>
+        </AdaptationSet>
+        <AdaptationSet mimeType="audio/mp4">
+          <Representation id="a" bandwidth="64">
+            <SegmentTemplate media="a-$Time$.m4s" timescale="1">
+              <SegmentTimeline/>
+            </SegmentTemplate>
+          </Representation>
+        </AdaptationSet>
+      </Period>
+    </MPD>"""
+
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="selected audio track produced zero",
+    ):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_parse_mpd_rejects_last_negative_repeat_without_period_end():
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">
+          <SegmentTemplate media="$Time$.m4s" timescale="1">
+            <SegmentTimeline>
+              <S t="0" d="2"/>
+              <S d="2" r="-1"/>
+            </SegmentTimeline>
+          </SegmentTemplate>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="S@r=-1 has no finite increasing boundary",
+    ):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_parse_mpd_rejects_negative_repeat_with_non_increasing_next_time():
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT10S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">
+          <SegmentTemplate media="$Time$.m4s" timescale="1">
+            <SegmentTimeline>
+              <S t="5" d="2" r="-1"/>
+              <S t="4" d="2"/>
+            </SegmentTimeline>
+          </SegmentTemplate>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="S@r=-1 has no finite increasing boundary",
+    ):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_parse_mpd_rejects_negative_repeat_with_implicit_following_time():
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+         mediaPresentationDuration="PT10S">
+      <Period><AdaptationSet mimeType="video/mp4">
+        <Representation id="v" bandwidth="1">
+          <SegmentTemplate media="$Time$.m4s" timescale="1">
+            <SegmentTimeline>
+              <S t="0" d="2" r="-1"/>
+              <S d="2"/>
+              <S t="8" d="2"/>
+            </SegmentTimeline>
+          </SegmentTemplate>
+        </Representation>
+      </AdaptationSet></Period>
+    </MPD>"""
+
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="following S lacks explicit @t",
+    ):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
 def test_parse_mpd_rejects_template_with_no_duration_or_timeline():
     xml = """<?xml version="1.0"?>
     <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT2S">
@@ -1146,8 +1930,310 @@ def test_parse_mpd_rejects_template_with_no_duration_or_timeline():
         </AdaptationSet>
       </Period>
     </MPD>"""
-    with pytest.raises(MPDParseError, match="cannot determine segment count"):
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="cannot determine segment count",
+    ):
         parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_parse_mpd_rejects_fixed_template_without_period_duration():
+    xml = """<?xml version="1.0"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static">
+      <Period>
+        <AdaptationSet mimeType="video/mp4">
+          <Representation id="v" bandwidth="1">
+            <SegmentTemplate media="$Number$.m4s" duration="2" timescale="1"/>
+          </Representation>
+        </AdaptationSet>
+      </Period>
+    </MPD>"""
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="Invalid duration.*period=0",
+    ):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_mpd_element_preflight_rejects_before_elementtree(monkeypatch):
+    # Compact `<S/>`/metadata nodes can number in the millions inside the
+    # 10 MiB body cap.  The total-element preflight must stop them before
+    # DefusedET retains a full Python object graph.
+    xml = (
+        "<MPD>"
+        + "<X/>" * shared_dash.MAX_MPD_XML_ELEMENTS
+        + "</MPD>"
+    )
+    monkeypatch.setattr(
+        shared_dash.DefusedET,
+        "fromstring",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized XML must be rejected before ElementTree"
+        ),
+    )
+
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="MAX_MPD_XML_ELEMENTS",
+    ):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_mpd_preflight_rejects_deep_nesting_before_elementtree(monkeypatch):
+    depth = shared_dash.MAX_MPD_XML_DEPTH + 1
+    xml = "<MPD>" + "<X>" * depth + "</X>" * depth + "</MPD>"
+    monkeypatch.setattr(
+        shared_dash.DefusedET,
+        "fromstring",
+        lambda *_args, **_kwargs: pytest.fail(
+            "deep XML must be rejected before ElementTree"
+        ),
+    )
+    with pytest.raises(MPDFallbackUnsafeError, match="MAX_MPD_XML_DEPTH"):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_mpd_preflight_rejects_oversized_start_tag_before_expat(monkeypatch):
+    xml = (
+        "<MPD oversized=\""
+        + "x" * shared_dash.MAX_MPD_XML_TOKEN_CHARS
+        + "\"></MPD>"
+    )
+    monkeypatch.setattr(
+        shared_dash.expat,
+        "ParserCreate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized XML token must be rejected before Expat"
+        ),
+    )
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="MAX_MPD_XML_TOKEN_CHARS",
+    ):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_mpd_token_lexer_cannot_be_desynchronised_by_comment_quote(monkeypatch):
+    monkeypatch.setattr(shared_dash, "MAX_MPD_XML_TOKEN_CHARS", 64)
+    # The quote in the comment used to leak into the following start tag. Its
+    # opening quote then cleared that stale state and the literal `>` inside the
+    # attribute made the scanner stop early, skipping the oversized remainder.
+    xml = '<MPD><!-- " --><X a=">' + ("x" * 64) + '"/></MPD>'
+    monkeypatch.setattr(
+        shared_dash.expat,
+        "ParserCreate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized desynchronised token must be rejected before Expat"
+        ),
+    )
+
+    with pytest.raises(
+        MPDFallbackUnsafeError,
+        match="MAX_MPD_XML_TOKEN_CHARS",
+    ):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+@pytest.mark.parametrize(
+    "special_markup",
+    ["<!-- don't -->", "<?note don't?>", "<![CDATA[don't]]>"],
+)
+def test_mpd_token_lexer_special_markup_quotes_do_not_poison_following_tags(
+    monkeypatch, special_markup,
+):
+    monkeypatch.setattr(shared_dash, "MAX_MPD_XML_TOKEN_CHARS", 48)
+    xml = "<MPD>" + special_markup + ("<X/>" * 20) + "</MPD>"
+
+    # Total XML is well above the per-token cap, but every individual token is
+    # small. Quotes in comment/PI/CDATA content must not merge later tags into
+    # one apparent token.
+    shared_dash._preflight_mpd_xml(xml)
+
+
+def test_mpd_preflight_caps_segmentlist_urls_before_fallback(monkeypatch):
+    monkeypatch.setattr(shared_dash, "MAX_MPD_SEGMENT_URLS", 2)
+    xml = """<MPD><Period><AdaptationSet><Representation><SegmentList>
+      <SegmentURL media="1.m4s"/><SegmentURL media="2.m4s"/>
+      <SegmentURL media="3.m4s"/>
+    </SegmentList></Representation></AdaptationSet></Period></MPD>"""
+    monkeypatch.setattr(
+        shared_dash.DefusedET,
+        "fromstring",
+        lambda *_args, **_kwargs: pytest.fail(
+            "over-limit SegmentList must reject before ElementTree/fallback"
+        ),
+    )
+
+    with pytest.raises(MPDFallbackUnsafeError, match="MAX_MPD_SEGMENT_URLS"):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+def test_mpd_preflight_caps_periods_before_fallback(monkeypatch):
+    monkeypatch.setattr(shared_dash, "MAX_MPD_PERIODS", 2)
+    xml = "<MPD><Period/><Period/><Period/></MPD>"
+    monkeypatch.setattr(
+        shared_dash.DefusedET,
+        "fromstring",
+        lambda *_args, **_kwargs: pytest.fail(
+            "over-limit Periods must reject before ElementTree/fallback"
+        ),
+    )
+
+    with pytest.raises(MPDFallbackUnsafeError, match="MAX_MPD_PERIODS"):
+        parse_mpd(xml, "https://example.com/m.mpd")
+
+
+@pytest.mark.parametrize("failure_mode", ["timeout", "nonzero"])
+def test_ffmpeg_dash_fallback_never_publishes_partial_output(
+    monkeypatch, tmp_path, failure_mode,
+):
+    from pathlib import Path
+    import worker as worker_mod
+
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    worker._track_reservation = lambda _path: None
+    worker.update_job_status = lambda *_args, **_kwargs: None
+    worker.is_job_cancelled = lambda _job_id: False
+
+    monkeypatch.setattr(
+        worker_mod, "resolve_output_dir", lambda _subdir: tmp_path,
+    )
+    monkeypatch.setattr(worker_mod.shutil, "which", lambda _name: None)
+    captured = {}
+
+    def fake_popen(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return object()
+
+    def fake_monitor(*_args, **_kwargs):
+        partial = Path(captured["cmd"][-1])
+        partial.write_bytes(b"partial ffmpeg bytes")
+        if failure_mode == "timeout":
+            raise TimeoutError("simulated fallback timeout")
+        return 1, "simulated ffmpeg failure", False
+
+    monkeypatch.setattr(worker_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(worker_mod, "_monitor_ffmpeg_process", fake_monitor)
+
+    with pytest.raises((TimeoutError, Exception), match="simulated|exit 1"):
+        worker._process_mpd_with_ffmpeg(
+            "12345678-1234-1234-1234-123456789abc",
+            {
+                "url": "https://cdn.example.com/manifest.mpd",
+                "title": "界" * 100,
+                "output_subdir": None,
+            },
+            {},
+        )
+
+    files = list(tmp_path.iterdir())
+    assert not any(".partial." in path.name or ".partial.mp4" in path.name for path in files)
+    final_files = [path for path in files if not path.name.startswith(".")]
+    assert len(final_files) == 1
+    assert final_files[0].stat().st_size == 0
+
+
+def test_ffmpeg_dash_fallback_discards_output_when_cancel_wins_publish_race(
+    monkeypatch, tmp_path,
+):
+    from pathlib import Path
+    import worker as worker_mod
+
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    worker._track_reservation = lambda _path: None
+    statuses = []
+
+    def update_status(_job_id, status, **_kwargs):
+        statuses.append(status)
+        return False if status == "completed" else True
+
+    cancellation_checks = iter((False, True))
+    worker.update_job_status = update_status
+    worker.is_job_cancelled = lambda _job_id: next(
+        cancellation_checks, True,
+    )
+    worker._probe_duration_seconds = lambda _path: None
+
+    monkeypatch.setattr(
+        worker_mod, "resolve_output_dir", lambda _subdir: tmp_path,
+    )
+    monkeypatch.setattr(worker_mod.shutil, "which", lambda _name: None)
+    captured = {}
+
+    def fake_popen(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        return object()
+
+    def fake_monitor(*_args, **_kwargs):
+        Path(captured["cmd"][-1]).write_bytes(b"complete ffmpeg bytes")
+        return 0, "", False
+
+    monkeypatch.setattr(worker_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(worker_mod, "_monitor_ffmpeg_process", fake_monitor)
+
+    worker._process_mpd_with_ffmpeg(
+        "12345678-1234-1234-1234-123456789abc",
+        {
+            "url": "https://cdn.example.com/manifest.mpd",
+            "title": "race",
+            "output_subdir": None,
+        },
+        {},
+    )
+
+    assert statuses[-1] == "completed"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_primary_mpd_completion_cas_discards_cancelled_published_output(
+    tmp_path,
+):
+    from unittest.mock import MagicMock
+    import worker as worker_mod
+
+    output = tmp_path / "published.mp4"
+    output.write_bytes(b"complete media")
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    worker.update_job_status = MagicMock(return_value=False)
+    worker.is_job_cancelled = MagicMock(return_value=True)
+
+    committed = worker._commit_published_output(
+        "job-cancel-race",
+        str(output),
+        output.stat().st_size,
+        context="MPD",
+    )
+
+    assert committed is False
+    assert not output.exists()
+    worker.update_job_status.assert_called_once_with(
+        "job-cancel-race",
+        "completed",
+        progress=100,
+        file_path=str(output),
+        file_size=len(b"complete media"),
+    )
+
+
+def test_completion_db_failure_preserves_non_cancelled_output(tmp_path):
+    from unittest.mock import MagicMock
+    import worker as worker_mod
+
+    output = tmp_path / "published.mp4"
+    output.write_bytes(b"complete media")
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    worker.update_job_status = MagicMock(return_value=None)
+    worker.is_job_cancelled = MagicMock(return_value=False)
+
+    committed = worker._commit_published_output(
+        "job-db-error",
+        str(output),
+        output.stat().st_size,
+        context="MPD",
+    )
+
+    assert committed is False
+    assert output.read_bytes() == b"complete media"
 
 
 # --- Round 9 fix #18: ffmpeg fallback fails closed under SSRF_GUARD --------
@@ -1178,19 +2264,31 @@ def _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled):
     import worker as worker_mod
     import mpd_parser as mpd_mod
     import ssl_adapter as ssl_mod
+    import shared.security as security_mod
 
     monkeypatch.setattr(worker_mod, 'SSRF_GUARD_ENABLED', ssrf_guard_enabled)
+    monkeypatch.setenv(
+        "SSRF_GUARD", "true" if ssrf_guard_enabled else "false",
+    )
     # Public-host resolution so the entry-point _enforce_ssrf_guard call
     # on the manifest URL itself doesn't trip when guard is on.
     monkeypatch.setattr(
         worker_mod, '_resolve_host_ips',
         lambda h: [ipaddress.ip_address('8.8.8.8')],
     )
+    monkeypatch.setattr(
+        security_mod, 'resolve_host_ips',
+        lambda h: [ipaddress.ip_address('8.8.8.8')],
+    )
 
     fake_response = MagicMock()
     fake_response.content = b"<?xml version='1.0'?><MPD>unsupported shape</MPD>"
+    fake_response.headers = {}
     fake_response.url = 'https://cdn.example.com/m.mpd'
     fake_response.raise_for_status = MagicMock(return_value=None)
+    fake_response.iter_content = MagicMock(
+        return_value=[fake_response.content],
+    )
     fake_session = MagicMock()
     fake_session.get = MagicMock(return_value=fake_response)
     monkeypatch.setattr(ssl_mod, 'create_impersonated_session', lambda: fake_session)
@@ -1207,9 +2305,410 @@ def _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled):
     return worker
 
 
-def test_mpd_fallback_fails_closed_under_ssrf_guard(monkeypatch):
-    """Codex review #18 (round 9, [high]): SSRF_GUARD on + non-DRM
-    MPDParseError → must NOT delegate to ffmpeg fallback. The job fails."""
+def test_worker_mpd_body_reader_rejects_oversized_declared_length(monkeypatch):
+    worker = _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled=False)
+    import worker as worker_mod
+    from unittest.mock import MagicMock
+
+    response = MagicMock()
+    response.headers = {
+        "Content-Length": str(worker_mod.MAX_MPD_MANIFEST_BYTES + 1),
+    }
+    response.iter_content = MagicMock(
+        side_effect=AssertionError("oversized declared body must not be read"),
+    )
+
+    with pytest.raises(
+        worker_mod.NonRetryableManifestError,
+        match="Content-Length.*exceeds",
+    ):
+        worker_mod._read_bounded_mpd_body(response)
+    response.iter_content.assert_not_called()
+
+
+def test_worker_mpd_body_reader_rejects_chunked_body_over_cap(monkeypatch):
+    worker = _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled=False)
+    import worker as worker_mod
+    from unittest.mock import MagicMock
+
+    response = MagicMock()
+    response.headers = {}
+    response.iter_content.return_value = iter(
+        [b"x" * worker_mod.MAX_MPD_MANIFEST_BYTES, b"y"]
+    )
+
+    with pytest.raises(
+        worker_mod.NonRetryableManifestError,
+        match="body exceeds",
+    ):
+        worker_mod._read_bounded_mpd_body(response)
+
+
+def test_mpd_url_policy_rejects_private_host_without_retry(monkeypatch):
+    import ipaddress
+    import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "SSRF_GUARD_ENABLED", True)
+    monkeypatch.setattr(
+        worker_mod,
+        "_resolve_host_ips",
+        lambda _host: [ipaddress.ip_address("127.0.0.1")],
+    )
+
+    with pytest.raises(
+        worker_mod.NonRetryableManifestError,
+        match="MPD URL policy rejected",
+    ):
+        worker_mod._enforce_mpd_url_policy("https://private.example/m.mpd")
+
+
+def test_mpd_url_policy_keeps_dns_resolution_failure_retryable(monkeypatch):
+    import worker as worker_mod
+    from shared.security import SsrfBlocked
+
+    monkeypatch.setattr(worker_mod, "SSRF_GUARD_ENABLED", True)
+
+    def fail_resolution(_host):
+        raise OSError("temporary resolver outage")
+
+    monkeypatch.setattr(worker_mod, "_resolve_host_ips", fail_resolution)
+
+    with pytest.raises(SsrfBlocked, match="could not be resolved") as raised:
+        worker_mod._enforce_mpd_url_policy("https://cdn.example/m.mpd")
+    assert not isinstance(
+        raised.value,
+        worker_mod.NonRetryableManifestError,
+    )
+
+
+def test_worker_mpd_media_headers_do_not_leak_to_foreign_baseurl(
+    monkeypatch,
+):
+    import downloader as downloader_mod
+    import worker as worker_mod
+
+    monkeypatch.setattr(downloader_mod, "_HOST_HEADERS_BY_HOST", {})
+    captured = {
+        "Cookie": "sid=secret",
+        "Authorization": "Bearer secret",
+        "X-Token": "secret",
+        "Referer": "https://trusted.example/watch?token=secret",
+        "Origin": "https://trusted.example",
+        "User-Agent": "browser",
+    }
+
+    scoped = worker_mod._scoped_worker_media_headers(
+        captured,
+        "https://attacker.example/collect/init.mp4",
+        "https://trusted.example/manifest.mpd",
+    )
+
+    assert scoped == {"User-Agent": "browser"}
+
+
+def test_worker_redirected_mpd_cdn_gets_referer_without_captured_secrets(
+    monkeypatch,
+):
+    import downloader as downloader_mod
+    import worker as worker_mod
+
+    monkeypatch.setattr(downloader_mod, "_HOST_HEADERS_BY_HOST", {})
+    manifest_url = "https://media.cdn.example/final/stream.mpd"
+    scoped = worker_mod._scoped_worker_media_headers(
+        {
+            "Cookie": "sid=secret",
+            "Authorization": "Bearer secret",
+            "X-Playback-Token": "secret",
+            "Referer": "https://source.example/watch?token=secret",
+            "Origin": "https://source.example",
+            "User-Agent": "browser",
+        },
+        "https://media.cdn.example/final/init.mp4",
+        "https://source.example/start.mpd",
+        manifest_url,
+    )
+
+    assert scoped == {
+        "User-Agent": "browser",
+        "Referer": manifest_url,
+        "Origin": "https://media.cdn.example",
+    }
+
+
+def test_worker_media_headers_are_case_insensitive_and_host_override_wins(
+    monkeypatch,
+):
+    import downloader as downloader_mod
+    import worker as worker_mod
+
+    manifest_url = "https://media.cdn.example/final/index.mpd"
+    target_url = "https://media.cdn.example/final/init.mp4"
+    monkeypatch.setattr(
+        downloader_mod,
+        "_HOST_HEADERS_BY_HOST",
+        {
+            "media.cdn.example": {
+                "REFERER": "https://operator.example/custom-ref",
+                "origin": "https://operator.example",
+            },
+        },
+    )
+
+    scoped = worker_mod._scoped_worker_media_headers(
+        {
+            "referer": "https://captured.example/watch",
+            "ORIGIN": "https://captured.example",
+            "User-Agent": "browser",
+        },
+        target_url,
+        manifest_url,
+        manifest_url,
+    )
+
+    assert scoped == {
+        "User-Agent": "browser",
+        "REFERER": "https://operator.example/custom-ref",
+        "origin": "https://operator.example",
+    }
+
+
+def test_worker_mpd_fetch_holds_host_slot_until_response_close(monkeypatch):
+    worker = _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled=False)
+    import host_throttle
+    import ssl_adapter as ssl_mod
+
+    events = []
+
+    class _Throttle:
+        def acquire(self, url, **_kwargs):
+            events.append(("acquire", url))
+            return True
+
+        def release(self, url):
+            events.append(("release", url))
+
+    monkeypatch.setattr(host_throttle, "get", lambda: _Throttle())
+    session = ssl_mod.create_impersonated_session()
+    response = session.get.return_value
+
+    def record_get(*_args, **_kwargs):
+        events.append(("get", _args[0]))
+        return response
+
+    session.get.side_effect = record_get
+    response.close.side_effect = lambda: events.append(
+        ("close", "https://cdn.example.com/m.mpd")
+    )
+
+    worker._process_mpd_download(
+        "job-host-slot",
+        {"url": "https://cdn.example.com/m.mpd", "headers": {}},
+    )
+
+    assert [event[0] for event in events] == [
+        "acquire", "get", "close", "release",
+    ]
+
+
+def test_worker_mpd_fetch_requests_streaming_response(monkeypatch):
+    worker = _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled=False)
+    import ssl_adapter as ssl_mod
+
+    session = ssl_mod.create_impersonated_session()
+    job = {'url': 'https://cdn.example.com/m.mpd', 'headers': {}}
+    worker._process_mpd_download('job-streaming-fetch', job)
+
+    assert session.get.call_args.kwargs["stream"] is True
+
+
+def test_worker_mpd_uses_require_all_and_classifies_segment_cap_nonretryable(
+    monkeypatch,
+):
+    worker = _make_mpd_worker_with_stubs(
+        monkeypatch, ssrf_guard_enabled=False,
+    )
+    import downloader as downloader_mod
+    import mpd_parser as mpd_mod
+    import worker as worker_mod
+
+    monkeypatch.setattr(
+        mpd_mod,
+        "parse_mpd",
+        lambda *_args, **_kwargs: {
+            "duration": 1.0,
+            "video": {
+                "segments": [
+                    {"url": "https://cdn.example.com/0.m4s", "index": 0},
+                ],
+                "segment_count": 1,
+                "init_segment_url": None,
+                "bandwidth": 1,
+                "resolution": "1x1",
+            },
+            "audio": None,
+        },
+    )
+    created = []
+
+    class _RejectingDownloader:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def download_all(self, _progress_callback):
+            raise downloader_mod.NonRetryableSegmentResourceError(
+                "Segment 0 response body exceeded limit"
+            )
+
+    monkeypatch.setattr(
+        downloader_mod, "SegmentDownloader", _RejectingDownloader,
+    )
+
+    worker._process_mpd_download(
+        "job-segment-cap",
+        {"url": "https://cdn.example.com/m.mpd", "headers": {}},
+    )
+
+    assert len(created) == 1
+    assert created[0]["require_all"] is True
+    assert worker._process_mpd_with_ffmpeg.call_count == 0
+    assert worker._handle_job_failure.call_count == 1
+    error = worker._handle_job_failure.call_args[0][2]
+    assert isinstance(error, worker_mod.NonRetryableMediaResourceError)
+    assert "response body exceeded limit" in str(error)
+
+
+def test_worker_mpd_fetch_blocks_private_intermediate_redirect(monkeypatch):
+    worker = _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled=True)
+    import ipaddress
+    import shared.security as security_mod
+    import ssl_adapter as ssl_mod
+    import worker as worker_mod
+
+    session = ssl_mod.create_impersonated_session()
+    redirect = session.get.return_value
+    redirect.status_code = 302
+    redirect.headers = {"location": "http://192.168.50.10/secret.mpd"}
+    monkeypatch.setattr(
+        security_mod,
+        "resolve_host_ips",
+        lambda host: [
+            ipaddress.ip_address("192.168.50.10")
+            if host == "192.168.50.10"
+            else ipaddress.ip_address("8.8.8.8")
+        ],
+    )
+
+    worker._process_mpd_download(
+        "job-private-hop",
+        {'url': 'https://cdn.example.com/m.mpd', 'headers': {}},
+    )
+
+    assert session.get.call_count == 1
+    assert worker._process_mpd_with_ffmpeg.call_count == 0
+    assert worker._handle_job_failure.call_count == 1
+    assert isinstance(
+        worker._handle_job_failure.call_args[0][2],
+        worker_mod.NonRetryableManifestError,
+    )
+    assert "URL host not allowed" in str(
+        worker._handle_job_failure.call_args[0][2]
+    )
+
+
+def test_ffmpeg_monitor_cancels_even_when_stderr_never_emits_line():
+    import threading
+    import time
+    import worker as worker_mod
+
+    released = threading.Event()
+
+    class SilentStderr:
+        def read1(self, _size):
+            released.wait(timeout=5)
+            return b""
+
+    class FakeProcess:
+        def __init__(self):
+            self.stderr = SilentStderr()
+            self.returncode = None
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            released.set()
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = FakeProcess()
+    started = time.monotonic()
+    rc, stderr, cancelled = worker_mod._monitor_ffmpeg_process(
+        process,
+        should_stop=lambda: True,
+        on_progress=lambda _seconds: None,
+        total_duration=None,
+        timeout_seconds=60,
+    )
+
+    assert time.monotonic() - started < 1.0
+    assert cancelled is True
+    assert process.killed is True
+    assert rc == -9
+    assert stderr == ""
+
+
+def test_ffmpeg_monitor_cancels_while_stderr_is_continuously_chatty():
+    import threading
+    import time
+    import worker as worker_mod
+
+    released = threading.Event()
+
+    class ChattyStderr:
+        def read1(self, _size):
+            if released.is_set():
+                return b""
+            return b"frame=1 time=00:00:00.01 progress=continue\n" * 64
+
+    class FakeProcess:
+        def __init__(self):
+            self.stderr = ChattyStderr()
+            self.returncode = None
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            released.set()
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = FakeProcess()
+    started = time.monotonic()
+    rc, _stderr, cancelled = worker_mod._monitor_ffmpeg_process(
+        process,
+        should_stop=lambda: True,
+        on_progress=lambda _seconds: None,
+        total_duration=None,
+        timeout_seconds=60,
+    )
+
+    assert time.monotonic() - started < 1.0
+    assert cancelled is True
+    assert process.killed is True
+    assert rc == -9
+
+
+def test_unsupported_mpd_fails_closed_under_ssrf_guard(monkeypatch):
+    """Unsupported MPDs never delegate a second URL fetch to ffmpeg."""
     worker = _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled=True)
     job = {'url': 'https://cdn.example.com/m.mpd', 'headers': {}}
 
@@ -1222,27 +2721,125 @@ def test_mpd_fallback_fails_closed_under_ssrf_guard(monkeypatch):
     assert worker._handle_job_failure.call_count == 1, (
         "fail-closed branch must surface as a job failure"
     )
-    failure_msg = worker._handle_job_failure.call_args[0][2]
-    assert 'SSRF_GUARD' in failure_msg, (
-        f"failure message must explain why fallback was refused; got: {failure_msg}"
-    )
+    failure_msg = str(worker._handle_job_failure.call_args[0][2])
+    assert 'native ffmpeg URL fallback is disabled' in failure_msg
 
 
-def test_mpd_fallback_uses_ffmpeg_when_ssrf_guard_disabled(monkeypatch):
-    """Sanity: SSRF_GUARD off preserves v2.3.x DASH capability — the
-    ffmpeg fallback still runs for SegmentList/SegmentBase/multi-period
-    shapes our parser doesn't understand."""
+def test_unsupported_mpd_fails_closed_when_ssrf_guard_disabled(monkeypatch):
+    """Guard-off must not bypass resource caps via an ffmpeg re-fetch."""
     worker = _make_mpd_worker_with_stubs(monkeypatch, ssrf_guard_enabled=False)
     job = {'url': 'https://cdn.example.com/m.mpd', 'headers': {}}
 
     worker._process_mpd_download('job-ssrf-off', job)
 
-    assert worker._process_mpd_with_ffmpeg.call_count == 1, (
-        "ffmpeg fallback should run when the operator has accepted SSRF risk"
+    assert worker._process_mpd_with_ffmpeg.call_count == 0
+    assert worker._handle_job_failure.call_count == 1
+    assert "native ffmpeg URL fallback is disabled" in (
+        str(worker._handle_job_failure.call_args[0][2])
     )
-    assert worker._handle_job_failure.call_count == 0, (
-        "no failure should be raised — fallback is the expected path"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Computed segment count exceeds MAX_SEGMENTS_PER_TRACK",
+        "selected audio track produced zero segments",
+        "cannot determine segment count",
+        "Invalid duration: seg=2.0s, period=0.0s",
+        "MPD XML element count exceeds MAX_MPD_XML_ELEMENTS",
+        "MPD XML nesting exceeds MAX_MPD_XML_DEPTH",
+        "MPD XML token exceeds MAX_MPD_XML_TOKEN_CHARS",
+        "MPD XML DTD/entity declarations are forbidden",
+        "Expanded DASH URL bytes exceed MAX_EXPANDED_DASH_URL_BYTES",
+    ],
+)
+def test_mpd_safety_rejections_never_use_ffmpeg_fallback_when_guard_disabled(
+    monkeypatch, message,
+):
+    """Parser safety policy is fail-closed even when legacy fallback is on."""
+    worker = _make_mpd_worker_with_stubs(
+        monkeypatch, ssrf_guard_enabled=False,
     )
+
+    import mpd_parser as mpd_mod
+
+    def _raise_safety_error(*_args, **_kwargs):
+        raise mpd_mod.MPDFallbackUnsafeError(message)
+
+    monkeypatch.setattr(mpd_mod, "parse_mpd", _raise_safety_error)
+    job = {'url': 'https://cdn.example.com/m.mpd', 'headers': {}}
+
+    worker._process_mpd_download('job-safety-reject', job)
+
+    assert worker._process_mpd_with_ffmpeg.call_count == 0
+    assert worker._handle_job_failure.call_count == 1
+    assert message in str(worker._handle_job_failure.call_args[0][2])
+
+
+def test_manifest_policy_failure_is_typed_and_never_requeued(monkeypatch):
+    from unittest.mock import MagicMock
+    import worker as worker_mod
+
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    worker.db = MagicMock()
+    worker.update_job_status = MagicMock(return_value=True)
+    redis = MagicMock()
+    monkeypatch.setattr(worker_mod, "redis_client", redis)
+    error = worker_mod.NonRetryableManifestError(
+        "MPD: Representation id='cancelled by user' is unsupported"
+    )
+
+    worker._handle_job_failure(
+        "job-policy-reject",
+        {"retry_count": 0},
+        error,
+    )
+
+    worker.update_job_status.assert_called_once_with(
+        "job-policy-reject",
+        "failed",
+        error_message="MPD: Representation id='cancelled by user' is unsupported",
+    )
+    worker.db.execute.assert_not_called()
+    redis.rpush.assert_not_called()
+
+
+def test_retry_cas_cannot_resurrect_cancelled_job(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import worker as worker_mod
+
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    worker.db = MagicMock()
+    worker.db.execute.return_value = SimpleNamespace(rowcount=0)
+    worker.update_job_status = MagicMock()
+    redis = MagicMock()
+    monkeypatch.setattr(worker_mod, "redis_client", redis)
+
+    worker._handle_job_failure(
+        "job-cancel-won",
+        {"retry_count": 0},
+        RuntimeError("temporary transport failure"),
+    )
+
+    sql = str(worker.db.execute.call_args[0][0])
+    assert "status != 'cancelled'" in sql
+    worker.db.commit.assert_called_once()
+    redis.rpush.assert_not_called()
+
+
+def test_host_slot_cancel_is_typed_even_when_throttle_disabled(monkeypatch):
+    import host_throttle
+    import worker as worker_mod
+
+    monkeypatch.setattr(host_throttle, "get", lambda: None)
+
+    with pytest.raises(worker_mod.HostThrottleCancelled):
+        with worker_mod._host_request_slot(
+            "https://cdn.example/media",
+            should_cancel=lambda: True,
+        ):
+            pytest.fail("cancelled request scope must not yield")
 
 
 # --- Round 10 fix #19: fractional MPD duration must not be floored -------

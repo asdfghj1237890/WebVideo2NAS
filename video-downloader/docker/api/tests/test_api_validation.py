@@ -86,6 +86,32 @@ def test_rate_limit_upload_bucket_has_high_multiplier(monkeypatch):
     assert multipliers["upload"] >= 100
 
 
+def test_rate_limit_429_includes_retry_after(monkeypatch):
+    api_main = _reload_api_main(monkeypatch, RATE_LIMIT_PER_MINUTE="1")
+
+    class FakeRedis:
+        def incr(self, _key):
+            return 2
+        def expire(self, _key, _ttl):
+            return True
+
+    class Client:
+        host = "192.0.2.1"
+
+    class Request:
+        headers = {}
+        client = Client()
+
+    api_main.redis_client = FakeRedis()
+    monkeypatch.setattr(api_main.time, "time", lambda: 123.25)
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        api_main._rate_limit(Request(), "write")
+
+    assert exc.value.status_code == 429
+    assert exc.value.headers == {"Retry-After": "57"}
+
+
 def test_upload_endpoints_use_upload_bucket(monkeypatch):
     """Defense in depth: walk the FastAPI route table and confirm the
     new browser-side upload endpoints declared verify_api_key_upload as

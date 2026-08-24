@@ -109,12 +109,12 @@ video-downloader/docker/[downloads]   # docker-compose 預設 mount 點
 兩條獨立的 test suite，各自跑：
 
 ```bash
-# Chrome extension (vitest, 358 tests / 16 files)
+# Chrome extension (vitest, 399 tests / 16 files)
 cd chrome-extension
 npm install
 npm test
 
-# API + Worker (pytest, 539 tests)
+# API + Worker (pytest, 826 tests)
 cd ../  # 回到 repo root
 uv venv --python 3.11
 uv pip install -r video-downloader/docker/requirements.txt

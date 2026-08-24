@@ -184,18 +184,19 @@ elif ffprobe_failed and (file_size_bytes / declared) < 50KB/s:
 
 ## 4. mpd path
 
-[`_process_mpd_download()`](../../video-downloader/docker/worker/worker.py:527)：
+[`_process_mpd_download()`](../../video-downloader/docker/worker/worker.py) 不再把 URL 交給 ffmpeg
+重新抓。worker 先以 `guarded_get(..., stream=True)` 抓取最多 10 MiB 的 MPD，redirect 每一跳都套
+host throttle、URL safety 與 header 重算；再由本地 DASH parser 選 video/audio representation、展開
+init/media URL，最後以兩個 `SegmentDownloader(require_all=True)` 下載。DASH 不能缺任何一段：第一個
+確定失敗就停止 bounded future window，不會把剩下數萬段全部跑完後才宣告失敗。video/audio 軌下載
+完成後才由 ffmpeg 做本機 mux。
 
-```py
-ffmpeg -headers "Referer: ...\r\nCookie: ...\r\n" \
-       -i {manifest_url} -c copy -bsf:a aac_adtstoasc out.mp4
-```
-
-ffmpeg 自己當 DASH client，吃 manifest URL、處理 init segments + media segments、做 PTS 對齊。沒有額外 parsing/decryption layer。
-
-`-headers` 把 captured Referer / Cookie / Origin 灌進去（DASH segments 一樣會打 anti-hotlink CDN）。
-
-ffmpeg progress 走 stderr line-by-line parse — 看 `out_time_us=` 配 manifest 預期 duration 算進度。
+captured Cookie/Authorization 的信任錨仍是原始 job URL；若 MPD redirect 到另一個公開 CDN，該 CDN
+只會收到安全 representation headers。worker 另外以最終 manifest URL 產生 Referer/Origin，供同一
+CDN 的 init/media/key 使用，兩個邊界不混用。真的需要跨 CDN credential 時，必須由 operator 在
+`HOST_HEADERS_FILE` 對該 host 明確設定。parser 無法有限展開、超過 resource cap、dynamic/multi-period
+或 unsupported shape 都 fail-closed；不再有 native ffmpeg URL fallback 可繞過已驗證的 manifest
+bytes、SSRF 檢查與 parser 上限。
 
 ## 5. mp4 / mov direct path
 
@@ -283,6 +284,32 @@ extension POST /api/jobs/{id}/finalize
 - Manifest-less JSON DASH 的每個 `seg_NNNNNNNN.bin` 是同一完整 `.m4s` 軌道的連續 byte range（預設 8 MiB）；worker 依 seq 串回原始 video/audio 檔再 mux，不把 Range chunk 當獨立 fMP4 segment
 - HostThrottle、anti-hotlink detection 對這條 path 都不適用
 - Stale-browser-job reaper 在啟動時跑(超過 6h 還在 `browser_pending` / `browser_uploading` / `browser_finalizing` → 標 failed,清 staging_dir)
+
+## 9.2 NAS-direct HLS / DASH 的有界並行
+
+NAS-direct 與 browser-side 是兩套 concurrency。NAS-direct 的 `SegmentDownloader` 使用
+`MAX_DOWNLOAD_WORKERS`（預設 10）個 thread，但 executor 只維持最多 `2 × workers` 個
+in-flight／queued future；完成一個才補一個，不能因 100k-segment manifest 一次配置 100k 個
+Future。media response 一律 `stream=True`，非 range 預設最多 64 MiB；range 同時受這個上限、
+206 與宣告長度精確核對。process-local `MAX_INFLIGHT_SEGMENT_BYTES`（預設 128 MiB）以 weighted
+reservation 把所有 worker 留存的 response bytes 合併限制到同一上限，reservation 持續到驗證、
+AES decrypt 與寫檔完成；有可信 `Content-Length` 的小 segment 只保留實際大小，所以正常 DASH
+仍能用滿 threads。init 預設最多 16 MiB，AES-128 key 則必須精確 16 bytes；同 key URL 的首次
+cache miss 以 Future single-flight 合併。三者在成功、HTTP reject、超限與 exception 路徑都
+close response。
+
+HLS master/media playlist 同樣以 `stream=True` 讀入 10 MiB hard cap，response 關閉前持續占用該
+redirect hop 的 host slot；在 `m3u8.loads` 建物件前以不建立 line list 的 iterator 限制 raw line、
+單行長度、URI／media／variant 與 retained auxiliary objects 合計為 100,000，另外限制 rendition、
+unique key 與 key×segment／key-comparison work。
+HTTP redirect 與 master→variant 選擇後，segment、init、AES key 的相對 URL 與 generated Referer
+都以最終 media-playlist URL 為準，但 captured credentials 仍以原始 job URL 為信任邊界。
+
+DASH 在建立 ElementTree／segment list 前另做常數記憶體 XML preflight，限制 body、單一 XML
+token、深度、總 element、fallback `SegmentURL` 與 Period 數；單一 BaseURL／resolved URL、raw
+template、video+audio expanded URL aggregate 也各有上限。`RepresentationID`／`Bandwidth` 與
+printf width normalization 只做一次，segment loop 僅展開 Number／Time，避免縮短型 template
+在輸出很小時仍反覆掃描大量靜態 token。
 
 ## 10. 改 worker 時要注意
 

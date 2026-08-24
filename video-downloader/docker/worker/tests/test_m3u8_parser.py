@@ -3,17 +3,40 @@ import pytest
 
 import m3u8_parser
 from m3u8_parser import M3U8Parser
+from shared.parsers import m3u8 as shared_m3u8
+from shared.security import scoped_captured_headers
 
 
 class _FakeResponse:
-    def __init__(self, *, content: bytes, headers: dict | None = None, status_code: int = 200):
+    def __init__(
+        self,
+        *,
+        content: bytes,
+        headers: dict | None = None,
+        status_code: int = 200,
+        url: str | None = None,
+        chunks: list[bytes] | None = None,
+    ):
         self.content = content
         self.headers = headers or {}
         self.status_code = status_code
+        self.url = url
+        self._chunks = chunks
+        self.closed = False
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
+
+    def iter_content(self, chunk_size=64 * 1024):
+        if self._chunks is not None:
+            yield from self._chunks
+            return
+        for offset in range(0, len(self.content), chunk_size):
+            yield self.content[offset:offset + chunk_size]
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeSession:
@@ -61,7 +84,7 @@ def test_get_base_url_keeps_directory_trailing_slash():
 def test_fetch_playlist_raises_on_large_content_length(monkeypatch):
     resp = _FakeResponse(
         content=b"#EXTM3U\n#EXT-X-VERSION:3\n",
-        headers={"Content-Length": str(2 * 1024 * 1024)},
+        headers={"Content-Length": str(11 * 1024 * 1024)},
     )
     parser = M3U8Parser("https://example.com/a.m3u8", headers={}, session=_FakeSession(resp))
     with pytest.raises(ValueError, match="Response too large"):
@@ -73,6 +96,387 @@ def test_fetch_playlist_raises_on_empty_response(monkeypatch):
     parser = M3U8Parser("https://example.com/a.m3u8", headers={}, session=_FakeSession(resp))
     with pytest.raises(ValueError, match="Empty response"):
         parser.fetch_playlist()
+
+
+def test_fetch_playlist_stream_cap_rejects_chunked_body_and_closes(monkeypatch):
+    cap = shared_m3u8.MAX_M3U8_PLAYLIST_BYTES
+    resp = _FakeResponse(
+        content=b"",
+        headers={"Content-Type": "application/vnd.apple.mpegurl"},
+        chunks=[b"#EXTM3U\n", b"x" * cap],
+    )
+    parser = M3U8Parser(
+        "https://example.com/a.m3u8",
+        headers={},
+        session=_FakeSession(resp),
+    )
+
+    with pytest.raises(ValueError, match="too large while streaming"):
+        parser.fetch_playlist()
+
+    assert resp.closed is True
+
+
+def test_worker_classifies_chunked_playlist_cap_as_nonretryable(monkeypatch):
+    from unittest.mock import MagicMock
+    import ssl_adapter
+    import worker as worker_mod
+
+    monkeypatch.setattr(shared_m3u8, "MAX_M3U8_PLAYLIST_BYTES", 8)
+    monkeypatch.setattr(worker_mod, "SSRF_GUARD_ENABLED", False)
+    response = _FakeResponse(
+        content=b"",
+        chunks=[b"#EXTM3U\n", b"x"],
+        url="https://example.com/index.m3u8",
+    )
+    session = _FakeSession(response)
+    monkeypatch.setattr(
+        ssl_adapter, "create_impersonated_session", lambda: session,
+    )
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    worker.db = MagicMock()
+    worker.update_job_status = MagicMock()
+    worker.is_job_cancelled = MagicMock(return_value=False)
+    worker._handle_job_failure = MagicMock()
+
+    worker._process_m3u8_download(
+        "job-hls-cap",
+        {"url": "https://example.com/index.m3u8", "headers": {}},
+    )
+
+    assert len(session.calls) == 1
+    assert response.closed is True
+    worker._handle_job_failure.assert_called_once()
+    error = worker._handle_job_failure.call_args[0][2]
+    assert isinstance(error, worker_mod.NonRetryableManifestError)
+    assert "too large while streaming" in str(error)
+
+
+def test_worker_classifies_invalid_aes_key_as_nonretryable_media(monkeypatch):
+    from unittest.mock import MagicMock
+    import downloader as downloader_mod
+    import m3u8_parser as parser_mod
+    import ssl_adapter
+    import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "SSRF_GUARD_ENABLED", False)
+    monkeypatch.setattr(
+        ssl_adapter, "create_impersonated_session", lambda: object(),
+    )
+    monkeypatch.setattr(
+        parser_mod,
+        "parse_m3u8",
+        lambda *_args, **_kwargs: {
+            "segments": [
+                {
+                    "url": "https://media.example/0.ts",
+                    "index": 0,
+                },
+            ],
+            "segment_count": 1,
+            "duration": 1,
+            "resolution": None,
+            "has_encryption": True,
+            "init_segment_url": None,
+            "init_segment_byte_range": None,
+            "is_fmp4": False,
+            "playlist_url": "https://media.example/index.m3u8",
+        },
+    )
+
+    class _RejectingDownloader:
+        def __init__(self, **_kwargs):
+            pass
+
+        def download_all(self, _progress_callback):
+            raise downloader_mod.NonRetryableKeyResourceError(
+                "Unexpected AES-128 key length: 17 bytes"
+            )
+
+    monkeypatch.setattr(
+        downloader_mod, "SegmentDownloader", _RejectingDownloader,
+    )
+    worker = worker_mod.DownloadWorker.__new__(worker_mod.DownloadWorker)
+    worker.db = MagicMock()
+    worker.update_job_status = MagicMock()
+    worker.is_job_cancelled = MagicMock(return_value=False)
+    worker._handle_job_failure = MagicMock()
+
+    worker._process_m3u8_download(
+        "job-hls-key",
+        {"url": "https://media.example/index.m3u8", "headers": {}},
+    )
+
+    worker._handle_job_failure.assert_called_once()
+    error = worker._handle_job_failure.call_args[0][2]
+    assert isinstance(error, worker_mod.NonRetryableMediaResourceError)
+    assert "AES-128 key length" in str(error)
+
+
+def test_parse_uses_redirected_final_playlist_url(monkeypatch):
+    final_url = "https://media.cdn.example/final/index.m3u8"
+    content = b"#EXTM3U\n#EXTINF:1,\nchunk.ts\n#EXT-X-ENDLIST\n"
+    resp = _FakeResponse(
+        content=content,
+        headers={"Content-Type": "application/vnd.apple.mpegurl"},
+        url=final_url,
+    )
+    parser = M3U8Parser(
+        "https://source.example/start.m3u8?token=secret",
+        headers={},
+        session=_FakeSession(resp),
+    )
+
+    result = parser.parse()
+
+    assert result["playlist_url"] == final_url
+    assert result["segments"][0]["url"] == (
+        "https://media.cdn.example/final/chunk.ts"
+    )
+
+
+def test_redirected_master_uses_final_master_referer_for_variant_without_secrets():
+    source_url = "https://source.example/start.m3u8?token=secret"
+    final_master_url = "https://media.cdn.example/final/master.m3u8"
+    master = _FakeResponse(
+        content=(
+            b"#EXTM3U\n"
+            b"#EXT-X-STREAM-INF:BANDWIDTH=1000\n"
+            b"video.m3u8\n"
+        ),
+        url=final_master_url,
+    )
+    variant = _FakeResponse(
+        content=b"#EXTM3U\n#EXTINF:1,\nchunk.ts\n#EXT-X-ENDLIST\n",
+        url="https://media.cdn.example/final/video.m3u8",
+    )
+
+    class _SequenceSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return master if len(self.calls) == 1 else variant
+
+    session = _SequenceSession()
+    parser = M3U8Parser(
+        source_url,
+        headers={
+            "Cookie": "sid=secret",
+            "Authorization": "Bearer secret",
+            "Referer": "https://source.example/watch?secret=1",
+            "Origin": "https://source.example",
+            "User-Agent": "browser",
+        },
+        session=session,
+        headers_for_url=lambda target, captured: scoped_captured_headers(
+            captured, target, source_url,
+        ),
+    )
+
+    result = parser.parse()
+
+    assert result["playlist_url"] == variant.url
+    variant_headers = session.calls[1][1]["headers"]
+    assert variant_headers == {
+        "User-Agent": "browser",
+        "Referer": final_master_url,
+        "Origin": "https://media.cdn.example",
+    }
+
+
+def test_variant_preserves_explicit_host_header_referer_override():
+    source_url = "https://source.example/start.m3u8"
+    final_master_url = "https://media.cdn.example/final/master.m3u8"
+    master = _FakeResponse(
+        content=(
+            b"#EXTM3U\n"
+            b"#EXT-X-STREAM-INF:BANDWIDTH=1000\n"
+            b"video.m3u8\n"
+        ),
+        url=final_master_url,
+    )
+    variant = _FakeResponse(
+        content=b"#EXTM3U\n#EXTINF:1,\nchunk.ts\n#EXT-X-ENDLIST\n",
+        url="https://media.cdn.example/final/video.m3u8",
+    )
+
+    class _SequenceSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return master if len(self.calls) == 1 else variant
+
+    def scope_with_host_override(target, captured):
+        scoped = scoped_captured_headers(captured, target, source_url)
+        if target.startswith("https://media.cdn.example/"):
+            scoped["referer"] = "https://operator.example/custom-ref"
+            scoped["ORIGIN"] = "https://operator.example"
+        return scoped
+
+    session = _SequenceSession()
+    parser = M3U8Parser(
+        source_url,
+        headers={"Cookie": "sid=secret", "User-Agent": "browser"},
+        session=session,
+        headers_for_url=scope_with_host_override,
+    )
+
+    parser.parse()
+
+    assert session.calls[1][1]["headers"] == {
+        "User-Agent": "browser",
+        "referer": "https://operator.example/custom-ref",
+        "ORIGIN": "https://operator.example",
+    }
+
+
+def test_standalone_redirected_master_scopes_secrets_before_variant_fetch():
+    source_url = "https://source.example/start.m3u8"
+    final_master_url = "https://media.cdn.example/final/master.m3u8"
+    master = _FakeResponse(
+        content=(
+            b"#EXTM3U\n"
+            b"#EXT-X-STREAM-INF:BANDWIDTH=1000\n"
+            b"video.m3u8\n"
+        ),
+        url=final_master_url,
+    )
+    variant = _FakeResponse(
+        content=b"#EXTM3U\n#EXTINF:1,\nchunk.ts\n#EXT-X-ENDLIST\n",
+        url="https://media.cdn.example/final/video.m3u8",
+    )
+
+    class _SequenceSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return master if len(self.calls) == 1 else variant
+
+    session = _SequenceSession()
+    parser = M3U8Parser(
+        source_url,
+        headers={
+            "Cookie": "sid=secret",
+            "Authorization": "Bearer secret",
+            "X-Token": "secret",
+            "User-Agent": "browser",
+        },
+        session=session,
+    )
+
+    parser.parse()
+
+    assert session.calls[1][1]["headers"] == {
+        "User-Agent": "browser",
+        "Referer": final_master_url,
+        "Origin": "https://media.cdn.example",
+    }
+
+
+def test_standalone_initial_redirect_does_not_forward_captured_secrets():
+    source_url = "https://source.example/start.m3u8"
+    final_url = "https://media.cdn.example/final/index.m3u8"
+    redirect = _FakeResponse(
+        content=b"",
+        status_code=302,
+        headers={"location": final_url},
+        url=source_url,
+    )
+    media = _FakeResponse(
+        content=b"#EXTM3U\n#EXTINF:1,\nchunk.ts\n#EXT-X-ENDLIST\n",
+        url=final_url,
+    )
+
+    class _RedirectSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return redirect if len(self.calls) == 1 else media
+
+    session = _RedirectSession()
+    parser = M3U8Parser(
+        source_url,
+        headers={
+            "Cookie": "sid=secret",
+            "Authorization": "Bearer secret",
+            "X-Token": "secret",
+            "Referer": "https://source.example/watch?secret=1",
+            "User-Agent": "browser",
+        },
+        session=session,
+    )
+
+    result = parser.parse()
+
+    assert result["playlist_url"] == final_url
+    assert session.calls[0][1]["headers"]["Cookie"] == "sid=secret"
+    assert session.calls[1][1]["headers"] == {"User-Agent": "browser"}
+
+
+def test_parse_rejects_media_entry_count_before_library_materialization(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "shared.parsers.m3u8.MAX_M3U8_MEDIA_ENTRIES",
+        2,
+    )
+    content = b"#EXTM3U\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n#EXTINF:1,\nc.ts\n"
+    resp = _FakeResponse(content=content)
+    parser = M3U8Parser(
+        "https://example.com/a.m3u8",
+        headers={},
+        session=_FakeSession(resp),
+    )
+
+    with pytest.raises(ValueError, match="media entry count exceeds"):
+        parser.parse()
+
+
+def test_parse_preflight_counts_auxiliary_objects_before_library_load(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "shared.parsers.m3u8.MAX_M3U8_MEDIA_ENTRIES",
+        2,
+    )
+    content = (
+        b"#EXTM3U\n"
+        b"#EXT-X-DATERANGE:ID=\"a\"\n"
+        b"#EXT-X-MAP:URI=\"init.mp4\"\n"
+        b"#EXT-X-PART:URI=\"part.m4s\",DURATION=1\n"
+    )
+    parser = M3U8Parser(
+        "https://example.com/a.m3u8",
+        headers={},
+        session=_FakeSession(_FakeResponse(content=content)),
+    )
+
+    with pytest.raises(ValueError, match="media entry count exceeds"):
+        parser.parse()
+
+
+def test_parse_preflight_rejects_pathological_raw_line_count(monkeypatch):
+    monkeypatch.setattr(
+        "shared.parsers.m3u8.MAX_M3U8_MEDIA_ENTRIES",
+        1,
+    )
+    content = ("#EXTM3U\n" + "#\n" * 1041).encode("utf-8")
+    parser = M3U8Parser(
+        "https://example.com/a.m3u8",
+        headers={},
+        session=_FakeSession(_FakeResponse(content=content)),
+    )
+
+    with pytest.raises(ValueError, match="raw line count exceeds"):
+        parser.parse()
 
 
 def test_fetch_playlist_raises_on_binary_non_utf8(monkeypatch):

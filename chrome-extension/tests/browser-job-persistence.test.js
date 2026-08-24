@@ -15,7 +15,7 @@ const BACKGROUND_SCRIPT = path.resolve(__dirname, '..', 'background.js');
 
 
 function makeChromeStub({ storageInitial = {}, abortFetchOk = true, dnrFn } = {}) {
-  const storage = { local: { ...storageInitial } };
+  const storage = { local: { ...storageInitial }, session: {} };
   const noop = () => {};
   return {
     runtime: {
@@ -36,6 +36,17 @@ function makeChromeStub({ storageInitial = {}, abortFetchOk = true, dnrFn } = {}
         set: vi.fn(async (obj) => { Object.assign(storage.local, obj); }),
         remove: vi.fn(async (key) => { delete storage.local[key]; }),
         _state: storage.local,
+      },
+      session: {
+        get: vi.fn(async (key) => {
+          if (typeof key === 'string') {
+            return key in storage.session ? { [key]: storage.session[key] } : {};
+          }
+          return { ...storage.session };
+        }),
+        set: vi.fn(async (obj) => { Object.assign(storage.session, obj); }),
+        remove: vi.fn(async (key) => { delete storage.session[key]; }),
+        _state: storage.session,
       },
       sync: { get: (_keys, cb) => cb && cb({}), set: async () => {} },
       onChanged: { addListener: noop },
@@ -72,6 +83,118 @@ function makeChromeStub({ storageInitial = {}, abortFetchOk = true, dnrFn } = {}
     },
   };
 }
+
+
+describe('browser transfer snapshots', () => {
+  it('persists progress and merges the terminal summary without losing timings', async () => {
+    const chrome = makeChromeStub();
+    const ctx = loadBackground({ chrome });
+    await ctx._wv2nasPersistBrowserTransferSnapshot({
+      type: 'BROWSER_JOB_PROGRESS',
+      payload: {
+        jobId: 'job-transfer', done: 3, total: 10, concurrency: 6, ts: Date.now(),
+        transferTimings: { cdn: { bytes: 30 }, nas: { bytes: 20 } },
+      },
+    });
+    await ctx._wv2nasPersistBrowserTransferSnapshot({
+      type: 'BROWSER_JOB_DONE',
+      payload: {
+        jobId: 'job-transfer',
+        summary: {
+          totalSegments: 10,
+          concurrency: 4,
+          transferTimings: { cdn: { bytes: 100 }, nas: { bytes: 100 } },
+        },
+      },
+    });
+
+    const snapshot = chrome.storage.session._state
+      .wv2nasBrowserTransferSnapshots['job-transfer'];
+    expect(snapshot).toMatchObject({
+      jobId: 'job-transfer', done: 10, total: 10, percent: 100,
+      concurrency: 4, terminal: true, failed: false,
+      transferTimings: { cdn: { bytes: 100 }, nas: { bytes: 100 } },
+    });
+  });
+
+  it('preserves last progress counters when a failure only supplies final timings', async () => {
+    const chrome = makeChromeStub();
+    const ctx = loadBackground({ chrome });
+    await ctx._wv2nasPersistBrowserTransferSnapshot({
+      type: 'BROWSER_JOB_PROGRESS',
+      payload: { jobId: 'job-failed', done: 2, total: 8, ts: Date.now() },
+    });
+    await ctx._wv2nasPersistBrowserTransferSnapshot({
+      type: 'BROWSER_JOB_FAILED',
+      payload: {
+        jobId: 'job-failed', concurrency: 5, done: 7, total: 8,
+        transferTimings: { cdn: { failures: 1 }, nas: { failures: 2 } },
+      },
+    });
+
+    expect(chrome.storage.session._state.wv2nasBrowserTransferSnapshots['job-failed'])
+      .toMatchObject({
+        done: 7, total: 8, percent: 87.5, concurrency: 5,
+        terminal: true, failed: true,
+        transferTimings: { cdn: { failures: 1 }, nas: { failures: 2 } },
+      });
+  });
+
+  it('keeps completion sticky when an older fire-and-forget progress event arrives late', async () => {
+    const chrome = makeChromeStub();
+    const ctx = loadBackground({ chrome });
+    const now = Date.now();
+    await ctx._wv2nasPersistBrowserTransferSnapshot({
+      type: 'BROWSER_JOB_DONE',
+      payload: {
+        jobId: 'job-race',
+        summary: {
+          totalSegments: 10, concurrency: 6,
+          transferTimings: {
+            cdn: { bytes: 100, attemptedBytes: 100, requests: 10, failures: 0, requestMs: 500, activeMs: 200, inFlight: 0 },
+            nas: { bytes: 100, attemptedBytes: 110, requests: 11, failures: 1, requestMs: 600, activeMs: 300, inFlight: 0 },
+          },
+        },
+      },
+    });
+    await ctx._wv2nasPersistBrowserTransferSnapshot({
+      type: 'BROWSER_JOB_PROGRESS',
+      payload: {
+        jobId: 'job-race', done: 4, total: 10, concurrency: 6, ts: now - 1000,
+        transferTimings: {
+          cdn: { bytes: 40, attemptedBytes: 40, requests: 4, failures: 0, requestMs: 200, activeMs: 100, inFlight: 2 },
+          nas: { bytes: 40, attemptedBytes: 40, requests: 4, failures: 0, requestMs: 220, activeMs: 120, inFlight: 2 },
+        },
+      },
+    });
+
+    const snapshot = chrome.storage.session._state.wv2nasBrowserTransferSnapshots['job-race'];
+    expect(snapshot).toMatchObject({ terminal: true, failed: false, done: 10, percent: 100 });
+    expect(snapshot.transferTimings.cdn).toMatchObject({ bytes: 100, requests: 10, inFlight: 0 });
+    expect(snapshot.transferTimings.nas).toMatchObject({ bytes: 100, requests: 11, failures: 1, inFlight: 0 });
+  });
+
+  it('prunes expired entries and bounds the session map to 30 jobs', async () => {
+    const chrome = makeChromeStub();
+    const ctx = loadBackground({ chrome });
+    const now = Date.now();
+    chrome.storage.session._state.wv2nasBrowserTransferSnapshots = {
+      expired: { jobId: 'expired', ts: now - 25 * 60 * 60 * 1000 },
+    };
+    for (let i = 0; i < 31; i += 1) {
+      await ctx._wv2nasPersistBrowserTransferSnapshot({
+        type: 'BROWSER_JOB_PROGRESS',
+        payload: { jobId: `job-${i}`, done: i, total: 31, ts: now + i },
+      });
+    }
+
+    const snapshots = chrome.storage.session._state.wv2nasBrowserTransferSnapshots;
+    expect(Object.keys(snapshots)).toHaveLength(30);
+    expect(snapshots.expired).toBeUndefined();
+    expect(snapshots['job-30']).toBeDefined();
+    expect(snapshots['job-0']).toBeUndefined();
+  });
+});
 
 
 function loadBackground({ chrome, fetchStub }) {

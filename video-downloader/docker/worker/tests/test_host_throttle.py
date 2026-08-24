@@ -13,7 +13,13 @@ import time
 import pytest
 
 import host_throttle
-from host_throttle import HostThrottle, _LUA_TRY_ACQUIRE, parse_overrides
+from host_throttle import (
+    HostThrottle,
+    HostThrottleCancelled,
+    HostThrottleCapacityTimeout,
+    _LUA_TRY_ACQUIRE,
+    parse_overrides,
+)
 
 
 class _FakeRedis:
@@ -146,6 +152,47 @@ def test_acquire_times_out_returns_false():
     elapsed = time.monotonic() - start
     assert result is False
     assert 0.2 <= elapsed < 1.5, f"Expected ~0.3s timeout, got {elapsed}s"
+
+
+def test_strict_acquire_times_out_instead_of_bypassing_cap():
+    redis = _FakeRedis()
+    throttle = HostThrottle(redis, default_cap=1, max_wait=0.1)
+    assert throttle.acquire("https://host.test/x") is True
+
+    with pytest.raises(HostThrottleCapacityTimeout):
+        throttle.acquire("https://host.test/y", fail_open=False)
+
+    # Only the original holder owns a slot; the timed-out request did not
+    # create an over-cap connection.
+    assert redis.store["host_inflight:host.test"] == 1
+
+
+def test_acquire_wait_is_interruptible_by_stop_event():
+    redis = _FakeRedis()
+    throttle = HostThrottle(redis, default_cap=1, max_wait=5.0)
+    assert throttle.acquire("https://host.test/x") is True
+    stop = threading.Event()
+    result = []
+
+    def wait_for_slot():
+        try:
+            throttle.acquire(
+                "https://host.test/y",
+                stop_event=stop,
+                fail_open=False,
+            )
+        except BaseException as exc:
+            result.append(exc)
+
+    thread = threading.Thread(target=wait_for_slot)
+    thread.start()
+    time.sleep(0.05)
+    stop.set()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert len(result) == 1
+    assert isinstance(result[0], HostThrottleCancelled)
 
 
 def test_release_decrements_and_clamps_negative():

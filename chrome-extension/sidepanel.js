@@ -25,10 +25,24 @@ let jobs = [];
 // progress for browser-side jobs, so we keep our own map here and
 // re-apply it after every loadRecentJobs() poll (which would
 // otherwise overwrite job.progress with the API's stale 0).
-const liveBrowserProgress = new Map();  // jobId(string) → { done, total, percent }
+const liveBrowserProgress = new Map();  // jobId → progress + CDN/NAS transfer timings
+const BROWSER_TRANSFER_SNAPSHOT_KEY = 'wv2nasBrowserTransferSnapshots';
+const LIVE_BROWSER_PROGRESS_TTL_MS = 5 * 60 * 1000;
+const TERMINAL_BROWSER_TRANSFER_TTL_MS = 24 * 60 * 60 * 1000;
+const BROWSER_LIVE_RETAIN_STATUSES = new Set([
+  'browser_pending', 'browser_uploading', 'browser_finalizing', 'pending',
+]);
+const BROWSER_JOB_PHASE = {
+  browser_pending: 0,
+  browser_uploading: 1,
+  browser_finalizing: 2,
+  // After browser finalize succeeds the API queues the NAS worker as pending.
+  pending: 3,
+};
 let expandedErrorIds = new Set();
 let activeTabId = null;
 let loadDetectedUrlsSeq = 0;
+let loadRecentJobsSeq = 0;
 
 // Design state
 let theme = 'dark';
@@ -358,28 +372,263 @@ function handleBrowserJobProgress(message) {
   const total = Number(message.total) || 0;
   const done = Number(message.done) || 0;
   const percent = total > 0 ? Math.min(100, (done / total) * 100) : 0;
-  liveBrowserProgress.set(idStr, { done, total, percent });
+  const transferTimings = normalizeBrowserTransferTimings(message.transferTimings);
+  const concurrency = Number.isInteger(Number(message.concurrency))
+    ? Number(message.concurrency)
+    : null;
+  const live = mergeLiveBrowserProgress(liveBrowserProgress.get(idStr), {
+    done, total, percent, transferTimings, concurrency,
+  });
+  liveBrowserProgress.set(idStr, live);
 
   const job = jobs.find((j) => String(j.id) === idStr);
   if (!job) return;
-  // Promote browser_pending → browser_uploading once the first
-  // segment lands. The API status update may lag; the user-visible
-  // progress should kick in on the first event.
-  if (job.status === 'browser_pending') job.status = 'browser_uploading';
-  job.progress = percent;
+  const acceptsLiveProgress = BROWSER_LIVE_RETAIN_STATUSES.has(job.status);
+  if (acceptsLiveProgress) {
+    // Promote browser_pending → browser_uploading once the first segment
+    // lands. Later browser/finalize/pending phases remain monotonic.
+    if (job.status === 'browser_pending') job.status = 'browser_uploading';
+    job.progress = Math.max(Number(job.progress) || 0, live.percent);
+  } else {
+    // A late runtime event may arrive after the API poll painted a worker or
+    // terminal state. Keep diagnostics, but never overwrite API progress.
+    live.terminal = true;
+  }
+  if (live.transferTimings) job.browserTransferTimings = live.transferTimings;
+  if (live.concurrency) job.browserConcurrency = live.concurrency;
 
   const itemEl = document.getElementById(`job-${idStr}`);
   if (!itemEl) return;
   const oldStatus = itemEl.dataset.status;
   itemEl.dataset.status = job.status;
   itemEl.dataset.progress = String(job.progress);
-  if (shouldFullRender(oldStatus, job.status)) {
+  const needsTransferRender = !!browserTransferMeta(job)
+    && !itemEl.querySelector('[data-browser-transfer]');
+  if (shouldFullRender(oldStatus, job.status) || needsTransferRender) {
     itemEl.innerHTML = getJobInnerHtml(job);
     bindJobEvents(itemEl, idStr);
   } else {
     updateJobElement(itemEl, job);
   }
-  startTween(itemEl, idStr, percent);
+  if (isActiveStatus(job.status)) startTween(itemEl, idStr, job.progress);
+  else stopTween(idStr);
+}
+
+function normalizeBrowserTransferTimings(value) {
+  if (!value || typeof value !== 'object') return null;
+  const normalizeStage = (stage) => {
+    if (!stage || typeof stage !== 'object') return null;
+    const number = (key) => {
+      const parsed = Number(stage[key]);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    };
+    return {
+      bytes: number('bytes'),
+      attemptedBytes: number('attemptedBytes'),
+      requests: number('requests'),
+      failures: number('failures'),
+      cancelled: number('cancelled'),
+      inFlight: number('inFlight'),
+      requestMs: number('requestMs'),
+      activeMs: number('activeMs'),
+      mbPerSecond: number('mbPerSecond'),
+    };
+  };
+  const cdn = normalizeStage(value.cdn);
+  const nas = normalizeStage(value.nas);
+  return cdn && nas ? { cdn, nas } : null;
+}
+
+function mergeTransferStage(previous, incoming) {
+  if (!previous) return incoming;
+  if (!incoming) return previous;
+  const cumulativeKeys = [
+    'bytes', 'attemptedBytes', 'requests', 'failures', 'cancelled',
+    'requestMs', 'activeMs',
+  ];
+  const merged = {};
+  for (const key of cumulativeKeys) {
+    merged[key] = Math.max(Number(previous[key]) || 0, Number(incoming[key]) || 0);
+  }
+  // inFlight may legitimately fall. Only accept it from a snapshot whose
+  // cumulative counters dominate the previous one; stale events cannot make
+  // a finished transfer look active again.
+  const incomingIsFresh = cumulativeKeys.every(
+    (key) => (Number(incoming[key]) || 0) >= (Number(previous[key]) || 0),
+  );
+  merged.inFlight = incomingIsFresh
+    ? Number(incoming.inFlight) || 0
+    : Number(previous.inFlight) || 0;
+  merged.mbPerSecond = merged.activeMs > 0
+    ? (merged.bytes / (1024 * 1024)) / (merged.activeMs / 1000)
+    : 0;
+  return merged;
+}
+
+function mergeLiveBrowserProgress(previous, incoming) {
+  const normalizedIncoming = normalizeBrowserTransferTimings(incoming && incoming.transferTimings);
+  if (!previous) {
+    return {
+      done: Number(incoming && incoming.done) || 0,
+      total: Number(incoming && incoming.total) || 0,
+      percent: Number(incoming && incoming.percent) || 0,
+      transferTimings: normalizedIncoming,
+      concurrency: Number(incoming && incoming.concurrency) || null,
+      updatedAt: Number(incoming && (incoming.updatedAt || incoming.ts)) || Date.now(),
+      terminal: !!(incoming && incoming.terminal),
+      failed: !!(incoming && incoming.failed),
+    };
+  }
+  const previousTimings = normalizeBrowserTransferTimings(previous.transferTimings);
+  const done = Math.max(Number(previous.done) || 0, Number(incoming && incoming.done) || 0);
+  const total = Math.max(Number(previous.total) || 0, Number(incoming && incoming.total) || 0);
+  const computedPercent = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+  const transferTimings = previousTimings && normalizedIncoming
+    ? {
+        cdn: mergeTransferStage(previousTimings.cdn, normalizedIncoming.cdn),
+        nas: mergeTransferStage(previousTimings.nas, normalizedIncoming.nas),
+      }
+    : (normalizedIncoming || previousTimings);
+  return {
+    done,
+    total,
+    percent: Math.max(Number(previous.percent) || 0, Number(incoming && incoming.percent) || 0, computedPercent),
+    transferTimings,
+    concurrency: Math.max(
+      Number(previous.concurrency) || 0,
+      Number(incoming && incoming.concurrency) || 0,
+    ) || null,
+    updatedAt: Math.max(
+      Number(previous.updatedAt) || 0,
+      Number(incoming && (incoming.updatedAt || incoming.ts)) || Date.now(),
+    ),
+    terminal: !!(previous.terminal || (incoming && incoming.terminal)),
+    // Terminal failure is sticky. A delayed PROGRESS event carries no failed
+    // bit and must not turn a completed failure back into an active transfer.
+    failed: !!(previous.failed || (incoming && incoming.failed)),
+  };
+}
+
+async function mergePersistedBrowserTransferSnapshots() {
+  const sessionStorage = typeof chrome !== 'undefined'
+    && chrome.storage
+    && chrome.storage.session;
+  if (!sessionStorage || typeof sessionStorage.get !== 'function') return;
+  try {
+    const stored = await sessionStorage.get(BROWSER_TRANSFER_SNAPSHOT_KEY);
+    const snapshots = stored && stored[BROWSER_TRANSFER_SNAPSHOT_KEY];
+    if (!snapshots || typeof snapshots !== 'object') return;
+    for (const [jobId, snapshot] of Object.entries(snapshots)) {
+      if (!snapshot || typeof snapshot !== 'object') continue;
+      const idStr = String(jobId);
+      const snapshotTs = Number(snapshot.ts) || 0;
+      const snapshotTtl = snapshot.terminal
+        ? TERMINAL_BROWSER_TRANSFER_TTL_MS
+        : LIVE_BROWSER_PROGRESS_TTL_MS;
+      if (snapshotTs > 0 && Date.now() - snapshotTs > snapshotTtl) {
+        continue;
+      }
+      const current = liveBrowserProgress.get(idStr);
+      liveBrowserProgress.set(idStr, mergeLiveBrowserProgress(current, {
+        done: snapshot.done,
+        total: snapshot.total,
+        percent: snapshot.percent,
+        concurrency: snapshot.concurrency,
+        transferTimings: snapshot.transferTimings,
+        ts: snapshotTs,
+        terminal: snapshot.terminal,
+        failed: snapshot.failed,
+      }));
+    }
+  } catch (error) {
+    // storage.session is unavailable in some test/older browser contexts;
+    // live runtime messages still provide progress in that case.
+    console.warn('Failed to load browser transfer snapshots:', error);
+  }
+}
+
+function mergeBrowserJobWithLive(apiJob, live, previousJob) {
+  if (!live) return apiJob;
+  const merged = { ...apiJob };
+  const apiStillInBrowserTransfer = apiJob.status === 'browser_pending'
+    || apiJob.status === 'browser_uploading'
+    || apiJob.status === 'browser_finalizing';
+  if (live.terminal && live.failed && apiStillInBrowserTransfer) {
+    // The offscreen transfer has definitively stopped. The abort request may
+    // be waiting for NAS connectivity, so its API row can temporarily remain
+    // in a browser_* state; do not render that terminal snapshot as uploading.
+    merged.status = 'failed';
+  } else {
+    const candidates = [apiJob.status, previousJob && previousJob.status, 'browser_uploading']
+      .filter((status) => Object.prototype.hasOwnProperty.call(BROWSER_JOB_PHASE, status));
+    if (candidates.length > 0) {
+      merged.status = candidates.reduce((latest, status) => (
+        BROWSER_JOB_PHASE[status] > BROWSER_JOB_PHASE[latest] ? status : latest
+      ));
+    }
+  }
+  merged.progress = Math.max(
+    Number(apiJob.progress) || 0,
+    Number(previousJob && previousJob.progress) || 0,
+    Number(live.percent) || 0,
+  );
+  if (live.transferTimings) merged.browserTransferTimings = live.transferTimings;
+  if (live.concurrency) merged.browserConcurrency = live.concurrency;
+  return merged;
+}
+
+function mergeBrowserTransferOnly(apiJob, live) {
+  const merged = { ...apiJob };
+  if (live && live.transferTimings) merged.browserTransferTimings = live.transferTimings;
+  if (live && live.concurrency) merged.browserConcurrency = live.concurrency;
+  return merged;
+}
+
+function compactTransferRate(value) {
+  const rate = Number(value);
+  if (!Number.isFinite(rate) || rate <= 0) return '0';
+  return rate < 10 ? rate.toFixed(2) : rate.toFixed(1);
+}
+
+function browserTransferMeta(job) {
+  const timings = normalizeBrowserTransferTimings(job && job.browserTransferTimings);
+  const hasActivity = (stage) => (
+    stage.bytes > 0
+    || stage.attemptedBytes > 0
+    || stage.requests > 0
+    || stage.failures > 0
+    || stage.cancelled > 0
+    || stage.inFlight > 0
+  );
+  if (!timings || (!hasActivity(timings.cdn) && !hasActivity(timings.nas))) return null;
+  const toMb = (bytes) => (bytes / (1024 * 1024)).toFixed(1);
+  const toSeconds = (ms) => (ms / 1000).toFixed(1);
+  const concurrency = Number(job && job.browserConcurrency) || 0;
+  const stageTitle = (stageKey, stage) => t('job.transfer.detail', {
+    stage: t(`job.transfer.stage.${stageKey}`),
+    mb: toMb(stage.bytes),
+    attemptedMb: toMb(stage.attemptedBytes),
+    active: toSeconds(stage.activeMs),
+    request: toSeconds(stage.requestMs),
+    requests: stage.requests,
+    failures: stage.failures,
+    cancelled: stage.cancelled,
+    inFlight: stage.inFlight,
+  });
+  const cdnLabel = t('job.transfer.stage.cdn');
+  const nasLabel = t('job.transfer.stage.nas');
+  return {
+    // Keep the two wall clocks visible instead of hiding them in the hover /
+    // expanded diagnostics. `activeMs` measures elapsed wall time with at
+    // least one request in that stage, so parallel requests are not summed.
+    label: `${cdnLabel} ${compactTransferRate(timings.cdn.mbPerSecond)} MB/s · ${toSeconds(timings.cdn.activeMs)}s | ${nasLabel} ${compactTransferRate(timings.nas.mbPerSecond)} MB/s · ${toSeconds(timings.nas.activeMs)}s`,
+    title: [
+      stageTitle('cdn', timings.cdn),
+      stageTitle('nas', timings.nas),
+      concurrency > 0 ? t('job.transfer.concurrency', { concurrency }) : null,
+      t('job.transfer.retryHint'),
+    ].filter(Boolean).join(' · '),
+  };
 }
 
 function setupEventListeners() {
@@ -797,17 +1046,25 @@ function normalizeQualityFilter() {
   }
 }
 
-// Browser-side play-first gate. HLS / DASH downloads need the
+// Browser-side play-first gate. HLS / DASH manifest downloads need the
 // browser session's just-issued (often IP-bound, expiring-in-
 // minutes) token; the page's player typically only requests it
 // at the moment it calls play(). Sending before that gives the
 // extension a stale URL and the segments 403. Doesn't apply to
-// MP4 (NAS-direct, the URL is the auth material) or when the
-// user has explicitly disabled useBrowserSide.
+// complete JSON DASH track pairs (their intercepted URLs are the
+// auth material), MP4 (NAS-direct), or when the user has explicitly
+// disabled useBrowserSide.
 function urlInfoRequiresPlayFirst(urlInfo) {
   if (!urlInfo || !urlInfo.url) return false;
   const browserSideOn = !settings || settings.useBrowserSide !== false;
   if (!browserSideOn) return false;
+  // Manifest-less JSON DASH rows already contain the complete, freshly
+  // signed video/audio URLs intercepted from the page's play-info response.
+  // They are labelled MPD only for UI/routing compatibility; waiting for a
+  // second matching .m4s request can deadlock after the player has buffered
+  // or when Chrome attributes that request outside the tab. The play-first
+  // gate is only needed for actual manifest URLs that may still be stale.
+  if (urlInfo.directDash) return false;
   const fmt = (urlInfo.detectedFormat || classifyVideoType(urlInfo.url) || '').toUpperCase();
   if (fmt !== 'M3U8' && fmt !== 'MPD') return false;
   if (urlInfo.playbackObserved) return false;
@@ -1383,6 +1640,9 @@ async function sendToNAS(url, pageUrl) {
 
 // ---------- Jobs ----------
 async function loadRecentJobs() {
+  const requestSeq = ++loadRecentJobsSeq;
+  await mergePersistedBrowserTransferSnapshots();
+  if (requestSeq !== loadRecentJobsSeq) return;
   if (!settings.nasEndpoint || !settings.apiKey) return;
 
   try {
@@ -1391,26 +1651,70 @@ async function loadRecentJobs() {
     });
 
     if (response.ok) {
-      jobs = await response.json();
-      // The API returns progress=0 for browser-side uploads (it doesn't
-      // track that phase). Re-apply the live counter we kept from
-      // BROWSER_JOB_PROGRESS pushes so the just-polled `jobs` doesn't
-      // visually snap back to 0% mid-upload. Drop entries for jobs no
-      // longer in the uploading state to bound the map.
-      const livePresentIds = new Set();
-      for (const job of jobs) {
-        const idStr = String(job.id);
-        if (job.status === 'browser_uploading') {
-          const live = liveBrowserProgress.get(idStr);
-          if (live) {
-            job.progress = live.percent;
-            livePresentIds.add(idStr);
-          }
+      const apiJobs = await response.json();
+      // Ignore an older overlapping poll that completed after a newer one.
+      if (requestSeq !== loadRecentJobsSeq) return;
+      // A transfer may advance while the API request is in flight. Merge the
+      // SW-persisted snapshot again so this poll cannot paint an older value.
+      await mergePersistedBrowserTransferSnapshots();
+      if (requestSeq !== loadRecentJobsSeq) return;
+
+      const previousJobs = jobs;
+      const previousById = new Map(previousJobs.map((job) => [String(job.id), job]));
+      const apiIds = new Set(apiJobs.map((job) => String(job.id)));
+      const now = Date.now();
+      // Polling is not liveness. Drop stale client-only overlays before they
+      // can promote an API browser_pending row or revive old progress.
+      for (const [id, live] of Array.from(liveBrowserProgress.entries())) {
+        const ttl = live.terminal
+          ? TERMINAL_BROWSER_TRANSFER_TTL_MS
+          : LIVE_BROWSER_PROGRESS_TTL_MS;
+        if (now - (Number(live.updatedAt) || 0) > ttl) {
+          liveBrowserProgress.delete(id);
         }
       }
-      for (const id of Array.from(liveBrowserProgress.keys())) {
-        if (!livePresentIds.has(id)) liveBrowserProgress.delete(id);
+      const mergedJobs = [];
+      for (const apiJob of apiJobs) {
+        let job = apiJob;
+        const idStr = String(job.id);
+        const live = liveBrowserProgress.get(idStr);
+        if (live && BROWSER_LIVE_RETAIN_STATUSES.has(apiJob.status)) {
+          job = mergeBrowserJobWithLive(apiJob, live, previousById.get(idStr));
+        } else if (live) {
+          // Keep final transfer diagnostics on downstream/terminal API rows,
+          // but never let the browser snapshot override their status/progress.
+          job = mergeBrowserTransferOnly(apiJob, live);
+          if (!live.terminal) {
+            live.terminal = true;
+            live.updatedAt = now;
+          }
+        }
+        mergedJobs.push(job);
       }
+
+      // The API row can briefly be absent while create/finalize commits, or
+      // because limit=20 races a busy queue. Preserve an already-rendered
+      // active browser row until the live snapshot expires instead of
+      // pruning it on one poll.
+      for (const previousJob of previousJobs) {
+        const idStr = String(previousJob.id);
+        if (apiIds.has(idStr)) continue;
+        const live = liveBrowserProgress.get(idStr);
+        if (!live) continue;
+        if (now - (Number(live.updatedAt) || 0) <= LIVE_BROWSER_PROGRESS_TTL_MS
+            && BROWSER_LIVE_RETAIN_STATUSES.has(previousJob.status)) {
+          mergedJobs.push(mergeBrowserJobWithLive(previousJob, live, previousJob));
+        }
+      }
+      for (const [id, live] of Array.from(liveBrowserProgress.entries())) {
+        const ttl = live.terminal
+          ? TERMINAL_BROWSER_TRANSFER_TTL_MS
+          : LIVE_BROWSER_PROGRESS_TTL_MS;
+        if (now - (Number(live.updatedAt) || 0) > ttl) {
+          liveBrowserProgress.delete(id);
+        }
+      }
+      jobs = mergedJobs;
       renderJobs();
     }
   } catch (error) {
@@ -1563,6 +1867,7 @@ function getJobInnerHtml(job) {
   const statusTooltip = (job.status === 'completed' && typeof job.duration === 'number')
     ? t('job.duration', { duration: formatDuration(job.duration) })
     : '';
+  const browserTransfer = browserTransferMeta(job);
   // Colour by source URL format (m3u8/mp4/mpd…) so jobs of the same
    // type share a colour — see FORMAT_HUE.
   const tone = thumbColorForUrl(job.url || job.title || String(job.id));
@@ -1583,7 +1888,7 @@ function getJobInnerHtml(job) {
     <div class="job-thumb" style="background:${tone}"></div>
     <div class="job-body">
       <div class="job-title" title="${escapeHtml(job.title)}"${statusTooltip ? ` data-tip="${escapeHtml(statusTooltip)}"` : ''}>${
-        job.mode === 'browser' ? '<span class="mode-badge mode-browser" title="Downloaded in browser session (v2.5)">browser</span>' : ''
+        job.mode === 'browser' ? `<span class="mode-badge mode-browser" title="${escapeHtml(t('job.browserMode.title'))}">browser</span>` : ''
       }${escapeHtml(job.title)}</div>
       <div class="job-meta status-${escapeHtml(job.status)}">
         <span class="status-text" data-status-text>${escapeHtml(jobStatusLabel(job))}</span>
@@ -1591,6 +1896,7 @@ function getJobInnerHtml(job) {
         ${job.size ? `<span class="meta-sep"> · </span><span>${escapeHtml(String(job.size))}</span>` : ''}
         ${job.when ? `<span class="meta-sep"> · </span><span>${escapeHtml(String(job.when))}</span>` : ''}
       </div>
+      ${browserTransfer ? `<details class="job-transfer" data-browser-transfer><summary data-transfer-label title="${escapeHtml(browserTransfer.title)}" aria-label="${escapeHtml(browserTransfer.title)}">${escapeHtml(browserTransfer.label)}</summary><div class="job-transfer-detail" data-transfer-detail>${escapeHtml(browserTransfer.title)}</div></details>` : ''}
       ${showProgress ? `
         <div class="job-bar" data-job-bar>
           <div class="job-bar-fill" data-bar-fill style="width:${Number(job.progress)||0}%; background:${ringStrokeForStatus(job.status)}"></div>
@@ -1710,6 +2016,18 @@ function updateJobElement(el, job) {
     if (statusEl) statusEl.textContent = jobStatusLabel(job);
     const speedEl = meta.querySelector('[data-speed]');
     if (speedEl && job.speed != null) speedEl.textContent = `${job.speed} MB/s`;
+  }
+  const transferEl = el.querySelector('[data-browser-transfer]');
+  const transfer = browserTransferMeta(job);
+  if (transferEl && transfer) {
+    const transferLabel = transferEl.querySelector('[data-transfer-label]');
+    const transferDetail = transferEl.querySelector('[data-transfer-detail]');
+    if (transferLabel) {
+      transferLabel.textContent = transfer.label;
+      transferLabel.title = transfer.title;
+      transferLabel.setAttribute('aria-label', transfer.title);
+    }
+    if (transferDetail) transferDetail.textContent = transfer.title;
   }
   // Progress color tracks status, so a transition between two
   // ACTIVE statuses (e.g. browser_pending → browser_uploading,

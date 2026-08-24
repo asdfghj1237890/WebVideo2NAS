@@ -75,6 +75,14 @@ end
 _DEFAULT_MAX_WAIT = 600.0  # 10 minutes
 
 
+class HostThrottleCancelled(RuntimeError):
+    """A caller cancelled while waiting for a per-host slot."""
+
+
+class HostThrottleCapacityTimeout(RuntimeError):
+    """The configured hard cap stayed full for the whole wait window."""
+
+
 def parse_overrides(raw: str) -> List[Tuple[str, int]]:
     """Parse the HOST_CONCURRENCY_OVERRIDES env value into [(suffix, cap), ...].
 
@@ -199,12 +207,21 @@ class HostThrottle:
             self._redis.eval(_LUA_TRY_ACQUIRE, 1, key, cap, self._ttl)
         )
 
-    def acquire(self, url_or_host: str) -> bool:
+    def acquire(
+        self,
+        url_or_host: str,
+        *,
+        stop_event=None,
+        should_cancel=None,
+        fail_open: bool = True,
+    ) -> bool:
         """Block until a slot is available for this host.
 
         Returns True if a slot was acquired (caller MUST call release()),
         False if no cap applies / Redis errored / max_wait elapsed (caller
-        proceeds without a slot, MUST NOT call release).
+        proceeds without a slot, MUST NOT call release). Worker download paths
+        pass ``fail_open=False`` so a saturated configured cap remains a hard
+        ceiling instead of releasing a thundering herd after max_wait.
         """
         host = self._extract_host(url_or_host)
         if not host:
@@ -218,6 +235,14 @@ class HostThrottle:
         backoff = 0.05  # 50ms initial
         warned_timeout = False
         while True:
+            cancelled = (
+                (stop_event is not None and stop_event.is_set())
+                or (should_cancel is not None and should_cancel())
+            )
+            if cancelled:
+                raise HostThrottleCancelled(
+                    f"Cancelled while waiting for host slot on {host}"
+                )
             try:
                 count = self._try_acquire_once(host, cap)
             except Exception as e:
@@ -233,12 +258,32 @@ class HostThrottle:
                 if not warned_timeout:
                     logger.warning(
                         f"HostThrottle timed out waiting for slot on {host} "
-                        f"(cap={cap}); proceeding without throttle. "
+                        f"(cap={cap}); "
+                        f"{'proceeding without throttle' if fail_open else 'failing request'}. "
                         f"Possible counter leak — TTL will reset within {self._ttl}s."
+                    )
+                if not fail_open:
+                    raise HostThrottleCapacityTimeout(
+                        f"Timed out waiting for host concurrency slot on "
+                        f"{host} (cap={cap})"
                     )
                 return False
             sleep_for = min(backoff + random.uniform(0, backoff), 2.0)
-            time.sleep(sleep_for)
+            if stop_event is not None:
+                if stop_event.wait(sleep_for):
+                    raise HostThrottleCancelled(
+                        f"Cancelled while waiting for host slot on {host}"
+                    )
+            elif should_cancel is not None:
+                sleep_deadline = time.monotonic() + sleep_for
+                while time.monotonic() < sleep_deadline:
+                    if should_cancel():
+                        raise HostThrottleCancelled(
+                            f"Cancelled while waiting for host slot on {host}"
+                        )
+                    time.sleep(min(0.1, sleep_deadline - time.monotonic()))
+            else:
+                time.sleep(sleep_for)
             backoff = min(backoff * 1.5, 2.0)
 
     def release(self, url_or_host: str) -> None:

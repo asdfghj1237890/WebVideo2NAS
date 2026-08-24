@@ -265,10 +265,11 @@ Manifest path：
   │  4. Phase-2 DNR：覆蓋 phase-1，把每段 segment / byte range + AES key URI 都加進
   │     CORS-relax / header-spoof scope（cross-site 的不放 CORS-relax）
   │  5. offscreen.js 開 segmentDownloader.runJob：
-  │     - 平行抓 N 段或 Range chunk (concurrency=6 default)
+  │     - 平行抓 N 段或 Range chunk（HLS 預設 6；direct DASH 最多 12，依 API 建議值下修）
   │     - AES-128-CBC decrypt（如果有 key URI）
   │     - PUT 每一段到 /api/jobs/{id}/segments/{track}/{seq}
-  │     - onProgress({done, total}) 觸發 BROWSER_JOB_PROGRESS → SW → sidepanel
+  │     - onProgress({done, total, transferTimings}) 分開累計 CDN fetch / NAS PUT
+  │       active time、request time、bytes 與 throughput，再觸發 progress → SW → sidepanel
   │
   │ ─── POST /api/jobs/{id}/finalize ─────────────────────────────►│
   │                                                                │ status='browser_finalizing'
@@ -352,20 +353,24 @@ masterTrustedForDnr 也諮詢 allowlist — 不然 CORS-relax 沒裝、cross-sit
 NAS API 不追蹤 browser-side 上傳階段的 progress(只有 finalize 之後 worker mux 那段才追)。v3.1 改 extension 自己 push:
 
 ```
-runJob.onProgress({done, total})        ← per media segment / Range chunk in segmentDownloader
+runJob.onProgress({done, total, concurrency, transferTimings})
+                                        ← 每段 / Range chunk；分開量 CDN fetch 與 NAS PUT
   │
 offscreen.js 每 200ms throttle 一次,first/last 強制送
   │ chrome.runtime.sendMessage(BROWSER_JOB_PROGRESS, target=service-worker)
   ▼
 background.js receiver
-  │ chrome.runtime.sendMessage({action: 'browserJobProgress', jobId, done, total})  廣播
+  │ chrome.runtime.sendMessage({action: 'browserJobProgress', jobId, done, total,
+  │                             concurrency, transferTimings})  廣播
   ▼
 sidepanel.js handleBrowserJobProgress
-  │ liveBrowserProgress.set(jobId, {done, total, percent})
+  │ liveBrowserProgress.set(jobId, {done, total, percent, concurrency, transferTimings})
   │ 找 jobs[id] → 改 progress + status → updateJobElement → startTween 進度環動畫
 ```
 
-`loadRecentJobs()` 從 NAS API 拿到的 `progress=0`(API 沒這個資訊),render 前重套 `liveBrowserProgress` 蓋回去。Map entry 在 status 不再是 `browser_uploading` 時自動 prune。
+`transferTimings.cdn` 與 `.nas` 各自記錄成功／嘗試 bytes、已完成 request 數、失敗／取消數、in-flight 數、所有 request 的累計等待時間，以及至少一個同類 request 正在執行的 active wall time。NAS PUT retry 與 CDN fetch retry 分離：NAS 暫時失敗時會重用已抓到的 buffer，不再重抓同一個 signed range。側欄單行直接顯示兩段各自的 `MB/s` 與 active 秒數；展開後再看 request time、bytes、錯誤與實際 concurrency。
+
+`loadRecentJobs()` 從 NAS API 拿到的 `progress=0`(API 沒這個資訊),render 前用單調 merge 重套 `liveBrowserProgress`，避免較舊的 poll 或 progress event 倒退狀態。SW 另把最多 30 筆 snapshot 寫進 `chrome.storage.session`：active snapshot 保留 5 分鐘，terminal 診斷保留 24 小時，所以 sidepanel 或 SW 重開後仍能復原。一般 manifest segment 預設 concurrency 6，Direct Range plan 預設最多 12；兩者都會依 API plan 的 `recommended_concurrency` 下修，Direct 另受 staging quota 可容納的 Range 數限制。
 
 ### 8.5 SW 死掉怎麼辦
 

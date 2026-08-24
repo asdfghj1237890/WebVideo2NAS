@@ -126,6 +126,25 @@ def test_job_init_request_accepts_paired_direct_dash(monkeypatch):
     assert request.direct_dash.audio.content_length == 12345
 
 
+@pytest.mark.parametrize("duration", [float("inf"), float("-inf"), float("nan")])
+def test_job_init_request_rejects_non_finite_direct_dash_duration(
+    monkeypatch, duration,
+):
+    api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
+    with pytest.raises(Exception):
+        api_main.JobInitRequest(direct_dash={
+            "video": {
+                "url": "https://cdn.example.com/video.m4s",
+                "content_length": 1,
+            },
+            "audio": {
+                "url": "https://cdn.example.com/audio.m4s",
+                "content_length": 1,
+            },
+            "duration": duration,
+        })
+
+
 def test_job_init_request_rejects_mixed_or_incomplete_direct_dash(monkeypatch):
     api_main = _reload_api_main(monkeypatch, SSRF_GUARD="false")
     paired = {
@@ -189,6 +208,51 @@ seg0.ts
     assert "Unsupported HLS encryption" in resp.text
 
 
+@pytest.mark.parametrize("source", ["manifest_text", "url"])
+def test_init_manifest_budget_is_forwarded_and_maps_to_413(
+    monkeypatch, tmp_path, source,
+):
+    api_main = _reload_api_main(
+        monkeypatch,
+        SSRF_GUARD="false",
+        STAGING_DIR=str(tmp_path),
+        MAX_BROWSER_PLAN_BYTES="1234",
+        MAX_BROWSER_SEGMENTS="77",
+    )
+    import manifest_planner
+
+    observed = {}
+
+    def reject_oversized(*_args, **kwargs):
+        observed["max_plan_bytes"] = kwargs.get("max_plan_bytes")
+        observed["max_segments"] = kwargs.get("max_segments")
+        raise manifest_planner.ManifestPlanTooLargeError("test plan too large")
+
+    if source == "manifest_text":
+        monkeypatch.setattr(manifest_planner, "plan_from_text", reject_oversized)
+        request = api_main.JobInitRequest(
+            manifest_text="#EXTM3U\n#EXTINF:1,\nseg.ts\n",
+            base_url="https://cdn.example.com/playlist.m3u8",
+        )
+    else:
+        monkeypatch.setattr(manifest_planner, "plan_from_url", reject_oversized)
+        request = api_main.JobInitRequest(
+            url="https://cdn.example.com/playlist.m3u8",
+        )
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        api_main.init_browser_job(
+            request=request,
+            db=MagicMock(),
+            api_key="test-key-not-the-default-placeholder",
+        )
+
+    assert exc.value.status_code == 413
+    assert "MAX_BROWSER_PLAN_BYTES=1234" in str(exc.value.detail)
+    assert observed == {"max_plan_bytes": 1234, "max_segments": 77}
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_init_direct_dash_returns_standard_two_track_browser_plan(monkeypatch, tmp_path):
     api_main = _reload_api_main(
         monkeypatch,
@@ -224,8 +288,253 @@ def test_init_direct_dash_returns_standard_two_track_browser_plan(monkeypatch, t
     assert body.plan["container"] == "dash"
     assert set(body.plan["tracks"]) == {"video", "audio"}
     assert body.plan["total_segments"] == 2
+    assert body.plan["recommended_concurrency"] == 12
     assert (tmp_path / body.job_id / "manifest.json").is_file()
     assert db.commit.call_count == 1
+
+
+def test_init_direct_dash_recommendation_respects_server_upload_cap(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(
+        monkeypatch,
+        SSRF_GUARD="false",
+        STAGING_DIR=str(tmp_path),
+        MAX_CONCURRENT_UPLOADS_PER_JOB="4",
+    )
+    monkeypatch.setattr(api_main, "_enforce_plan_url_safety", lambda _plan: None)
+    mib = 1024 * 1024
+    request = api_main.JobInitRequest(direct_dash={
+        "video": {
+            "url": "https://cdn.example.com/video.m4s",
+            "content_length": 40 * mib,
+        },
+        "audio": {
+            "url": "https://cdn.example.com/audio.m4s",
+            "content_length": 16 * mib,
+        },
+    })
+
+    body = api_main.init_browser_job(
+        request=request,
+        db=MagicMock(),
+        api_key="test-key-not-the-default-placeholder",
+    )
+
+    assert body.plan["recommended_concurrency"] == 4
+
+
+def test_manifest_recommendation_respects_server_upload_cap(monkeypatch):
+    api_main = _reload_api_main(
+        monkeypatch,
+        MAX_CONCURRENT_UPLOADS_PER_JOB="3",
+    )
+    assert api_main._recommended_manifest_concurrency() == 3
+
+
+@pytest.mark.parametrize("source", ["manifest_text", "url"])
+def test_init_manifest_sources_publish_server_concurrency_recommendation(
+    monkeypatch, tmp_path, source,
+):
+    api_main = _reload_api_main(
+        monkeypatch,
+        SSRF_GUARD="false",
+        STAGING_DIR=str(tmp_path),
+        MAX_CONCURRENT_UPLOADS_PER_JOB="3",
+    )
+    import manifest_planner
+
+    plan = {
+        "container": "hls",
+        "source_url": "https://cdn.example.com/playlist.m3u8",
+        "total_segments": 1,
+        "duration": 1,
+        "tracks": {
+            "video": {
+                "segment_count": 1,
+                "segments": [{
+                    "seq": 0,
+                    "url": "https://cdn.example.com/segment.ts",
+                }],
+            },
+        },
+    }
+    planner = lambda *_args, **_kwargs: dict(plan)
+    if source == "manifest_text":
+        monkeypatch.setattr(manifest_planner, "plan_from_text", planner)
+        request = api_main.JobInitRequest(
+            manifest_text="#EXTM3U\n#EXTINF:1,\nsegment.ts\n",
+            base_url="https://cdn.example.com/playlist.m3u8",
+        )
+    else:
+        monkeypatch.setattr(manifest_planner, "plan_from_url", planner)
+        request = api_main.JobInitRequest(
+            url="https://cdn.example.com/playlist.m3u8",
+        )
+    monkeypatch.setattr(api_main, "_enforce_plan_url_safety", lambda _plan: None)
+    monkeypatch.setattr(api_main, "_staged_bytes_get", lambda *_args: 0)
+
+    body = api_main.init_browser_job(
+        request=request,
+        db=MagicMock(),
+        api_key="test-key-not-the-default-placeholder",
+    )
+
+    assert body.plan["recommended_concurrency"] == 3
+    persisted = (tmp_path / body.job_id / "manifest.json").read_text(
+        encoding="utf-8",
+    )
+    assert '"recommended_concurrency": 3' in persisted
+
+
+def test_manifest_recommendation_rejects_nonpositive_server_cap(monkeypatch):
+    api_main = _reload_api_main(
+        monkeypatch,
+        MAX_CONCURRENT_UPLOADS_PER_JOB="0",
+    )
+    with pytest.raises(ValueError, match="must be positive"):
+        api_main._recommended_manifest_concurrency()
+
+
+def test_init_direct_dash_recommendation_respects_custom_staging_quota(
+    monkeypatch, tmp_path,
+):
+    mib = 1024 * 1024
+    api_main = _reload_api_main(
+        monkeypatch,
+        SSRF_GUARD="false",
+        STAGING_DIR=str(tmp_path),
+        MAX_JOB_STAGING_BYTES=str(21 * mib),
+        MAX_CONCURRENT_UPLOADS_PER_JOB="12",
+    )
+    monkeypatch.setattr(api_main, "_enforce_plan_url_safety", lambda _plan: None)
+    request = api_main.JobInitRequest(direct_dash={
+        "video": {
+            "url": "https://cdn.example.com/video.m4s",
+            "content_length": 12 * mib,
+        },
+        "audio": {
+            "url": "https://cdn.example.com/audio.m4s",
+            "content_length": 8 * mib,
+        },
+    })
+
+    body = api_main.init_browser_job(
+        request=request,
+        db=MagicMock(),
+        api_key="test-key-not-the-default-placeholder",
+    )
+
+    # Largest actual planned range is 8 MiB: only two worst-case ranges fit
+    # the deployment's 21 MiB quota concurrently.
+    assert body.plan["recommended_concurrency"] == 2
+
+
+def test_init_direct_dash_counts_manifest_against_exact_media_quota(
+    monkeypatch, tmp_path,
+):
+    mib = 1024 * 1024
+    api_main = _reload_api_main(
+        monkeypatch,
+        SSRF_GUARD="false",
+        STAGING_DIR=str(tmp_path),
+        MAX_JOB_STAGING_BYTES=str(20 * mib),
+    )
+    monkeypatch.setattr(api_main, "_enforce_plan_url_safety", lambda _plan: None)
+    request = api_main.JobInitRequest(direct_dash={
+        "video": {
+            "url": "https://cdn.example.com/video.m4s",
+            "content_length": 12 * mib,
+        },
+        "audio": {
+            "url": "https://cdn.example.com/audio.m4s",
+            "content_length": 8 * mib,
+        },
+    })
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        api_main.init_browser_job(
+            request=request,
+            db=MagicMock(),
+            api_key="test-key-not-the-default-placeholder",
+        )
+
+    assert exc.value.status_code == 413
+    assert "media plus manifest" in str(exc.value.detail)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_init_direct_dash_rejects_oversized_estimated_plan_before_materializing(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(
+        monkeypatch,
+        SSRF_GUARD="false",
+        STAGING_DIR=str(tmp_path),
+        MAX_SEGMENT_BYTES="1",
+        MAX_BROWSER_PLAN_BYTES="1024",
+    )
+    monkeypatch.setattr(api_main, "_enforce_plan_url_safety", lambda _plan: None)
+
+    import manifest_planner
+    called = False
+
+    def must_not_materialize(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("oversized plan was materialized")
+
+    monkeypatch.setattr(manifest_planner, "plan_direct_dash", must_not_materialize)
+    request = api_main.JobInitRequest(direct_dash={
+        "video": {
+            "url": "https://cdn.example.com/video.m4s?" + "x" * 500,
+            "content_length": 100,
+        },
+        "audio": {
+            "url": "https://cdn.example.com/audio.m4s?" + "y" * 500,
+            "content_length": 100,
+        },
+    })
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        api_main.init_browser_job(
+            request=request,
+            db=MagicMock(),
+            api_key="test-key-not-the-default-placeholder",
+        )
+
+    assert exc.value.status_code == 413
+    assert "Estimated direct DASH plan" in str(exc.value.detail)
+    assert called is False
+
+
+def test_direct_dash_preflight_does_not_false_reject_small_custom_plan_cap(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(
+        monkeypatch,
+        SSRF_GUARD="false",
+        STAGING_DIR=str(tmp_path),
+        MAX_BROWSER_PLAN_BYTES="10000",
+    )
+    monkeypatch.setattr(api_main, "_enforce_plan_url_safety", lambda _plan: None)
+    request = api_main.JobInitRequest(direct_dash={
+        "video": {
+            "url": "https://cdn.example.com/v.m4s",
+            "content_length": 1,
+        },
+        "audio": {
+            "url": "https://cdn.example.com/a.m4s",
+            "content_length": 1,
+        },
+    })
+
+    body = api_main.init_browser_job(
+        request=request,
+        db=MagicMock(),
+        api_key="test-key-not-the-default-placeholder",
+    )
+    assert body.plan["total_segments"] == 2
 
 
 # --- Codex review fix #1: finalize completeness check -----------------------
@@ -287,6 +596,118 @@ def test_verify_staging_complete_rejects_byte_range_size_mismatch(monkeypatch, t
     assert exc.value.detail["size_mismatch"] == {
         "video": [{"seq": 0, "expected": 8, "actual": 5}],
     }
+
+
+@pytest.mark.parametrize(
+    "actual_size,should_pass",
+    [(15, False), (16, True), (31, True), (32, False)],
+)
+def test_verify_staging_complete_enforces_aes_plaintext_length_interval(
+    monkeypatch, tmp_path, actual_size, should_pass,
+):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    staging = tmp_path / "11111111-2222-3333-4444-555555555555"
+    plan = {
+        "container": "hls",
+        "tracks": {"video": {
+            "segment_count": 1,
+            "segments": [{
+                "seq": 0,
+                "byte_range": {"offset": 0, "length": 32},
+                "key": {"method": "AES-128", "uri": "https://example.com/key"},
+            }],
+        }},
+    }
+    _write_plan(staging, plan)
+    (staging / "video").mkdir()
+    (staging / "video" / "seg_00000000.bin").write_bytes(
+        b"x" * actual_size
+    )
+
+    if should_pass:
+        assert api_main._verify_staging_complete(staging) == {"video": 1}
+    else:
+        with pytest.raises(api_main.HTTPException) as exc:
+            api_main._verify_staging_complete(staging)
+        assert exc.value.status_code == 409
+        assert exc.value.detail["size_mismatch"] == {
+            "video": [{
+                "seq": 0,
+                "expected": {"min": 16, "max": 31},
+                "actual": actual_size,
+            }],
+        }
+
+
+def test_expected_segment_shape_exposes_aes_plaintext_bounds(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    staging = tmp_path / "11111111-2222-3333-4444-555555555555"
+    _write_plan(staging, {
+        "tracks": {"video": {
+            "segment_count": 1,
+            "segments": [{
+                "seq": 0,
+                "byte_range": {"offset": 0, "length": 32},
+                "key": {"method": "AES-128"},
+            }],
+        }},
+    })
+
+    count, lower, upper, exact = api_main._expected_segment_shape_for_track(
+        staging, "video",
+    )
+    assert count == 1
+    assert lower == {0: 16}
+    assert upper == {0: 31}
+    assert exact == set()
+
+
+def test_encrypted_range_upload_rejects_declared_body_below_plaintext_bound(
+    monkeypatch, tmp_path,
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    job_id = "11111111-2222-3333-4444-555555555555"
+    _write_plan(tmp_path / job_id, {
+        "tracks": {"video": {
+            "segment_count": 1,
+            "segments": [{
+                "seq": 0,
+                "byte_range": {"offset": 0, "length": 32},
+                "key": {"method": "AES-128"},
+            }],
+        }},
+    })
+    monkeypatch.setattr(
+        api_main,
+        "_get_browser_job_meta",
+        lambda *_args: SimpleNamespace(
+            status="browser_uploading", total_segments=1,
+        ),
+    )
+    claimed = []
+    monkeypatch.setattr(
+        api_main,
+        "_claim_upload_slot",
+        lambda *_args: claimed.append(True) or 1,
+    )
+
+    class FakeRequest:
+        headers = {"content-length": "15"}
+
+        async def stream(self):
+            pytest.fail("invalid declared length must reject before body read")
+            yield b""
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(api_main.upload_segment(
+            job_id, 0, FakeRequest(), track="video", db=MagicMock(), api_key="x",
+        ))
+    assert exc.value.status_code == 400
+    assert "below planned lower bound 16" in exc.value.detail
+    assert claimed == []
 
 
 def test_verify_staging_complete_rejects_missing_segments(monkeypatch, tmp_path):
@@ -358,6 +779,37 @@ def test_verify_staging_complete_treats_part_file_as_in_flight(monkeypatch, tmp_
     detail = exc.value.detail
     assert "in_flight_partial_files" in detail
     assert any("seg_00000001.bin.part" in name for name in detail["in_flight_partial_files"])
+
+
+def test_verify_staging_complete_rejects_active_upload_without_part_file(
+    monkeypatch, tmp_path,
+):
+    """A no-hardlink publish removes its source part at rename time.
+
+    The Redis upload token remains authoritative through staged-byte
+    accounting, so finalize must reject the token itself rather than relying
+    exclusively on a visible .part or publish-lock pathname.
+    """
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    staging = tmp_path / "job"
+    _write_plan(staging, {
+        "container": "dash",
+        "tracks": {"video": {"segment_count": 1}},
+    })
+    (staging / "video").mkdir()
+    (staging / "video" / "seg_00000000.bin").write_bytes(b"complete")
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        api_main._verify_staging_complete(
+            staging,
+            active_upload_tokens={"publisher-token-123456"},
+        )
+
+    assert exc.value.status_code == 409
+    assert any(
+        name.startswith("active-upload:publisher-")
+        for name in exc.value.detail["in_flight_partial_files"]
+    )
 
 
 def test_verify_staging_complete_checks_init_segment(monkeypatch, tmp_path):
@@ -855,35 +1307,1270 @@ def test_plan_url_safety_accepts_all_https(monkeypatch):
 # --- Codex review #9: per-job upload slot + reserved-bytes quota -----
 
 
+class _AtomicCounterRedis:
+    """Small interpreter for main.py's upload coordination Lua scripts."""
+
+    def __init__(
+        self, *, fail_after_increment=False, fail_after_staged_record=False,
+        fail_after_dirty_set=False, fail_release_before=False,
+        fail_release_after=False,
+    ):
+        self.values = {}
+        self.expirations = {}
+        self.lease_amounts = {}
+        self.lease_deadlines = {}
+        self.now = 1000
+        self.max_reserved = 0
+        self.fail_after_increment = fail_after_increment
+        self.fail_after_staged_record = fail_after_staged_record
+        self.fail_after_dirty_set = fail_after_dirty_set
+        self.fail_release_before = fail_release_before
+        self.fail_release_after = fail_release_after
+
+    def _prune_leases(self, lease_key, staged_key, dirty_key, dirty_ttl):
+        amounts = self.lease_amounts.setdefault(lease_key, {})
+        deadlines = self.lease_deadlines.setdefault(lease_key, {})
+        expired = [
+            token for token, deadline in deadlines.items()
+            if deadline <= self.now
+        ]
+        if any(amounts.get(token, 0) != 0 for token in expired):
+            self.values[dirty_key] = 1
+            self.expirations[dirty_key] = int(dirty_ttl)
+            self.values.pop(staged_key, None)
+        for token in expired:
+            amounts.pop(token, None)
+            deadlines.pop(token, None)
+        if not amounts:
+            self.lease_amounts.pop(lease_key, None)
+            self.lease_deadlines.pop(lease_key, None)
+        return amounts, deadlines
+
+    def eval(self, script, numkeys, key, *args):
+        keys = [key, *args[:numkeys - 1]]
+        argv = args[numkeys - 1:]
+        if "wv2nas:upload-lease-claim-v2" in script:
+            lease_key, staged_key, dirty_key = keys
+            token, lease_seconds, key_ttl, cap, dirty_ttl = argv
+            amounts, deadlines = self._prune_leases(
+                lease_key, staged_key, dirty_key, dirty_ttl,
+            )
+            amounts = self.lease_amounts.setdefault(lease_key, amounts)
+            deadlines = self.lease_deadlines.setdefault(lease_key, deadlines)
+            active_count = sum(1 for amount in amounts.values() if amount >= 0)
+            if str(token) not in amounts and active_count >= int(cap):
+                return int(cap) + 1
+            if amounts.get(str(token), 0) < 0:
+                return int(cap) + 1
+            amounts.setdefault(str(token), 0)
+            deadlines[str(token)] = self.now + int(lease_seconds)
+            self.expirations[lease_key] = int(key_ttl)
+            if self.fail_after_increment:
+                self.fail_after_increment = False
+                raise TimeoutError("response lost after lease claim")
+            return sum(1 for amount in amounts.values() if amount >= 0)
+        if "wv2nas:upload-lease-reserve-v2" in script:
+            lease_key, staged_key, dirty_key = keys
+            token, amount, lease_seconds, key_ttl, dirty_ttl = argv
+            amounts, deadlines = self._prune_leases(
+                lease_key, staged_key, dirty_key, dirty_ttl,
+            )
+            if str(token) not in amounts or amounts[str(token)] < 0:
+                return -1
+            amounts[str(token)] = int(amount)
+            deadlines[str(token)] = self.now + int(lease_seconds)
+            total = sum(value for value in amounts.values() if value > 0)
+            self.max_reserved = max(self.max_reserved, total)
+            self.expirations[lease_key] = int(key_ttl)
+            if self.fail_after_increment:
+                self.fail_after_increment = False
+                raise TimeoutError("response lost after lease reserve")
+            return total
+        if "wv2nas:upload-quota-snapshot-v1" in script:
+            lease_key, staged_key, dirty_key = keys
+            (dirty_ttl,) = argv
+            amounts, _deadlines = self._prune_leases(
+                lease_key, staged_key, dirty_key, dirty_ttl,
+            )
+            reserved = sum(value for value in amounts.values() if value > 0)
+            signature = "|".join(
+                f"{token}={amount}"
+                for token, amount in sorted(amounts.items())
+            )
+            active = sorted(
+                token for token, amount in amounts.items() if amount >= 0
+            )
+            clean = dirty_key not in self.values and staged_key in self.values
+            return [
+                1 if clean else 0,
+                int(self.values[staged_key]) if clean else -1,
+                reserved,
+                signature,
+                *active,
+            ]
+        if "wv2nas:upload-lease-heartbeat-v2" in script:
+            lease_key, staged_key, dirty_key = keys
+            token, lease_seconds, require_reserved, key_ttl, dirty_ttl = argv
+            amounts, deadlines = self._prune_leases(
+                lease_key, staged_key, dirty_key, dirty_ttl,
+            )
+            if str(token) not in amounts or amounts[str(token)] < 0:
+                return 0
+            if int(require_reserved) == 1 and amounts[str(token)] <= 0:
+                return 0
+            deadlines[str(token)] = self.now + int(lease_seconds)
+            self.expirations[lease_key] = int(key_ttl)
+            return 1
+        if "wv2nas:upload-lease-release-v2" in script:
+            lease_key, staged_key, dirty_key = keys
+            token, dirty_ttl = argv
+            if self.fail_release_before:
+                self.fail_release_before = False
+                raise TimeoutError("release failed before commit")
+            amounts = self.lease_amounts.get(lease_key, {})
+            deadlines = self.lease_deadlines.get(lease_key, {})
+            if amounts.get(str(token), 0) < 0:
+                return 0
+            amounts.pop(str(token), None)
+            deadlines.pop(str(token), None)
+            self._prune_leases(lease_key, staged_key, dirty_key, dirty_ttl)
+            if self.fail_release_after:
+                self.fail_release_after = False
+                raise TimeoutError("release response lost after commit")
+            return 1
+        if "wv2nas:upload-lease-active-tokens-v2" in script:
+            lease_key, staged_key, dirty_key = keys
+            dirty_ttl, include_retained = argv
+            amounts, _deadlines = self._prune_leases(
+                lease_key, staged_key, dirty_key, dirty_ttl,
+            )
+            return [
+                token for token, amount in amounts.items()
+                if int(include_retained) == 1 or amount >= 0
+            ]
+        if "wv2nas:upload-lease-retain-bytes-v1" in script:
+            lease_key, staged_key, dirty_key = keys
+            token, lease_seconds, key_ttl, dirty_ttl = argv
+            amounts = self.lease_amounts.get(lease_key, {})
+            deadlines = self.lease_deadlines.get(lease_key, {})
+            amount = amounts.get(str(token))
+            if amount is None or amount == 0:
+                return 0
+            amounts[str(token)] = -abs(amount)
+            deadlines[str(token)] = self.now + int(lease_seconds)
+            self.expirations[lease_key] = int(key_ttl)
+            self.values[dirty_key] = 1
+            self.expirations[dirty_key] = int(dirty_ttl)
+            self.values.pop(staged_key, None)
+            return 1
+        if "wv2nas:increment-with-ttl" in script:
+            amount, ttl = int(args[0]), int(args[1])
+            current = max(0, int(self.values.get(key, 0)))
+            self.values[key] = current + amount
+            self.expirations[key] = ttl
+            if self.fail_after_increment:
+                raise TimeoutError("response lost after EXEC")
+            return self.values[key]
+        if "wv2nas:release-clamped" in script:
+            amount, ttl = int(args[0]), int(args[1])
+            remaining = int(self.values.get(key, 0)) - amount
+            if remaining <= 0:
+                self.values.pop(key, None)
+                self.expirations.pop(key, None)
+                return 0
+            self.values[key] = remaining
+            self.expirations[key] = ttl
+            return remaining
+        if "wv2nas:mark-staged-dirty" in script:
+            staged_key, dirty_key, _lease_key = keys
+            self.values[dirty_key] = 1
+            self.expirations[dirty_key] = int(argv[0])
+            self.values.pop(staged_key, None)
+            if self.fail_after_dirty_set:
+                self.fail_after_dirty_set = False
+                raise TimeoutError("dirty EVAL response lost after mutation")
+            return 1
+        if "wv2nas:staged-commit-upload-v1" in script:
+            staged_key, dirty_key, lease_key = keys
+            token, published, staged_ttl, dirty_ttl = argv
+            token = str(token)
+            published = int(published)
+            amounts = self.lease_amounts.get(lease_key, {})
+            deadlines = self.lease_deadlines.get(lease_key, {})
+
+            def mark_dirty_and_release():
+                self.values[dirty_key] = 1
+                self.expirations[dirty_key] = int(dirty_ttl)
+                self.values.pop(staged_key, None)
+                amounts.pop(token, None)
+                deadlines.pop(token, None)
+
+            if dirty_key in self.values:
+                amounts.pop(token, None)
+                deadlines.pop(token, None)
+                return -1
+            reserved = amounts.get(token)
+            current = self.values.get(staged_key)
+            if (
+                reserved is None
+                or reserved <= 0
+                or published <= 0
+                or published > reserved
+                or current is None
+            ):
+                mark_dirty_and_release()
+                return -2
+            self.values[staged_key] = int(current) + published
+            self.expirations[staged_key] = int(staged_ttl)
+            amounts.pop(token, None)
+            deadlines.pop(token, None)
+            if not amounts:
+                self.lease_amounts.pop(lease_key, None)
+                self.lease_deadlines.pop(lease_key, None)
+            if self.fail_after_staged_record:
+                self.fail_after_staged_record = False
+                raise TimeoutError("staged commit response lost after EXEC")
+            return self.values[staged_key]
+        if "wv2nas:staged-seed-if-clean" in script:
+            staged_key, dirty_key, lease_key = keys
+            seeded, ttl = int(argv[0]), int(argv[1])
+            if dirty_key in self.values:
+                return (-1, None)
+            if staged_key in self.values:
+                self.expirations[staged_key] = ttl
+                return (1, self.values[staged_key])
+            if any(
+                amount != 0
+                for amount in self.lease_amounts.get(lease_key, {}).values()
+            ):
+                return (-2, None)
+            self.values[staged_key] = seeded
+            self.expirations[staged_key] = ttl
+            return (0, seeded)
+        if "wv2nas:get-refresh" in script:
+            if key not in self.values:
+                return None
+            self.expirations[key] = int(argv[0])
+            return self.values[key]
+        if "wv2nas:staged-record-existing" in script:
+            staged_key, dirty_key, _lease_key = keys
+            if dirty_key in self.values:
+                return -1
+            if staged_key not in self.values:
+                return None
+            self.values[staged_key] = int(self.values[staged_key]) + int(argv[0])
+            self.expirations[staged_key] = int(argv[1])
+            if self.fail_after_staged_record:
+                raise TimeoutError("staged record response lost after EXEC")
+            return self.values[staged_key]
+        if "wv2nas:publish-lock-refresh" in script:
+            if str(self.values.get(key)) != str(args[0]):
+                return 0
+            self.expirations[key] = int(args[1])
+            return 1
+        if "wv2nas:publish-lock-release" in script:
+            if str(self.values.get(key)) != str(args[0]):
+                return 0
+            self.delete(key)
+            return 1
+        raise AssertionError("unknown Lua script")
+
+    def set(self, key, value, *, ex=None, nx=False):
+        if nx and key in self.values:
+            return False
+        try:
+            self.values[key] = int(value)
+        except (TypeError, ValueError):
+            self.values[key] = str(value)
+        if ex is not None:
+            self.expirations[key] = int(ex)
+        if self.fail_after_dirty_set and "staged_bytes_dirty" in key:
+            self.fail_after_dirty_set = False
+            raise TimeoutError("dirty SET response lost after mutation")
+        return True
+
+    def delete(self, key):
+        self.values.pop(key, None)
+        self.expirations.pop(key, None)
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def expire(self, key, ttl):
+        exists = key in self.values or key in self.lease_amounts
+        if exists:
+            self.expirations[key] = int(ttl)
+        return exists
+
+    def incrby(self, key, amount):
+        self.values[key] = int(self.values.get(key, 0)) + int(amount)
+        return self.values[key]
+
+
 def test_claim_release_upload_slot_round_trip(monkeypatch):
-    """Each claim increments; release decrements. Slot counts persist
-    until the TTL expires — the test mock implements INCR/DECR
-    atomically using a dict so we can verify the contract."""
-    from collections import defaultdict
+    """Distinct request tokens own distinct, idempotently releasable slots."""
     api_main = _reload_api_main(monkeypatch)
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
 
-    counts = defaultdict(int)
-    expirations = {}
-
-    class FakeRedis:
-        def incr(self, key):
-            counts[key] += 1
-            return counts[key]
-        def decr(self, key):
-            counts[key] -= 1
-            return counts[key]
-        def expire(self, key, ttl):
-            expirations[key] = ttl
-
-    api_main.redis_client = FakeRedis()
-
-    a = api_main._claim_upload_slot("job-A")
-    b = api_main._claim_upload_slot("job-A")
-    c = api_main._claim_upload_slot("job-A")
+    a = api_main._claim_upload_slot("job-A", "token-a")
+    b = api_main._claim_upload_slot("job-A", "token-b")
+    c = api_main._claim_upload_slot("job-A", "token-c")
     assert a == 1 and b == 2 and c == 3
-    api_main._release_upload_slot("job-A")
-    api_main._release_upload_slot("job-A")
-    assert counts["wv2nas:upload_slots:job-A"] == 1
+    api_main._release_upload_claim("job-A", "token-a")
+    api_main._release_upload_claim("job-A", "token-b")
+    assert fake.lease_amounts[api_main._upload_slot_key("job-A")] == {
+        "token-c": 0,
+    }
+
+
+def test_upload_coordination_ttl_outlives_custom_refresh_interval(monkeypatch):
+    api_main = _reload_api_main(
+        monkeypatch,
+        UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS="300",
+        UPLOAD_COORDINATION_REFRESH_SECONDS="7200",
+    )
+
+    assert api_main._UPLOAD_SLOT_KEY_TTL_SECONDS >= 7260
+
+
+def test_claim_upload_slot_survives_expire_failure_and_can_release(monkeypatch):
+    """No non-atomic EXPIRE fallback is used when Redis lacks EVAL."""
+    api_main = _reload_api_main(monkeypatch)
+    api_main.redis_client = object()
+    assert api_main._claim_upload_slot("job-A", "token-a") == -1
+
+
+def test_atomic_claim_and_reservation_keep_ttl_after_response_loss(monkeypatch):
+    api_main = _reload_api_main(monkeypatch)
+    fake = _AtomicCounterRedis(fail_after_increment=True)
+    api_main.redis_client = fake
+
+    # The first claim commits but loses its reply. Retrying the same token is
+    # idempotent and returns the one real slot rather than leaking a phantom.
+    assert api_main._claim_upload_slot("job-A", "token-a") == 1
+    fake.fail_after_increment = True
+    assert api_main._reserve_upload_bytes("job-A", "token-a", 8) == 8
+    assert fake.lease_amounts[api_main._upload_slot_key("job-A")] == {
+        "token-a": 8,
+    }
+    assert fake.expirations[api_main._upload_slot_key("job-A")] == (
+        api_main._UPLOAD_SLOT_KEY_TTL_SECONDS + 60
+    )
+
+
+def test_atomic_release_never_creates_negative_missing_counters(monkeypatch):
+    api_main = _reload_api_main(monkeypatch)
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+
+    api_main._release_upload_claim("job-A", "missing")
+    assert api_main._upload_slot_key("job-A") not in fake.lease_amounts
+
+    assert api_main._claim_upload_slot("job-A", "token-a") == 1
+    assert api_main._reserve_upload_bytes("job-A", "token-a", 8) == 8
+    api_main._release_upload_claim("job-A", "token-a")
+    api_main._release_upload_claim("job-A", "token-a")
+    assert api_main._upload_slot_key("job-A") not in fake.lease_amounts
+
+
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+def test_upload_claim_release_retries_ambiguous_redis_failure(
+    monkeypatch, failure_mode,
+):
+    api_main = _reload_api_main(monkeypatch)
+    fake = _AtomicCounterRedis(
+        fail_release_before=failure_mode == "before",
+        fail_release_after=failure_mode == "after",
+    )
+    api_main.redis_client = fake
+    assert api_main._claim_upload_slot("job-A", "token-a") == 1
+    assert api_main._reserve_upload_bytes("job-A", "token-a", 8) == 8
+
+    api_main._release_upload_claim("job-A", "token-a")
+
+    assert api_main._upload_slot_key("job-A") not in fake.lease_amounts
+
+
+def test_expired_positive_upload_lease_invalidates_staged_cache(monkeypatch):
+    api_main = _reload_api_main(monkeypatch)
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    staged_key = api_main._staged_bytes_key("job-A")
+    dirty_key = api_main._staged_bytes_dirty_key("job-A")
+    fake.values[staged_key] = 100
+
+    assert api_main._claim_upload_slot("job-A", "token-a") == 1
+    assert api_main._reserve_upload_bytes("job-A", "token-a", 8) == 8
+    fake.now += api_main._UPLOAD_SLOT_KEY_TTL_SECONDS + 1
+
+    assert api_main._claim_upload_slot("job-A", "token-b") == 1
+    assert staged_key not in fake.values
+    assert fake.values[dirty_key] == 1
+    assert fake.lease_amounts[api_main._upload_slot_key("job-A")] == {
+        "token-b": 0,
+    }
+
+
+def test_retained_byte_lease_preserves_quota_without_consuming_upload_slot(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_CONCURRENT_UPLOADS_PER_JOB="2",
+    )
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+
+    assert api_main._claim_upload_slot("job-A", "token-a") == 1
+    assert api_main._reserve_upload_bytes("job-A", "token-a", 8) == 8
+    assert api_main._retain_upload_reservation("job-A", "token-a") is True
+
+    # Negative encoding forces authoritative disk scans and is omitted from
+    # active-token/slot views so a transient record failure cannot pin cap=2.
+    assert fake.lease_amounts[api_main._upload_slot_key("job-A")] == {
+        "token-a": -8,
+    }
+    assert fake.get(api_main._staged_bytes_dirty_key("job-A")) == 1
+    assert api_main._active_upload_tokens("job-A") == set()
+
+    published = tmp_path / "job-A" / "video" / "seg_00000000.bin"
+    published.parent.mkdir(parents=True)
+    published.write_bytes(b"12345678")
+    assert api_main._staged_bytes_get("job-A", tmp_path / "job-A") == 8
+
+    assert api_main._claim_upload_slot("job-A", "token-b") == 1
+    # The retained final is already in the 8-byte disk scan, so reservation
+    # totals include only B's positive in-flight 4 bytes (8 + 4, not 8 + 12).
+    assert api_main._reserve_upload_bytes("job-A", "token-b", 4) == 4
+    assert (
+        api_main._staged_bytes_get("job-A", tmp_path / "job-A") + 4
+    ) == 12
+    assert api_main._claim_upload_slot("job-A", "token-c") == 2
+
+    # Ordinary request cleanup cannot accidentally erase retained accounting.
+    api_main._release_upload_claim("job-A", "token-a")
+    assert fake.lease_amounts[api_main._upload_slot_key("job-A")]["token-a"] == -8
+
+
+def test_publish_atomically_transfers_reservation_into_staged_counter(
+    monkeypatch, tmp_path,
+):
+    """A committed upload is never double-counted as staged + in-flight."""
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_JOB_STAGING_BYTES="16",
+    )
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staged_key = api_main._staged_bytes_key(job_id)
+    fake.values[staged_key] = 0
+
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 8) == 8
+    assert api_main._claim_upload_slot(job_id, "token-b") == 2
+    assert api_main._reserve_upload_bytes(job_id, "token-b", 8) == 16
+
+    assert api_main._staged_bytes_record(
+        job_id, 8, upload_token="token-a",
+    ) is True
+
+    # Token A vanished in the same atomic operation that credited its 8 bytes;
+    # B's gate therefore sees exactly 8 staged + 8 reserved == cap, not 24.
+    assert fake.values[staged_key] == 8
+    assert fake.lease_amounts[api_main._upload_slot_key(job_id)] == {
+        "token-b": 8,
+    }
+    assert api_main._staged_bytes_get(job_id, tmp_path / job_id) == 8
+    reserved = api_main._reserve_upload_bytes(job_id, "token-b", 8)
+    assert api_main._staged_bytes_get(job_id, tmp_path / job_id) + reserved == 16
+
+
+def test_quota_snapshot_never_combines_opposite_sides_of_publish(
+    monkeypatch, tmp_path,
+):
+    """B's stale reserve return must not be added to A's newer staged value."""
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_JOB_STAGING_BYTES="16",
+    )
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    fake.values[api_main._staged_bytes_key(job_id)] = 0
+
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 8) == 8
+    assert api_main._claim_upload_slot(job_id, "token-b") == 2
+    stale_reserved = api_main._reserve_upload_bytes(job_id, "token-b", 8)
+    assert stale_reserved == 16
+
+    assert api_main._staged_bytes_record(
+        job_id, 8, upload_token="token-a",
+    ) is True
+    newer_staged = api_main._staged_bytes_get(job_id, tmp_path / job_id)
+    assert newer_staged + stale_reserved == 24  # the former broken gate
+
+    staged, reserved, total = api_main._upload_quota_usage(
+        job_id, tmp_path / job_id,
+    )
+    assert (staged, reserved, total) == (8, 8, 16)
+
+
+def test_dirty_quota_excludes_final_guarded_by_positive_publish_marker(
+    monkeypatch, tmp_path,
+):
+    """Rename fallback final bytes remain in the positive lease generation."""
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_JOB_STAGING_BYTES="16",
+    )
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    target = staging / "video" / "seg_00000000.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"12345678")
+    marker = api_main._upload_publish_marker_path(target, "token-a")
+    marker.touch()
+    fake.values[api_main._staged_bytes_dirty_key(job_id)] = 1
+
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 8) == 8
+    assert api_main._claim_upload_slot(job_id, "token-b") == 2
+    assert api_main._reserve_upload_bytes(job_id, "token-b", 8) == 16
+
+    # A's visible final is represented by A's still-positive reservation;
+    # the marker prevents dirty reconciliation from charging both copies.
+    assert api_main._upload_quota_usage(job_id, staging) == (0, 16, 16)
+
+    # Once A atomically leaves the positive lease generation, its final moves
+    # back into the physical scan and B remains the only reservation.
+    assert api_main._staged_bytes_record(
+        job_id, 8, upload_token="token-a",
+    ) is True
+    marker.unlink()
+    assert api_main._upload_quota_usage(job_id, staging) == (8, 8, 16)
+
+
+def test_dirty_quota_excludes_hardlinked_final_before_marker_creation(
+    monkeypatch, tmp_path,
+):
+    """The os.link publish path has no double-count gap before its marker."""
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    target = staging / "video" / "seg_00000000.bin"
+    part = target.with_name(f"{target.name}.token-a.part")
+    target.parent.mkdir(parents=True)
+    part.write_bytes(b"12345678")
+    try:
+        api_main.os.link(part, target)
+    except OSError as e:
+        pytest.skip(f"test filesystem does not support hard links: {e}")
+    fake.values[api_main._staged_bytes_dirty_key(job_id)] = 1
+
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 8) == 8
+    assert api_main._claim_upload_slot(job_id, "token-b") == 2
+    assert api_main._reserve_upload_bytes(job_id, "token-b", 8) == 16
+
+    assert api_main._upload_quota_usage(job_id, staging) == (0, 16, 16)
+
+
+def test_atomic_publish_transfer_response_loss_falls_back_to_dirty_scan(
+    monkeypatch,
+):
+    api_main = _reload_api_main(monkeypatch)
+    fake = _AtomicCounterRedis(fail_after_staged_record=True)
+    api_main.redis_client = fake
+    job_id = "job-A"
+    staged_key = api_main._staged_bytes_key(job_id)
+    dirty_key = api_main._staged_bytes_dirty_key(job_id)
+    fake.values[staged_key] = 0
+
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 8) == 8
+    assert api_main._staged_bytes_record(
+        job_id, 8, upload_token="token-a",
+    ) is True
+
+    # First EVAL committed and lost its reply; idempotent retry cannot add the
+    # bytes twice, so it invalidates the cache and forces an on-disk reconcile.
+    assert staged_key not in fake.values
+    assert fake.values[dirty_key] == 1
+    assert api_main._upload_slot_key(job_id) not in fake.lease_amounts
+
+
+def test_expired_retained_byte_lease_invalidates_staged_cache(monkeypatch):
+    api_main = _reload_api_main(monkeypatch)
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    staged_key = api_main._staged_bytes_key("job-A")
+    dirty_key = api_main._staged_bytes_dirty_key("job-A")
+    fake.values[staged_key] = 100
+
+    assert api_main._claim_upload_slot("job-A", "token-a") == 1
+    assert api_main._reserve_upload_bytes("job-A", "token-a", 8) == 8
+    assert api_main._retain_upload_reservation("job-A", "token-a") is True
+    fake.now += api_main._UPLOAD_SLOT_KEY_TTL_SECONDS + 1
+
+    assert api_main._claim_upload_slot("job-A", "token-b") == 1
+    assert staged_key not in fake.values
+    assert fake.values[dirty_key] == 1
+
+def test_staged_counter_cache_hit_refreshes_ttl(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    job_id = "11111111-2222-3333-4444-555555555555"
+    key = api_main._staged_bytes_key(job_id)
+    fake.values[key] = 123
+    fake.expirations[key] = 1
+    api_main.redis_client = fake
+
+    assert api_main._staged_bytes_get(job_id, tmp_path / job_id) == 123
+    assert fake.expirations[key] == api_main._STAGED_BYTES_CACHE_TTL_SECONDS
+
+
+def test_cold_staged_seed_is_scan_only_while_positive_lease_exists(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    staging.mkdir()
+    (staging / "published.bin").write_bytes(b"x" * 10)
+
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 8) == 8
+    assert api_main._staged_bytes_get(job_id, staging) == 10
+    assert api_main._staged_bytes_key(job_id) not in fake.values
+
+
+def test_cold_staged_seed_before_reserve_avoids_publish_double_count(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    staging.mkdir()
+    (staging / "prior.bin").write_bytes(b"p" * 10)
+
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._staged_bytes_get(job_id, staging) == 10
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 5) == 5
+    (staging / "new.bin").write_bytes(b"n" * 5)
+    assert api_main._staged_bytes_record(job_id, 5) is True
+    assert fake.values[api_main._staged_bytes_key(job_id)] == 15
+
+
+def test_untrusted_reserved_token_scan_is_not_cached(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    staging.mkdir()
+    (staging / "seg.bin.live-token.part").write_bytes(b"x" * 7)
+    monkeypatch.setattr(api_main, "_active_upload_tokens", lambda _job_id: None)
+
+    assert api_main._staged_bytes_get(job_id, staging) == 7
+    assert api_main._staged_bytes_key(job_id) not in fake.values
+
+
+def test_staged_counter_record_switches_missing_key_to_dirty_scan(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    staging.mkdir()
+    (staging / "published.bin").write_bytes(b"12345678")
+
+    assert api_main._staged_bytes_record(job_id, 8) is True
+    assert api_main._staged_bytes_key(job_id) not in fake.values
+    assert fake.values[api_main._staged_bytes_dirty_key(job_id)] == 1
+    assert api_main._staged_bytes_get(job_id, staging) == 8
+    # Further publishes are accounted by the authoritative scan mode and do
+    # not recreate a partial Redis delta counter.
+    assert api_main._staged_bytes_record(job_id, 8) is True
+    assert api_main._staged_bytes_key(job_id) not in fake.values
+
+
+def test_staged_record_response_loss_switches_to_dirty_without_double_count(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis(fail_after_staged_record=True)
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    staging.mkdir()
+    (staging / "manifest.json").write_bytes(b"m" * 4)
+    (staging / "published.bin").write_bytes(b"x" * 8)
+    staged_key = api_main._staged_bytes_key(job_id)
+    fake.values[staged_key] = 4
+
+    assert api_main._staged_bytes_record(job_id, 8) is True
+    assert staged_key not in fake.values
+    assert fake.values[api_main._staged_bytes_dirty_key(job_id)] == 1
+    assert api_main._staged_bytes_get(job_id, staging) == 12
+
+
+def test_dirty_marker_response_loss_is_confirmed_before_releasing_reservation(
+    monkeypatch,
+):
+    api_main = _reload_api_main(monkeypatch)
+    fake = _AtomicCounterRedis(fail_after_dirty_set=True)
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+
+    assert api_main._mark_staged_bytes_dirty(job_id) is True
+    assert fake.values[api_main._staged_bytes_dirty_key(job_id)] == 1
+
+
+def test_direct_dash_range_reserves_declared_bytes_not_segment_max(
+    monkeypatch, tmp_path,
+):
+    """A small custom staging quota must accept an 8-byte planned range.
+
+    The old ``slot_count * MAX_SEGMENT_BYTES`` gate charged 5,000 bytes and
+    rejected this request despite the persisted direct-DASH plan declaring an
+    exact 8-byte body.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_SEGMENT_BYTES="5000",
+        MAX_JOB_STAGING_BYTES="2000",
+    )
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    _write_plan(staging, {
+        "container": "dash",
+        "direct_range_concat": True,
+        "tracks": {
+            "video": {
+                "segment_count": 1,
+                "segments": [{
+                    "seq": 0,
+                    "byte_range": {"offset": 0, "length": 8},
+                }],
+            },
+            "audio": {
+                "segment_count": 1,
+                "segments": [{
+                    "seq": 0,
+                    "byte_range": {"offset": 0, "length": 8},
+                }],
+            },
+        },
+    })
+
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    meta = SimpleNamespace(status="browser_uploading", total_segments=2)
+    monkeypatch.setattr(api_main, "_get_browser_job_meta", lambda *_args: meta)
+
+    class FakeRequest:
+        async def stream(self):
+            yield b"12345678"
+
+    db = MagicMock()
+    db.execute.return_value.first.return_value = SimpleNamespace(
+        status="browser_uploading",
+    )
+    result = asyncio.run(api_main.upload_segment(
+        job_id, 0, FakeRequest(), track="video", db=db, api_key="x",
+    ))
+
+    assert result["received"] == 8
+    assert fake.max_reserved == 8
+    assert api_main._upload_slot_key(job_id) not in fake.lease_amounts
+    assert api_main._segment_path(job_id, "video", 0).read_bytes() == b"12345678"
+
+
+def test_nonrange_upload_reserves_enforced_content_length(monkeypatch, tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_SEGMENT_BYTES="5000",
+        MAX_JOB_STAGING_BYTES="2000",
+    )
+    job_id = "11111111-2222-3333-4444-555555555555"
+    _write_plan(tmp_path / job_id, {
+        "container": "hls",
+        "tracks": {
+            "video": {
+                "segment_count": 1,
+                "segments": [{"seq": 0}],
+            },
+        },
+    })
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    monkeypatch.setattr(
+        api_main,
+        "_get_browser_job_meta",
+        lambda *_args: SimpleNamespace(
+            status="browser_uploading", total_segments=1,
+        ),
+    )
+
+    class FakeRequest:
+        headers = {"content-length": "8"}
+
+        async def stream(self):
+            yield b"12345678"
+
+    db = MagicMock()
+    db.execute.return_value.first.return_value = SimpleNamespace(
+        status="browser_uploading",
+    )
+    result = asyncio.run(api_main.upload_segment(
+        job_id, 0, FakeRequest(), track="video", db=db, api_key="x",
+    ))
+
+    assert result["received"] == 8
+    assert fake.max_reserved == 8
+
+
+@pytest.mark.parametrize("kind", ["segment", "init"])
+def test_publish_retains_target_and_reservation_when_accounting_is_uncertain(
+    monkeypatch, tmp_path, kind,
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_SEGMENT_BYTES="16",
+        MAX_JOB_STAGING_BYTES="1000",
+    )
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    _write_plan(staging, {
+        "container": "dash",
+        "tracks": {
+            "video": {
+                "segment_count": 1,
+                "segments": [{
+                    "seq": 0,
+                    "byte_range": {"offset": 0, "length": 8},
+                }],
+            },
+        },
+    })
+    meta = SimpleNamespace(
+        status="browser_uploading",
+        total_segments=1,
+        mode="browser",
+    )
+    monkeypatch.setattr(api_main, "_get_browser_job_meta", lambda *_args: meta)
+    monkeypatch.setattr(api_main, "_claim_upload_slot", lambda _job_id, _token: 1)
+    monkeypatch.setattr(
+        api_main,
+        "_reserve_upload_bytes",
+        lambda _job_id, _token, amount: amount,
+    )
+    monkeypatch.setattr(api_main, "_staged_bytes_get", lambda *_args: 0)
+    monkeypatch.setattr(
+        api_main, "_upload_quota_usage", lambda *_args: (0, 8, 8),
+    )
+    monkeypatch.setattr(
+        api_main, "_staged_bytes_record", lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        api_main,
+        "_refresh_upload_coordination_ttl",
+        lambda *_args, **_kwargs: True,
+    )
+    released_claims = []
+    retained_claims = []
+    monkeypatch.setattr(
+        api_main,
+        "_release_upload_claim",
+        lambda _job_id, _token: released_claims.append(_job_id),
+    )
+    monkeypatch.setattr(
+        api_main,
+        "_retain_upload_reservation",
+        lambda _job_id, _token: retained_claims.append(_job_id) or True,
+    )
+
+    class FakeRequest:
+        async def stream(self):
+            yield b"12345678"
+
+    db = MagicMock()
+    db.execute.return_value.first.return_value = SimpleNamespace(
+        status="browser_uploading",
+    )
+    if kind == "segment":
+        operation = api_main.upload_segment(
+            job_id, 0, FakeRequest(), track="video", db=db, api_key="x",
+        )
+        target = api_main._segment_path(job_id, "video", 0)
+    else:
+        operation = api_main.upload_init_segment(
+            job_id, FakeRequest(), track="video", db=db, api_key="x",
+        )
+        target = api_main._init_segment_path(job_id, "video")
+
+    result = asyncio.run(operation)
+
+    assert result["received"] == 8
+    assert target.read_bytes() == b"12345678"
+    # The already-committed file must survive even if finalize races this
+    # response. Its exact reservation remains live until Redis reconciliation.
+    assert released_claims == []
+    assert retained_claims == [job_id]
+    assert list(target.parent.glob(f"{target.name}.*.part")) == []
+
+
+def test_fallback_publish_lock_blocks_finalize_until_accounting_finishes(
+    monkeypatch, tmp_path,
+):
+    """Deterministic publish -> record interleaving for no-hardlink NASes."""
+    import asyncio
+    import errno as _errno
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    _write_plan(staging, {
+        "container": "dash",
+        "tracks": {"video": {"segment_count": 1}},
+    })
+    target = api_main._segment_path(job_id, "video", 0)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        api_main.os,
+        "link",
+        lambda *_args: (_ for _ in ()).throw(OSError(_errno.EPERM, "NAS")),
+    )
+    monkeypatch.setattr(
+        api_main,
+        "_refresh_upload_coordination_ttl",
+        lambda *_args, **_kwargs: True,
+    )
+
+    observed = {}
+
+    def record_while_finalize_runs(_job_id, written, **_kwargs):
+        observed["target"] = target.read_bytes()
+        observed["part_exists"] = any(target.parent.glob(f"{target.name}.*.part"))
+        with pytest.raises(api_main.HTTPException) as exc:
+            api_main._verify_staging_complete(staging)
+        observed["status"] = exc.value.status_code
+        observed["detail"] = exc.value.detail
+        return True
+
+    monkeypatch.setattr(api_main, "_staged_bytes_record", record_while_finalize_runs)
+
+    class FakeRequest:
+        async def stream(self):
+            yield b"PAYLOAD"
+
+    db = MagicMock()
+    db.execute.return_value.first.return_value = SimpleNamespace(
+        status="browser_uploading",
+    )
+    result = asyncio.run(api_main._stream_segment_to_disk(
+        request=FakeRequest(),
+        db=db,
+        meta=SimpleNamespace(status="browser_uploading"),
+        job_id=job_id,
+        track="video",
+        seq=0,
+        target=target,
+        expected_length=7,
+        upload_token="fallback-token",
+        coordination_required=True,
+        byte_reservation_required=True,
+    ))
+
+    assert result["received"] == 7
+    assert observed["target"] == b"PAYLOAD"
+    # The rename fallback now keeps a zero-byte token marker across the
+    # publish->accounting boundary; the live publish lock remains the second
+    # finalize guard on filesystems without hard links.
+    assert observed["part_exists"] is True
+    assert observed["status"] == 409
+    assert "in_flight_partial_files" in observed["detail"]
+    # Once accounting returns, the caller releases the kernel lock; its
+    # persistent pathname is harmless and final verification succeeds.
+    assert api_main._verify_staging_complete(staging) == {"video": 1}
+
+
+def test_hardlink_live_token_part_blocks_finalize_until_accounting_finishes(
+    monkeypatch, tmp_path,
+):
+    """The hard-link fast path uses its live token-owned .part as the guard."""
+    import asyncio
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    _write_plan(staging, {
+        "container": "dash",
+        "tracks": {"video": {"segment_count": 1}},
+    })
+    target = api_main._segment_path(job_id, "video", 0)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        api_main,
+        "_refresh_upload_coordination_ttl",
+        lambda *_args, **_kwargs: True,
+    )
+
+    def record_while_finalize_runs(_job_id, _written, **_kwargs):
+        with pytest.raises(api_main.HTTPException) as exc:
+            api_main._verify_staging_complete(
+                staging,
+                active_upload_tokens={"hardlink-token"},
+            )
+        assert exc.value.status_code == 409
+        assert "in_flight_partial_files" in exc.value.detail
+        return True
+
+    monkeypatch.setattr(api_main, "_staged_bytes_record", record_while_finalize_runs)
+
+    class FakeRequest:
+        async def stream(self):
+            yield b"PAYLOAD"
+
+    db = MagicMock()
+    db.execute.return_value.first.return_value = SimpleNamespace(
+        status="browser_uploading",
+    )
+    asyncio.run(api_main._stream_segment_to_disk(
+        request=FakeRequest(),
+        db=db,
+        meta=SimpleNamespace(status="browser_uploading"),
+        job_id=job_id,
+        track="video",
+        seq=0,
+        target=target,
+        expected_length=7,
+        upload_token="hardlink-token",
+        coordination_required=True,
+        byte_reservation_required=True,
+    ))
+
+    # This unit invokes the inner writer directly, so the endpoint wrapper has
+    # not yet released the Redis claim and removed its generation marker.
+    marker = api_main._upload_publish_marker_path(target, "hardlink-token")
+    assert list(target.parent.glob(f"{target.name}.*.part")) == [marker]
+    marker.unlink()
+    assert api_main._verify_staging_complete(staging) == {"video": 1}
+
+
+@pytest.mark.parametrize("kind", ["segment", "init"])
+@pytest.mark.parametrize("dirty_confirmed", [True, False])
+def test_unremovable_upload_part_invalidates_cache_or_retains_reservation(
+    monkeypatch, tmp_path, kind, dirty_confirmed,
+):
+    """An orphan temp can never disappear from both cache and reservation."""
+    import asyncio
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_SEGMENT_BYTES="16",
+        MAX_JOB_STAGING_BYTES="1000",
+    )
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    _write_plan(staging, {
+        "container": "dash",
+        "tracks": {"video": {
+            "segment_count": 1,
+            "segments": [{
+                "seq": 0,
+                "byte_range": {"offset": 0, "length": 8},
+            }],
+            "init_segment_byte_range": {"offset": 0, "length": 8},
+        }},
+    })
+    meta = SimpleNamespace(
+        status="browser_uploading", total_segments=1, mode="browser",
+    )
+    monkeypatch.setattr(api_main, "_get_browser_job_meta", lambda *_args: meta)
+    monkeypatch.setattr(api_main, "_claim_upload_slot", lambda *_args: 1)
+    monkeypatch.setattr(
+        api_main, "_reserve_upload_bytes", lambda _job, _token, amount: amount,
+    )
+    monkeypatch.setattr(api_main, "_staged_bytes_get", lambda *_args: 0)
+    monkeypatch.setattr(
+        api_main, "_upload_quota_usage", lambda *_args: (0, 8, 8),
+    )
+    monkeypatch.setattr(
+        api_main,
+        "_refresh_upload_coordination_ttl",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        api_main.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="cleanup-token"),
+    )
+    dirty_calls = []
+    monkeypatch.setattr(
+        api_main,
+        "_mark_staged_bytes_dirty",
+        lambda seen_job: dirty_calls.append(seen_job) or dirty_confirmed,
+    )
+    released = []
+    retained = []
+    monkeypatch.setattr(
+        api_main,
+        "_release_upload_claim",
+        lambda seen_job, _token: released.append(seen_job),
+    )
+    monkeypatch.setattr(
+        api_main,
+        "_retain_upload_reservation",
+        lambda seen_job, _token: retained.append(seen_job) or True,
+    )
+
+    real_unlink = api_main.Path.unlink
+
+    def fail_token_part_unlink(path, *args, **kwargs):
+        if path.name.endswith(".cleanup-token.part"):
+            raise OSError("simulated NAS unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(api_main.Path, "unlink", fail_token_part_unlink)
+
+    class FakeRequest:
+        async def stream(self):
+            yield b"12345678"
+            yield b"9"
+
+    db = MagicMock()
+    db.execute.return_value.first.return_value = SimpleNamespace(
+        status="browser_uploading",
+    )
+    operation = (
+        api_main.upload_segment(
+            job_id, 0, FakeRequest(), track="video", db=db, api_key="x",
+        )
+        if kind == "segment"
+        else api_main.upload_init_segment(
+            job_id, FakeRequest(), track="video", db=db, api_key="x",
+        )
+    )
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(operation)
+
+    assert exc.value.status_code == 413
+    orphan_parts = list(staging.rglob("*.cleanup-token.part"))
+    assert len(orphan_parts) == 1
+    assert orphan_parts[0].stat().st_size == 8
+    assert dirty_calls == [job_id]
+    assert released == ([job_id] if dirty_confirmed else [])
+    assert retained == ([] if dirty_confirmed else [job_id])
+
+
+def test_segment_upload_cap_returns_retry_after(monkeypatch, tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_CONCURRENT_UPLOADS_PER_JOB="3",
+    )
+    job_id = "11111111-2222-3333-4444-555555555555"
+    meta = SimpleNamespace(status="browser_uploading", total_segments=1)
+    monkeypatch.setattr(api_main, "_get_browser_job_meta", lambda *_args: meta)
+    monkeypatch.setattr(api_main, "_claim_upload_slot", lambda _job_id, _token: 4)
+    released = []
+    monkeypatch.setattr(
+        api_main,
+        "_release_upload_claim",
+        lambda _job_id, _token: released.append(_job_id),
+    )
+
+    class FakeRequest:
+        async def stream(self):
+            pytest.fail("429 must reject before reading the request body")
+            yield b""
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(api_main.upload_segment(
+            job_id, 0, FakeRequest(), track="video", db=MagicMock(), api_key="x",
+        ))
+
+    assert exc.value.status_code == 429
+    assert exc.value.headers == {"Retry-After": "1"}
+    assert released == [job_id]
+
+
+def test_failed_byte_reservation_is_not_released_into_negative_counter(
+    monkeypatch, tmp_path,
+):
+    """A failed INCRBY claim owns no reservation and must not DECRBY it."""
+    import asyncio
+    from types import SimpleNamespace
+
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    job_id = "11111111-2222-3333-4444-555555555555"
+    _write_plan(tmp_path / job_id, {
+        "tracks": {"video": {
+            "segment_count": 1,
+            "segments": [{
+                "seq": 0,
+                "byte_range": {"offset": 0, "length": 8},
+            }],
+        }},
+    })
+    meta = SimpleNamespace(status="browser_uploading", total_segments=1)
+    monkeypatch.setattr(api_main, "_get_browser_job_meta", lambda *_args: meta)
+    monkeypatch.setattr(api_main, "_claim_upload_slot", lambda _job_id, _token: 1)
+    monkeypatch.setattr(api_main, "_reserve_upload_bytes", lambda *_args: -1)
+    released_claims = []
+    monkeypatch.setattr(
+        api_main,
+        "_release_upload_claim",
+        lambda *_args: released_claims.append(_args),
+    )
+
+    class FakeRequest:
+        async def stream(self):
+            pytest.fail("503 must reject before reading the request body")
+            yield b""
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(api_main.upload_segment(
+            job_id, 0, FakeRequest(), track="video", db=MagicMock(), api_key="x",
+        ))
+
+    assert exc.value.status_code == 503
+    assert len(released_claims) == 1
 
 
 def test_existing_segment_retry_bypasses_quota_gate(monkeypatch, tmp_path):
@@ -904,8 +2591,8 @@ def test_existing_segment_retry_bypasses_quota_gate(monkeypatch, tmp_path):
     monkeypatch.setattr(api_main, "_get_browser_job_meta", lambda _db, _job_id: meta)
     claimed = []
     released = []
-    monkeypatch.setattr(api_main, "_claim_upload_slot", lambda _job_id: claimed.append(_job_id) or 1)
-    monkeypatch.setattr(api_main, "_release_upload_slot", lambda _job_id: released.append(_job_id))
+    monkeypatch.setattr(api_main, "_claim_upload_slot", lambda _job_id, _token: claimed.append(_job_id) or 1)
+    monkeypatch.setattr(api_main, "_release_upload_claim", lambda _job_id, _token: released.append(_job_id))
     monkeypatch.setattr(
         api_main,
         "_staged_bytes_get",
@@ -957,8 +2644,8 @@ def test_existing_init_retry_bypasses_quota_gate(monkeypatch, tmp_path):
     monkeypatch.setattr(api_main, "_get_browser_job_meta", lambda _db, _job_id: meta)
     claimed = []
     released = []
-    monkeypatch.setattr(api_main, "_claim_upload_slot", lambda _job_id: claimed.append(_job_id) or 1)
-    monkeypatch.setattr(api_main, "_release_upload_slot", lambda _job_id: released.append(_job_id))
+    monkeypatch.setattr(api_main, "_claim_upload_slot", lambda _job_id, _token: claimed.append(_job_id) or 1)
+    monkeypatch.setattr(api_main, "_release_upload_claim", lambda _job_id, _token: released.append(_job_id))
     monkeypatch.setattr(
         api_main,
         "_staged_bytes_get",
@@ -1005,22 +2692,8 @@ def test_staged_bytes_counter_avoids_per_put_walk(monkeypatch, tmp_path):
     filesystem. Verifies the hot path is O(1)."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
 
-    cache = {}
-
-    class FakeRedis:
-        def get(self, key):
-            return cache.get(key)
-        def set(self, key, value, ex=None):
-            cache[key] = str(value)
-        def incrby(self, key, n):
-            cache[key] = str(int(cache.get(key, "0")) + int(n))
-            return int(cache[key])
-        def expire(self, key, ttl):
-            pass
-        def delete(self, key):
-            cache.pop(key, None)
-
-    api_main.redis_client = FakeRedis()
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
 
     job_id = "11111111-2222-3333-4444-555555555555"
     staging = tmp_path / job_id
@@ -1042,24 +2715,8 @@ def test_staged_bytes_counter_seeds_on_miss_then_caches(monkeypatch, tmp_path):
     seeds the cache, and subsequent reads stay O(1)."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
 
-    cache = {}
-    set_calls = []
-
-    class FakeRedis:
-        def get(self, key):
-            return cache.get(key)
-        def set(self, key, value, ex=None):
-            cache[key] = str(value)
-            set_calls.append((key, int(value), ex))
-        def incrby(self, key, n):
-            cache[key] = str(int(cache.get(key, "0")) + int(n))
-            return int(cache[key])
-        def expire(self, key, ttl):
-            pass
-        def delete(self, key):
-            cache.pop(key, None)
-
-    api_main.redis_client = FakeRedis()
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
 
     job_id = "11111111-2222-3333-4444-555555555555"
     staging = tmp_path / job_id
@@ -1069,10 +2726,28 @@ def test_staged_bytes_counter_seeds_on_miss_then_caches(monkeypatch, tmp_path):
 
     # Cache cold → walk seeds 350.
     assert api_main._staged_bytes_get(job_id, staging) == 350
-    assert len(set_calls) == 1 and set_calls[0][1] == 350
+    key = api_main._staged_bytes_key(job_id)
+    assert fake.values[key] == 350
     # Cache warm → no further set.
     assert api_main._staged_bytes_get(job_id, staging) == 350
-    assert len(set_calls) == 1
+    assert fake.values[key] == 350
+
+
+def test_staging_scan_counts_hardlinked_publish_guard_once(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    staging = tmp_path / "job"
+    track = staging / "video"
+    track.mkdir(parents=True)
+    part = track / "seg_00000000.bin.token-a.part"
+    target = track / "seg_00000000.bin"
+    part.write_bytes(b"12345678")
+    try:
+        api_main.os.link(part, target)
+    except OSError as exc:
+        pytest.skip(f"hard links unavailable on test filesystem: {exc}")
+
+    # target + source-part are two names for one physical allocation.
+    assert api_main._staging_total_bytes(staging) == 8
 
 
 def test_staged_bytes_counter_falls_back_to_walk_on_redis_failure(monkeypatch, tmp_path):
@@ -1104,6 +2779,72 @@ def test_staged_bytes_counter_falls_back_to_walk_on_redis_failure(monkeypatch, t
     # Record + clear are best-effort; must not raise.
     api_main._staged_bytes_record(job_id, 99)
     api_main._staged_bytes_clear(job_id)
+
+
+def test_staging_scan_excludes_live_parts_but_counts_orphans(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    staging.mkdir()
+    (staging / "committed.bin").write_bytes(b"c" * 10)
+    (staging / "seg.bin.token-a.part").write_bytes(b"a" * 5)
+    (staging / "seg.bin.orphan.part").write_bytes(b"o" * 7)
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 8) == 8
+
+    active = api_main._active_upload_tokens(job_id)
+    assert active == {"token-a"}
+    assert api_main._staging_total_bytes(staging, active) == 17
+
+
+def test_staging_scan_counts_part_covered_by_retained_byte_lease_once(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    job_id = "11111111-2222-3333-4444-555555555555"
+    staging = tmp_path / job_id
+    staging.mkdir()
+    (staging / "seg.bin.token-a.part").write_bytes(b"a" * 8)
+
+    assert api_main._claim_upload_slot(job_id, "token-a") == 1
+    assert api_main._reserve_upload_bytes(job_id, "token-a", 8) == 8
+    assert api_main._retain_upload_reservation(job_id, "token-a") is True
+
+    assert api_main._active_upload_tokens(job_id) == set()
+    assert api_main._scan_staging_total(job_id, staging) == (8, True)
+    assert api_main._staged_bytes_get(job_id, staging) == 8
+
+
+def test_authoritative_staging_scan_fails_closed_on_metadata_error(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    staging = tmp_path / "job"
+    staging.mkdir()
+
+    class BrokenEntry:
+        name = "published.bin"
+        path = str(staging / name)
+
+        def is_symlink(self):
+            return False
+
+        def is_dir(self, *, follow_symlinks=False):
+            return False
+
+        def is_file(self, *, follow_symlinks=False):
+            return True
+
+        def stat(self, *, follow_symlinks=False):
+            raise OSError("NAS metadata unavailable")
+
+    monkeypatch.setattr(api_main.os, "scandir", lambda _path: [BrokenEntry()])
+    with pytest.raises(api_main._StagingAccountingError):
+        api_main._staging_total_bytes(staging)
 
 
 # --- Codex review #10: per-track seq bounds ---------------------------
@@ -1759,7 +3500,7 @@ def test_claim_upload_slot_returns_minus1_when_redis_unavailable(monkeypatch):
             raise RuntimeError("redis down")
 
     api_main.redis_client = BrokenRedis()
-    assert api_main._claim_upload_slot("job-X") == -1
+    assert api_main._claim_upload_slot("job-X", "token-x") == -1
 
 
 def test_finalize_rejected_when_part_file_exists_rolls_back_to_browser_uploading(
@@ -1852,6 +3593,40 @@ def test_abort_failed_browser_job_marks_failed_and_wipes_staging(monkeypatch, tm
     assert _read_job_status(api_main, job_id) == "failed"
     # Staging dir must be wiped — it could be 50GB worth of orphaned files.
     assert not staging.exists()
+
+
+def test_abort_rmtree_failure_preserves_accounting_for_reaper(
+    monkeypatch, tmp_path,
+):
+    import shutil
+    from fastapi.testclient import TestClient
+
+    api_main, job_id = _build_finalize_test_env(monkeypatch, tmp_path)
+    staging = Path(_staging_dir_for_test_job(api_main, tmp_path, job_id))
+    clear = MagicMock()
+    monkeypatch.setattr(api_main, "_staged_bytes_clear", clear)
+    monkeypatch.setattr(
+        shutil,
+        "rmtree",
+        MagicMock(side_effect=OSError("active NAS upload handle")),
+    )
+
+    with TestClient(api_main.app) as client:
+        response = client.post(
+            f"/api/jobs/{job_id}/abort",
+            headers={
+                "Authorization": (
+                    "Bearer test-key-not-the-default-placeholder"
+                )
+            },
+            json={"reason": "upload failed"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["aborted"] is True
+    assert response.json()["staging_cleaned"] is False
+    assert staging.exists()
+    clear.assert_not_called()
 
 
 def test_abort_already_completed_job_no_op(monkeypatch, tmp_path):
@@ -2080,12 +3855,14 @@ def test_finalize_rpush_called_before_db_commit(monkeypatch, tmp_path):
 # the sole atomic create. NAS bind mounts (SMB/CIFS/SSHFS) and various FUSE
 # filesystems refuse link() with EPERM/EOPNOTSUPP/ENOSYS; the staging tree
 # default is /downloads which is exactly where users mount their NAS. The
-# helper must fall back to a copy-based publish that preserves the same
-# "fail if target exists" guarantee.
+# helper must fall back to an atomic filesystem lock + same-directory rename
+# that preserves the same "fail if target exists" guarantee without doubling
+# staged bytes.
 
 
 def test_atomic_publish_part_happy_path_uses_link(monkeypatch, tmp_path):
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     part = tmp_path / "x.part"
     target = tmp_path / "x.bin"
@@ -2120,6 +3897,7 @@ def test_atomic_publish_part_falls_back_when_link_unsupported(monkeypatch, tmp_p
     """Simulate a NAS / FUSE filesystem that refuses link() with the
     given errno. The fallback must still publish the bytes."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     import errno as _errno
     code = getattr(_errno, err_code_attr, None)
@@ -2133,19 +3911,155 @@ def test_atomic_publish_part_falls_back_when_link_unsupported(monkeypatch, tmp_p
 
     part = tmp_path / "x.part"
     target = tmp_path / "x.bin"
-    part.write_bytes(b"COPY-FALLBACK-PAYLOAD")
+    part.write_bytes(b"RENAME-FALLBACK-PAYLOAD")
 
     api_main._atomic_publish_part(part, target)
 
-    assert target.read_bytes() == b"COPY-FALLBACK-PAYLOAD"
+    assert target.read_bytes() == b"RENAME-FALLBACK-PAYLOAD"
+    assert not part.exists()
+
+
+def test_atomic_publish_uses_redis_lock_when_nas_lacks_advisory_locks(
+    monkeypatch, tmp_path,
+):
+    """No-hardlink + no-flock NASes retain a bounded distributed fallback."""
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+
+    import errno as _errno
+    monkeypatch.setattr(
+        api_main.os,
+        "link",
+        lambda *_args: (_ for _ in ()).throw(OSError(_errno.EPERM, "NAS")),
+    )
+    unsupported = getattr(_errno, "EOPNOTSUPP", _errno.ENOSYS)
+    monkeypatch.setattr(
+        api_main,
+        "_lock_publish_fd",
+        lambda _fd: (_ for _ in ()).throw(
+            OSError(unsupported, "advisory locks unsupported")
+        ),
+    )
+
+    part = tmp_path / "job" / "video" / "x.part"
+    target = part.with_name("x.bin")
+    part.parent.mkdir(parents=True)
+    part.write_bytes(b"REDIS-LOCK-PAYLOAD")
+
+    api_main._atomic_publish_part(part, target)
+
+    assert target.read_bytes() == b"REDIS-LOCK-PAYLOAD"
+    assert not part.exists()
+    assert fake.get(api_main._redis_publish_lock_key(target)) is None
+    assert api_main._publish_lock_path(target).is_file()
+
+
+@pytest.mark.parametrize("winerror", [1, 50])
+def test_windows_unsupported_operation_uses_rename_and_redis_fallbacks(
+    monkeypatch, tmp_path, winerror,
+):
+    """SMB ERROR_INVALID_FUNCTION is EINVAL, but only on Windows."""
+    import errno as _errno
+
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    monkeypatch.setattr(api_main, "_RUNNING_ON_WINDOWS", True)
+
+    def invalid_function():
+        error = OSError(_errno.EINVAL, "SMB operation unsupported")
+        error.winerror = winerror
+        return error
+
+    monkeypatch.setattr(
+        api_main.os,
+        "link",
+        lambda *_args: (_ for _ in ()).throw(invalid_function()),
+    )
+    monkeypatch.setattr(
+        api_main,
+        "_lock_publish_fd",
+        lambda _fd: (_ for _ in ()).throw(invalid_function()),
+    )
+
+    part = tmp_path / "job" / "video" / "x.part"
+    target = part.with_name("x.bin")
+    part.parent.mkdir(parents=True)
+    part.write_bytes(b"WINDOWS-SMB")
+
+    api_main._atomic_publish_part(part, target)
+
+    assert target.read_bytes() == b"WINDOWS-SMB"
+    assert fake.get(api_main._redis_publish_lock_key(target)) is None
+
+
+def test_posix_einval_does_not_hide_real_link_error(monkeypatch):
+    import errno as _errno
+
+    api_main = _reload_api_main(monkeypatch)
+    monkeypatch.setattr(api_main, "_RUNNING_ON_WINDOWS", False)
+    error = OSError(_errno.EINVAL, "bad link arguments")
+    error.winerror = 1
+    assert api_main._link_is_unsupported(error) is False
+
+
+def test_redis_publish_lock_refresh_is_compare_owner_and_extends_ttl(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    fake = _AtomicCounterRedis()
+    api_main.redis_client = fake
+    target = tmp_path / "job" / "video" / "x.bin"
+    target.parent.mkdir(parents=True)
+    lock_path, lock_fd, identity = api_main._acquire_redis_publish_lock(
+        api_main._publish_lock_path(target), target,
+    )
+    _mode, key, owner = identity
+
+    fake.expirations[key] = 1
+    assert api_main._refresh_publish_lock(lock_path, lock_fd, identity) is True
+    assert fake.expirations[key] == api_main._UPLOAD_SLOT_KEY_TTL_SECONDS
+
+    fake.values[key] = "new-owner"
+    assert api_main._refresh_publish_lock(lock_path, lock_fd, identity) is False
+    api_main._release_publish_lock(lock_path, lock_fd, identity)
+    assert fake.get(key) == "new-owner"
+
+
+def test_redis_publish_lock_heartbeat_runs_off_request_thread(
+    monkeypatch, tmp_path,
+):
+    """A blocked NAS syscall must not prevent the Redis owner lease renewal."""
+    import threading as _threading
+
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    monkeypatch.setattr(api_main, "_PUBLISH_LOCK_REFRESH_INTERVAL_SECONDS", 0.01)
+    renewed = _threading.Event()
+    monkeypatch.setattr(
+        api_main,
+        "_refresh_publish_lock",
+        lambda *_args: renewed.set() or True,
+    )
+    lock_path = tmp_path / ".x.bin.publish.lock"
+    identity = ("redis", "wv2nas:publish_lock:test", "owner")
+
+    heartbeat = api_main._start_publish_lock_heartbeat(
+        lock_path, None, identity,
+    )
+    assert heartbeat is not None
+    assert renewed.wait(timeout=1.0)
+    api_main._stop_publish_lock_heartbeat(heartbeat)
+    assert not heartbeat[1].is_alive()
 
 
 def test_atomic_publish_part_fallback_preserves_existing_target(monkeypatch, tmp_path):
-    """Even on the copy-fallback path, an already-published target must
+    """Even on the rename-fallback path, an already-published target must
     NOT be overwritten — that's the property the os.link version gave
     us via FileExistsError, and the fallback uses O_CREAT|O_EXCL to
     preserve it."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     import errno as _errno
 
@@ -2187,18 +4101,15 @@ def test_atomic_publish_part_propagates_unexpected_oserror(monkeypatch, tmp_path
     assert not target.exists()
 
 
-# Codex adversarial-review (high): the fallback used to copy bytes
-# directly into `target`. A mid-copy crash (process killed, OOM,
-# disk full, container restart) left a partial-content file at the
-# FINAL path. Retry idempotency would accept it as committed. The
-# two-stage publish writes to `<target>.publish.<token>.part`
-# first, then atomically renames over the 0-byte sentinel target.
+# Codex adversarial-review (high): the fallback once copied bytes directly
+# into `target`, so a mid-copy crash left partial content at the FINAL path.
+# The upload already has a complete same-directory `.part`; an atomic lock
+# directory serializes the rename even while NAS metadata operations block.
 
-def test_atomic_publish_fallback_uses_publish_temp_not_direct_write(monkeypatch, tmp_path):
-    """Verify the fallback path opens an O_EXCL sentinel + writes to
-    a `.publish.<token>.part` tmp + atomic-renames. Specifically:
-    the bytes are NEVER written through the sentinel fd."""
+def test_atomic_publish_fallback_renames_complete_part_not_direct_write(monkeypatch, tmp_path):
+    """The fallback must rename the already-complete part while lock-owned."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     import errno as _errno
 
@@ -2215,21 +4126,16 @@ def test_atomic_publish_fallback_uses_publish_temp_not_direct_write(monkeypatch,
 
     assert target.is_file()
     assert target.read_bytes() == b"FULL-PAYLOAD-BYTES"
-    # No leftover publish.part — the atomic rename consumed it.
+    assert not part.exists()
+    # No legacy second-copy temp is created.
     leftover = list(tmp_path.glob("*.publish.*.part"))
     assert leftover == []
 
 
-def test_atomic_publish_fallback_crash_mid_copy_leaves_recoverable_state(monkeypatch, tmp_path):
-    """The Codex regression: simulate a crash AFTER the sentinel
-    O_EXCL but BEFORE the atomic os.replace. State on disk MUST be:
-      - target exists but is 0-byte (sentinel)
-      - publish.part exists (with partial-or-full bytes)
-    Both signals make the verify pass reject:
-      - zero_byte for the sentinel target
-      - in-flight `.part` for the publish tmp
-    So finalize refuses to mux corrupt bytes."""
+def test_atomic_publish_fallback_rename_failure_leaves_recoverable_state(monkeypatch, tmp_path):
+    """A no-replace rename failure leaves the complete part and no target."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     import errno as _errno
 
@@ -2238,13 +4144,11 @@ def test_atomic_publish_fallback_crash_mid_copy_leaves_recoverable_state(monkeyp
 
     monkeypatch.setattr(api_main.os, "link", fake_link)
 
-    # Simulate a crash by making os.replace raise (mid-publish).
-    real_replace = api_main.os.replace
-
-    def crashy_replace(_src, _dst):
+    # Simulate a crash/error at the atomic filesystem commit.
+    def crashy_rename(_src, _dst):
         raise RuntimeError("simulated crash mid-publish")
 
-    monkeypatch.setattr(api_main.os, "replace", crashy_replace)
+    monkeypatch.setattr(api_main, "_rename_noreplace", crashy_rename)
 
     part = tmp_path / "x.part"
     target = tmp_path / "x.bin"
@@ -2253,29 +4157,15 @@ def test_atomic_publish_fallback_crash_mid_copy_leaves_recoverable_state(monkeyp
     with pytest.raises(RuntimeError, match="simulated crash"):
         api_main._atomic_publish_part(part, target)
 
-    # The except BaseException should clean up; if it did:
-    #   - target is gone OR is 0-byte sentinel
-    #   - publish.part is gone
-    # Either way: NEVER a non-zero target with partial bytes.
-    if target.exists():
-        # If cleanup raced, the worst case is a 0-byte sentinel —
-        # rejected by zero-byte check at finalize time.
-        assert target.stat().st_size == 0, (
-            "Crash-mid-copy left a NON-EMPTY target — that's the "
-            "exact corruption the two-stage publish was supposed "
-            "to prevent."
-        )
-
-    # Restore real replace for cleanup.
-    monkeypatch.setattr(api_main.os, "replace", real_replace)
+    assert not target.exists()
+    # The complete part remains available for caller cleanup or retry.
+    assert part.read_bytes() == b"PARTIAL-BYTES-WOULD-CORRUPT"
 
 
-def test_atomic_publish_fallback_writes_publish_temp_not_target_during_copy(monkeypatch, tmp_path):
-    """Stronger guarantee: at NO point during the copy does the
-    final `target` path contain non-zero bytes. We instrument the
-    src.read() call to fail mid-copy and verify target is still 0
-    bytes when cleanup runs (or non-existent post-cleanup)."""
+def test_atomic_publish_fallback_target_is_absent_until_noreplace_rename(monkeypatch, tmp_path):
+    """Immediately before commit, target is absent and source is the part."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     import errno as _errno
 
@@ -2288,59 +4178,146 @@ def test_atomic_publish_fallback_writes_publish_temp_not_target_during_copy(monk
     target = tmp_path / "x.bin"
     part.write_bytes(b"X" * 10_000)
 
-    # Wrap open() so we can crash on the second read of the SOURCE
-    # file. By then, the publish_tmp exists with some bytes BUT
-    # target should still be 0-byte sentinel.
-    real_open = api_main.builtins.open if hasattr(api_main, "builtins") else open
-    target_size_during_copy = {"snapshot": None}
+    observed = {}
+    real_rename = api_main._rename_noreplace
 
-    real_global_open = open
-    crashed = {"flag": False}
+    def watching_rename(src, dst):
+        observed["src"] = src
+        observed["dst"] = dst
+        observed["target_exists"] = target.exists()
+        return real_rename(src, dst)
 
-    def watching_open(path, mode="r", *args, **kwargs):
-        f = real_global_open(path, mode, *args, **kwargs)
-        path_str = str(path)
-        if path_str == str(part) and "rb" in mode:
-            real_read = f.read
+    monkeypatch.setattr(api_main, "_rename_noreplace", watching_rename)
+    api_main._atomic_publish_part(part, target)
 
-            def watching_read(n=-1, *_):
-                # On the first read, snapshot target's size — it
-                # should be 0 (sentinel) since bytes are flowing
-                # into publish.part, not target.
-                if not crashed["flag"]:
-                    try:
-                        target_size_during_copy["snapshot"] = target.stat().st_size
-                    except OSError:
-                        target_size_during_copy["snapshot"] = -1
-                    crashed["flag"] = True
-                    raise RuntimeError("simulated crash mid-source-read")
-                return real_read(n)
-            f.read = watching_read
-        return f
+    assert observed == {
+        "src": part,
+        "dst": target,
+        "target_exists": False,
+    }
+    assert target.read_bytes() == b"X" * 10_000
+    assert not part.exists()
 
-    # Use a context to swap open during the call.
-    import builtins as _b
-    monkeypatch.setattr(_b, "open", watching_open)
 
-    with pytest.raises(RuntimeError):
+def test_atomic_publish_fallback_refuses_live_owner_lock(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+
+    import errno as _errno
+    monkeypatch.setattr(
+        api_main.os,
+        "link",
+        lambda *_args: (_ for _ in ()).throw(OSError(_errno.EPERM, "NAS")),
+    )
+    part = tmp_path / "x.part"
+    target = tmp_path / "x.bin"
+    part.write_bytes(b"SECOND")
+    api_main._publish_lock_path(target).mkdir()
+
+    with pytest.raises(api_main._PublishBusyError):
         api_main._atomic_publish_part(part, target)
 
-    # The CRITICAL assertion: while bytes were being copied,
-    # `target` was 0-byte. Pre-fix, target was the destination of
-    # the copy and would have grown.
-    assert target_size_during_copy["snapshot"] == 0, (
-        "While the publish copy was in progress, target was "
-        f"{target_size_during_copy['snapshot']} bytes (expected 0). "
-        "The two-stage publish should keep target as a 0-byte "
-        "sentinel until the atomic os.replace runs."
+    assert part.read_bytes() == b"SECOND"
+    assert not target.exists()
+
+
+def test_atomic_publish_fallback_recovers_lock_after_owner_process_dies(
+    monkeypatch, tmp_path,
+):
+    """Closing the owner fd models kernel cleanup after process death."""
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    import errno as _errno
+
+    monkeypatch.setattr(
+        api_main.os,
+        "link",
+        lambda *_args: (_ for _ in ()).throw(OSError(_errno.EPERM, "NAS")),
+    )
+    part = tmp_path / "x.part"
+    target = tmp_path / "x.bin"
+    part.write_bytes(b"RECOVERED")
+
+    _lock_path, owner_fd, _identity = api_main._acquire_publish_lock(target)
+    # A killed process cannot run finally/unlock; closing all descriptors is
+    # what the OS does and must make the persistent lock file reusable.
+    api_main.os.close(owner_fd)
+
+    api_main._atomic_publish_part(part, target)
+    assert target.read_bytes() == b"RECOVERED"
+
+
+def test_atomic_publish_lost_owner_never_deletes_another_publish(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
+
+    import errno as _errno
+    monkeypatch.setattr(
+        api_main.os,
+        "link",
+        lambda *_args: (_ for _ in ()).throw(OSError(_errno.EPERM, "NAS")),
+    )
+    part = tmp_path / "x.part"
+    target = tmp_path / "x.bin"
+    part.write_bytes(b"FIRST")
+
+    def lose_owner(_path, _identity):
+        target.write_bytes(b"OTHER-PUBLISH")
+        return False
+
+    monkeypatch.setattr(api_main, "_publish_lock_matches", lose_owner)
+
+    with pytest.raises(api_main._PublishBusyError):
+        api_main._atomic_publish_part(part, target)
+
+    assert target.read_bytes() == b"OTHER-PUBLISH"
+    assert part.read_bytes() == b"FIRST"
+
+
+def test_redis_fallback_stale_owner_cannot_overwrite_new_publish(
+    monkeypatch, tmp_path,
+):
+    """Filesystem no-replace fences the refresh→rename Redis TOCTOU."""
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
+    import errno as _errno
+
+    monkeypatch.setattr(
+        api_main.os,
+        "link",
+        lambda *_args: (_ for _ in ()).throw(OSError(_errno.EPERM, "NAS")),
+    )
+    unsupported = getattr(_errno, "EOPNOTSUPP", _errno.ENOSYS)
+    monkeypatch.setattr(
+        api_main,
+        "_lock_publish_fd",
+        lambda _fd: (_ for _ in ()).throw(
+            OSError(unsupported, "advisory locks unsupported")
+        ),
     )
 
+    part = tmp_path / "x.part"
+    target = tmp_path / "x.bin"
+    part.write_bytes(b"STALE-OWNER")
+    real_rename = api_main._rename_noreplace
 
-def test_atomic_publish_fallback_publish_tmp_caught_by_part_glob(monkeypatch, tmp_path):
-    """The publish tmp is named `<target>.publish.<token>.part` so
-    the existing in-flight upload guard (`*.part` glob in
-    _verify_staging_complete) treats a leftover stale tmp as
-    'upload still in flight' and rejects finalize."""
+    def publish_new_generation_then_resume_stale(source, destination):
+        target.write_bytes(b"NEW-OWNER")
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(
+        api_main,
+        "_rename_noreplace",
+        publish_new_generation_then_resume_stale,
+    )
+
+    with pytest.raises(FileExistsError):
+        api_main._atomic_publish_part(part, target)
+
+    assert target.read_bytes() == b"NEW-OWNER"
+    assert part.read_bytes() == b"STALE-OWNER"
+
+
+def test_atomic_publish_fallback_legacy_publish_tmp_caught_by_part_glob(monkeypatch, tmp_path):
+    """A leftover temp from older releases still blocks finalize safely."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
 
     # Simulate a leftover tmp from a prior crash.
@@ -2382,6 +4359,7 @@ def test_init_retry_replaces_zero_byte_sentinel_from_crashed_publish(monkeypatch
     0-byte case and overwrites via os.replace instead of returning
     idempotent_concurrent."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     import asyncio
     from unittest.mock import MagicMock as _MM
@@ -2470,6 +4448,7 @@ def test_segment_publish_succeeds_on_link_unsupported_filesystem(monkeypatch, tm
     raises EPERM (NAS bind mount) must still publish the bytes —
     NOT 500 with 'Segment write failed' as before the fix."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     import asyncio
     import errno as _errno
@@ -2517,6 +4496,7 @@ def test_init_publish_succeeds_on_link_unsupported_filesystem(monkeypatch, tmp_p
     """Same end-to-end check for the init-segment path (line 1429
     in the Codex finding) — fMP4/DASH must work on NAS too."""
     api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.redis_client = _AtomicCounterRedis()
 
     import asyncio
     import errno as _errno
@@ -2706,6 +4686,277 @@ def test_stream_segment_to_disk_rejects_declared_range_length_mismatch(monkeypat
     assert list(tmp_path.rglob("*.part")) == []
 
 
+def test_stream_segment_to_disk_stops_at_declared_range_length(monkeypatch, tmp_path):
+    """An 8-byte reservation must never permit a larger temporary file."""
+    api_main = _reload_api_main(
+        monkeypatch,
+        STAGING_DIR=str(tmp_path),
+        MAX_SEGMENT_BYTES="5000",
+    )
+
+    import asyncio
+    from unittest.mock import MagicMock as _MM
+
+    target = tmp_path / "video" / "seg_00000000.bin"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    chunks_read = 0
+
+    class _FakeRequest:
+        async def stream(self):
+            nonlocal chunks_read
+            for chunk in (b"12345678", b"9", b"must-not-be-read"):
+                chunks_read += 1
+                yield chunk
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(api_main._stream_segment_to_disk(
+            request=_FakeRequest(),
+            db=_MM(),
+            meta=_MM(status="browser_uploading"),
+            job_id="11111111-2222-3333-4444-555555555555",
+            track="video", seq=0,
+            target=target,
+            expected_length=8,
+        ))
+
+    assert exc.value.status_code == 413
+    assert "exceeds planned length 8 bytes" in str(exc.value.detail)
+    assert chunks_read == 2
+    assert not target.exists()
+    assert list(tmp_path.rglob("*.part")) == []
+
+
+@pytest.mark.parametrize("kind", ["segment", "init"])
+def test_upload_idle_timeout_removes_partial_file(monkeypatch, tmp_path, kind):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    api_main.UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS = 0.01
+
+    import asyncio
+    from unittest.mock import MagicMock as _MM
+
+    target = tmp_path / kind / ("seg_00000000.bin" if kind == "segment" else "video.bin")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    class _SlowRequest:
+        async def stream(self):
+            yield b"partial"
+            await asyncio.sleep(1)
+            yield b"never"
+
+    class _FakeRow:
+        status = "browser_uploading"
+
+    db = _MM()
+    db.execute = _MM(return_value=_MM(first=lambda: _FakeRow()))
+    if kind == "segment":
+        operation = api_main._stream_segment_to_disk(
+            request=_SlowRequest(),
+            db=db,
+            meta=_MM(status="browser_uploading"),
+            job_id="11111111-2222-3333-4444-555555555555",
+            track="video",
+            seq=0,
+            target=target,
+            expected_length=20,
+        )
+    else:
+        operation = api_main._stream_init_to_disk(
+            request=_SlowRequest(),
+            db=db,
+            job_id="11111111-2222-3333-4444-555555555555",
+            track="video",
+            target=target,
+        )
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(operation)
+
+    assert exc.value.status_code == 408
+    assert not target.exists()
+    assert list(tmp_path.rglob("*.part")) == []
+
+
+def test_upload_coordination_refresh_is_throttled(monkeypatch):
+    api_main = _reload_api_main(monkeypatch)
+    api_main.UPLOAD_COORDINATION_REFRESH_SECONDS = 30
+    ticks = iter((0.0, 0.0, 10.0, 31.0, 31.0, 31.0))
+    monkeypatch.setattr(api_main, "_upload_monotonic_seconds", lambda: next(ticks))
+    refreshed = []
+    monkeypatch.setattr(
+        api_main,
+        "_refresh_upload_coordination_ttl",
+        lambda job_id, *_args, **_kwargs: refreshed.append(job_id) or True,
+    )
+
+    class _Request:
+        async def stream(self):
+            yield b"a"
+            yield b"b"
+
+    import asyncio
+    db = MagicMock()
+
+    async def collect():
+        return [
+            chunk async for chunk in api_main._iter_upload_chunks(
+                _Request(), "job-A", db,
+            )
+        ]
+
+    assert asyncio.run(collect()) == [b"a", b"b"]
+    assert refreshed == ["job-A"]
+
+
+def test_upload_total_deadline_rejects_slow_drip_body(monkeypatch):
+    api_main = _reload_api_main(
+        monkeypatch,
+        UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS="300",
+        UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS="600",
+    )
+    ticks = iter((0.0, 0.0, 1.0, 601.0))
+    monkeypatch.setattr(api_main, "_upload_monotonic_seconds", lambda: next(ticks))
+
+    class _Request:
+        async def stream(self):
+            yield b"a"
+            yield b"b"
+
+    import asyncio
+
+    async def collect():
+        return [
+            chunk async for chunk in api_main._iter_upload_chunks(
+                _Request(), "job-A", MagicMock(),
+            )
+        ]
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(collect())
+    assert exc.value.status_code == 408
+    assert "total deadline" in str(exc.value.detail)
+
+
+def test_long_upload_refreshes_database_activity_lease(monkeypatch):
+    api_main = _reload_api_main(monkeypatch)
+    ticks = iter((0.0, 0.0, 301.0, 301.0))
+    monkeypatch.setattr(api_main, "_upload_monotonic_seconds", lambda: next(ticks))
+    monkeypatch.setattr(
+        api_main,
+        "_refresh_upload_coordination_ttl",
+        lambda *_args, **_kwargs: True,
+    )
+    db_refreshes = []
+    monkeypatch.setattr(
+        api_main,
+        "_refresh_upload_lease_independent",
+        lambda job_id: db_refreshes.append(job_id),
+    )
+
+    class _Request:
+        async def stream(self):
+            yield b"a"
+
+    import asyncio
+    db = MagicMock()
+
+    async def collect():
+        return [
+            chunk async for chunk in api_main._iter_upload_chunks(
+                _Request(), "job-A", db,
+            )
+        ]
+
+    assert asyncio.run(collect()) == [b"a"]
+    assert db_refreshes == ["job-A"]
+
+
+def test_upload_housekeeping_timeout_does_not_block_event_loop(monkeypatch):
+    api_main = _reload_api_main(monkeypatch)
+    api_main.UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS = 1.0
+    api_main.UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS = 0.05
+    api_main.UPLOAD_COORDINATION_REFRESH_SECONDS = 0
+
+    import asyncio
+    import time as _time
+
+    def blocked_housekeeping(*_args, **_kwargs):
+        _time.sleep(0.5)
+        return True
+
+    monkeypatch.setattr(api_main, "_run_upload_housekeeping", blocked_housekeeping)
+
+    class _Request:
+        async def stream(self):
+            yield b"a"
+
+    async def scenario():
+        started = _time.monotonic()
+
+        async def side_probe():
+            await asyncio.sleep(0.01)
+            return _time.monotonic() - started
+
+        probe = asyncio.create_task(side_probe())
+        with pytest.raises(api_main.HTTPException) as exc:
+            async for _chunk in api_main._iter_upload_chunks(
+                _Request(), "job-A", MagicMock(),
+            ):
+                pass
+        return exc.value, await probe, _time.monotonic() - started
+
+    error, probe_elapsed, total_elapsed = asyncio.run(scenario())
+    assert error.status_code == 408
+    assert probe_elapsed < 0.1
+    assert total_elapsed < 0.25
+
+
+@pytest.mark.parametrize("kind", ["segment", "init"])
+def test_cancelled_upload_removes_partial_file(monkeypatch, tmp_path, kind):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+
+    import asyncio
+    from unittest.mock import MagicMock as _MM
+
+    target = tmp_path / kind / ("seg_00000000.bin" if kind == "segment" else "video.bin")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    class _CancelledRequest:
+        async def stream(self):
+            yield b"partial"
+            raise asyncio.CancelledError()
+
+    class _FakeRow:
+        status = "browser_uploading"
+
+    db = _MM()
+    db.execute = _MM(return_value=_MM(first=lambda: _FakeRow()))
+    if kind == "segment":
+        operation = api_main._stream_segment_to_disk(
+            request=_CancelledRequest(),
+            db=db,
+            meta=_MM(status="browser_uploading"),
+            job_id="11111111-2222-3333-4444-555555555555",
+            track="video",
+            seq=0,
+            target=target,
+            expected_length=20,
+        )
+    else:
+        operation = api_main._stream_init_to_disk(
+            request=_CancelledRequest(),
+            db=db,
+            job_id="11111111-2222-3333-4444-555555555555",
+            track="video",
+            target=target,
+        )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(operation)
+
+    assert not target.exists()
+    assert list(tmp_path.rglob("*.part")) == []
+
+
 def test_stream_init_to_disk_rejects_empty_body(monkeypatch, tmp_path):
     """Init upload with a 0-byte body must 400 — published 0-byte
     init slips past _verify_staging_complete's old .is_file() check
@@ -2809,6 +5060,60 @@ def test_stream_init_to_disk_accepts_non_empty_body(monkeypatch, tmp_path):
     assert target.stat().st_size > 0
 
 
+def test_stream_init_to_disk_rejects_planned_byterange_mismatch(
+    monkeypatch, tmp_path,
+):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    import asyncio
+    from unittest.mock import MagicMock as _MM
+
+    target = tmp_path / "init.bin"
+
+    class _FakeRequest:
+        async def stream(self):
+            yield b"1234567"
+
+    db = _MM()
+    db.execute = _MM(return_value=_MM(first=lambda: _MM(status="browser_uploading")))
+    with pytest.raises(api_main.HTTPException) as exc:
+        asyncio.run(api_main._stream_init_to_disk(
+            request=_FakeRequest(),
+            db=db,
+            job_id="11111111-2222-3333-4444-555555555555",
+            track="video",
+            target=target,
+            expected_length=8,
+        ))
+    assert exc.value.status_code == 400
+    assert not target.exists()
+
+
+def test_verify_staging_complete_checks_init_byterange_length(monkeypatch, tmp_path):
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    staging = tmp_path / "job"
+    _write_plan(staging, {
+        "tracks": {
+            "video": {
+                "segment_count": 1,
+                "segments": [{"seq": 0}],
+                "init_segment_url": "https://cdn.example.com/init.mp4",
+                "init_segment_byte_range": {"offset": 0, "length": 8},
+            },
+        },
+    })
+    (staging / "video").mkdir()
+    (staging / "init").mkdir()
+    (staging / "video" / "seg_00000000.bin").write_bytes(b"segment")
+    (staging / "init" / "video.bin").write_bytes(b"1234567")
+
+    with pytest.raises(api_main.HTTPException) as exc:
+        api_main._verify_staging_complete(staging)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["size_mismatch"]["video:init"][0] == {
+        "seq": "init", "expected": 8, "actual": 7,
+    }
+
+
 def test_verify_staging_complete_rejects_zero_byte_init(monkeypatch, tmp_path):
     """Defense-in-depth: even if a 0-byte init landed via some other
     path (legacy bug, manual filesystem corruption), _verify must
@@ -2840,6 +5145,46 @@ def test_verify_staging_complete_rejects_zero_byte_init(monkeypatch, tmp_path):
     # The init's zero-byte report key is "<track>:init".
     assert "zero_byte" in detail
     assert "video:init" in detail["zero_byte"]
+
+
+def test_verify_staging_complete_rejects_init_that_becomes_unstatable(
+    monkeypatch, tmp_path,
+):
+    """A metadata I/O failure after is_file() must not pass finalize."""
+    api_main = _reload_api_main(monkeypatch, STAGING_DIR=str(tmp_path))
+    staging = tmp_path / "job"
+    (staging / "video").mkdir(parents=True)
+    (staging / "init").mkdir()
+    (staging / "video" / "seg_00000000.bin").write_bytes(b"OK")
+    init_path = staging / "init" / "video.bin"
+    init_path.write_bytes(b"FTYP-MOOV")
+    _write_plan(staging, {
+        "container": "dash",
+        "tracks": {
+            "video": {
+                "segment_count": 1,
+                "init_segment_url": "https://cdn.example.com/init.mp4",
+            },
+        },
+    })
+
+    real_stat = Path.stat
+    init_stat_calls = 0
+
+    def flaky_stat(path, *args, **kwargs):
+        nonlocal init_stat_calls
+        if path == init_path:
+            init_stat_calls += 1
+            if init_stat_calls >= 2:
+                raise OSError("simulated NAS metadata failure")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    with pytest.raises(api_main.HTTPException) as exc:
+        api_main._verify_staging_complete(staging)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["missing"]["video:init"] == [0]
 
 
 def test_verify_staging_complete_accepts_nonzero_init(monkeypatch, tmp_path):

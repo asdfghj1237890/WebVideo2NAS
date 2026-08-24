@@ -30,7 +30,10 @@ async function sendCompletionMessageWithRetry(message) {
   let lastErr = null;
   for (let attempt = 0; attempt < COMPLETION_SEND_MAX_ATTEMPTS; attempt++) {
     try {
-      await chrome.runtime.sendMessage(message);
+      const response = await chrome.runtime.sendMessage(message);
+      if (response && response.ok === false) {
+        throw new Error(response.error || 'service worker rejected completion');
+      }
       return true;
     } catch (err) {
       lastErr = err;
@@ -96,7 +99,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // (so it lands on 100%); throttle the middle.
     const PROGRESS_THROTTLE_MS = 200;
     let lastProgressTs = 0;
-    const onProgress = ({ done, total }) => {
+    const onProgress = ({ done, total, concurrency, transferTimings }) => {
       const now = Date.now();
       const isFirst = done === 1;
       const isLast = total > 0 && done >= total;
@@ -105,12 +108,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.runtime.sendMessage({
         type: 'BROWSER_JOB_PROGRESS',
         target: 'service-worker',
-        payload: { jobId, done, total, ts: now },
+        payload: {
+          jobId,
+          done,
+          total,
+          concurrency,
+          transferTimings,
+          ts: now,
+        },
       }).catch(() => {});
     };
 
     runJob({ ...msg.payload, signal: controller.signal, onProgress })
       .then(async (summary) => {
+        console.info('[wv2nas-transfer]', {
+          jobId,
+          concurrency: summary && summary.concurrency,
+          transferTimings: summary && summary.transferTimings,
+        });
         await deliverCompletionWhileAlive({
           type: 'BROWSER_JOB_DONE',
           target: 'service-worker',
@@ -118,6 +133,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
       })
       .catch(async (err) => {
+        console.info('[wv2nas-transfer]', {
+          jobId,
+          failed: true,
+          concurrency: err && err.concurrency,
+          transferTimings: err && err.transferTimings,
+        });
         // Codex review #4: forward finalizeAttempted flag so the SW can
         // decide whether the server-side abort is safe to call. Once
         // finalize has been POSTed, the server may have committed the
@@ -130,6 +151,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             error: String(err && err.message || err),
             finalizeAttempted: !!(err && err.finalizeAttempted),
             userCancelled: !!state.userCancelled,
+            concurrency: err && err.concurrency,
+            done: err && err.done,
+            total: err && err.total,
+            transferTimings: err && err.transferTimings,
           },
         });
       })

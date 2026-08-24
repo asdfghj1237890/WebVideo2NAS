@@ -160,12 +160,16 @@ describe('background.js pure helpers', () => {
     expect(ctx.getStoredPageTitle(sharedUrl, 8)).toBe('Tab Eight');
   });
 
-  it('uses a shared DASH audio request as playback evidence for every quality', () => {
+  it('does not use shared DASH audio to select every quality, including request-before-detection races', () => {
     const ctx = loadScriptIntoContext('background.js', {
       chrome: makeChromeStub(),
       fetch: async () => ({ ok: true, json: async () => ({}) }),
     });
     const audio = { url: 'https://cdn.example.com/audio.m4s?sig=1', mimeType: 'audio/mp4' };
+    ctx.rememberRecentDirectDashTrackRequest({
+      tabId: 7,
+      url: 'https://cdn.example.com/audio.m4s?sig=played-before-detection',
+    });
     for (const height of [1080, 720]) {
       ctx.registerDirectDashDetection(7, {
         pageUrl: 'https://page.example/watch',
@@ -178,8 +182,259 @@ describe('background.js pure helpers', () => {
       tabId: 7,
       url: 'https://cdn.example.com/audio.m4s?sig=refreshed',
     });
-    expect(matches).toHaveLength(2);
-    expect(ctx.__eval('currentTabUrls[7].every((row) => row.playbackObserved)')).toBe(true);
+    expect(matches).toHaveLength(0);
+    expect(ctx.__eval('currentTabUrls[7].every((row) => !row.playbackObserved)')).toBe(true);
+
+    const videoMatches = ctx.markExistingDirectDashPlaybackFromTrack({
+      tabId: 7,
+      url: 'https://cdn.example.com/video-720.m4s?sig=played',
+    });
+    expect(videoMatches).toHaveLength(1);
+    expect(videoMatches[0].qualityHeight).toBe(720);
+    expect(ctx.__eval('currentTabUrls[7].find((row) => row.qualityHeight === 1080).playbackObserved')).not.toBe(true);
+    expect(ctx.__eval('currentTabUrls[7].find((row) => row.qualityHeight === 720).playbackObserved')).toBe(true);
+  });
+
+  it('uses DASH audio as weak playback evidence when the tab has one video candidate', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    ctx.registerDirectDashDetection(7, {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://cdn.example.com/video-1080.m4s?sig=1',
+        mimeType: 'video/mp4',
+        height: 1080,
+      },
+      audio: {
+        url: 'https://cdn.example.com/audio.m4s?sig=1',
+        mimeType: 'audio/mp4',
+      },
+    });
+
+    const matches = ctx.markExistingDirectDashPlaybackFromTrack({
+      tabId: 7,
+      url: 'https://cdn.example.com/audio.m4s?sig=played',
+    });
+    expect(matches).toHaveLength(1);
+    expect(matches[0].qualityHeight).toBe(1080);
+    expect(ctx.__eval('currentTabUrls[7][0].playbackObserved')).toBe(true);
+  });
+
+  it('backfills weak audio evidence when audio starts before the sole JSON candidate', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    ctx.rememberRecentDirectDashTrackRequest({
+      tabId: 7,
+      url: 'https://cdn.example.com/audio.m4s?sig=played-before-json',
+    });
+    ctx.registerDirectDashDetection(7, {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://cdn.example.com/video.m4s?qn=1080&sig=fresh',
+        mimeType: 'video/mp4',
+        height: 1080,
+      },
+      audio: {
+        url: 'https://cdn.example.com/audio.m4s?sig=fresh',
+        mimeType: 'audio/mp4',
+      },
+    });
+
+    expect(ctx.__eval('currentTabUrls[7][0].playbackObserved')).toBe(true);
+    expect(ctx.__eval('currentTabUrls[7][0].directDashPlaybackEvidence')).toBe('audio');
+  });
+
+  it('uses the exact query to distinguish qualities sharing one m4s path', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    const audio = { url: 'https://cdn.example.com/audio.m4s?sig=1', mimeType: 'audio/mp4' };
+    for (const height of [1080, 720]) {
+      ctx.registerDirectDashDetection(7, {
+        pageUrl: 'https://page.example/watch',
+        video: {
+          url: `https://cdn.example.com/video.m4s?quality=${height}&sig=shared`,
+          mimeType: 'video/mp4',
+          height,
+        },
+        audio,
+      });
+    }
+
+    const matches = ctx.markExistingDirectDashPlaybackFromTrack({
+      tabId: 7,
+      url: 'https://cdn.example.com/video.m4s?quality=720&sig=shared',
+    });
+    expect(matches).toHaveLength(1);
+    expect(matches[0].qualityHeight).toBe(720);
+    expect(ctx.__eval('currentTabUrls[7].find((row) => row.qualityHeight === 1080).playbackObserved')).not.toBe(true);
+  });
+
+  it('revokes provisional path evidence when a later JSON candidate owns the same path', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    ctx.rememberRecentDirectDashTrackRequest({
+      tabId: 7,
+      url: 'https://cdn.example.com/video.m4s?quality=720&sig=shared',
+    });
+    const audio = { url: 'https://cdn.example.com/audio.m4s?sig=1', mimeType: 'audio/mp4' };
+
+    ctx.registerDirectDashDetection(7, {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://cdn.example.com/video.m4s?quality=1080&sig=shared',
+        mimeType: 'video/mp4',
+        height: 1080,
+      },
+      audio,
+    });
+    expect(ctx.__eval('currentTabUrls[7][0].directDashPlaybackEvidence')).toBe('video-path');
+
+    ctx.registerDirectDashDetection(7, {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://cdn.example.com/video.m4s?quality=720&sig=shared',
+        mimeType: 'video/mp4',
+        height: 720,
+      },
+      audio,
+    });
+
+    expect(ctx.__eval('currentTabUrls[7].find((row) => row.qualityHeight === 720).playbackObserved')).toBe(true);
+    expect(ctx.__eval('currentTabUrls[7].find((row) => row.qualityHeight === 720).directDashPlaybackEvidence')).toBe('video');
+    expect(ctx.__eval('currentTabUrls[7].find((row) => row.qualityHeight === 1080).playbackObserved')).not.toBe(true);
+  });
+
+  it('revokes weak DASH audio evidence if another quality registers later', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    const audio = {
+      url: 'https://cdn.example.com/audio.m4s?sig=1',
+      mimeType: 'audio/mp4',
+    };
+    ctx.registerDirectDashDetection(7, {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://cdn.example.com/video-1080.m4s?sig=1',
+        mimeType: 'video/mp4',
+        height: 1080,
+      },
+      audio,
+    });
+    ctx.markExistingDirectDashPlaybackFromTrack({
+      tabId: 7,
+      url: 'https://cdn.example.com/audio.m4s?sig=played',
+    });
+    expect(ctx.__eval('currentTabUrls[7][0].playbackObserved')).toBe(true);
+
+    ctx.registerDirectDashDetection(7, {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://cdn.example.com/video-720.m4s?sig=1',
+        mimeType: 'video/mp4',
+        height: 720,
+      },
+      audio,
+    });
+
+    expect(ctx.__eval('currentTabUrls[7].every((row) => !row.playbackObserved)')).toBe(true);
+    expect(ctx.__eval('currentTabUrls[7].every((row) => !row.directDashPlaybackEvidence)')).toBe(true);
+
+    ctx.markExistingDirectDashPlaybackFromTrack({
+      tabId: 7,
+      url: 'https://cdn.example.com/video-1080.m4s?sig=played',
+    });
+    ctx.registerDirectDashDetection(7, {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://cdn.example.com/video-480.m4s?sig=1',
+        mimeType: 'video/mp4',
+        height: 480,
+      },
+      audio,
+    });
+    expect(ctx.__eval('currentTabUrls[7].find((row) => row.qualityHeight === 1080).playbackObserved')).toBe(true);
+    expect(ctx.__eval('currentTabUrls[7].find((row) => row.qualityHeight === 1080).directDashPlaybackEvidence')).toBe('video-path');
+  });
+
+  it('backfills DASH playback when the first m4s request arrives before JSON detection', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    const now = 5_000_000;
+    withFixedNow(ctx, now);
+
+    ctx.rememberRecentDirectDashTrackRequest({
+      tabId: 7,
+      url: 'https://backup.example.com/video-1080.m4s?token=played',
+    });
+    ctx.registerDirectDashDetection(7, {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://primary.example.com/video-1080.m4s?token=fresh',
+        backupUrls: ['https://backup.example.com/video-1080.m4s?token=fresh'],
+        mimeType: 'video/mp4',
+        height: 1080,
+      },
+      audio: {
+        url: 'https://primary.example.com/audio.m4s?token=fresh',
+        mimeType: 'audio/mp4',
+      },
+    });
+
+    const [row] = ctx.__eval('currentTabUrls[7]');
+    expect(row.playbackObserved).toBe(true);
+    expect(row.lastSegmentAt).toBe(now);
+  });
+
+  it('does not backfill DASH playback across tabs, representations, or expired requests', () => {
+    const ctx = loadScriptIntoContext('background.js', {
+      chrome: makeChromeStub(),
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+    });
+    const base = {
+      pageUrl: 'https://page.example/watch',
+      video: {
+        url: 'https://cdn.example.com/video-1080.m4s?token=fresh',
+        mimeType: 'video/mp4',
+        height: 1080,
+      },
+      audio: {
+        url: 'https://cdn.example.com/audio.m4s?token=fresh',
+        mimeType: 'audio/mp4',
+      },
+    };
+
+    withFixedNow(ctx, 1_000_000);
+    ctx.rememberRecentDirectDashTrackRequest({
+      tabId: 8,
+      url: 'https://cdn.example.com/video-1080.m4s?token=other-tab',
+    });
+    ctx.rememberRecentDirectDashTrackRequest({
+      tabId: 7,
+      url: 'https://cdn.example.com/video-720.m4s?token=other-quality',
+    });
+    ctx.registerDirectDashDetection(7, base);
+    expect(ctx.__eval('currentTabUrls[7][0].playbackObserved')).toBe(false);
+
+    ctx.__eval('currentTabUrls[7] = []; currentTabUrlKeys[7] = new Set();');
+    ctx.rememberRecentDirectDashTrackRequest({
+      tabId: 7,
+      url: 'https://cdn.example.com/video-1080.m4s?token=expired',
+    });
+    withFixedNow(ctx, 1_120_001);
+    ctx.registerDirectDashDetection(7, base);
+    expect(ctx.__eval('currentTabUrls[7][0].playbackObserved')).toBe(false);
   });
 
   it('probes complete DASH track length with a one-byte Range request', async () => {

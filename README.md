@@ -74,7 +74,7 @@ This system enables you to:
 - ✅ One-click send to NAS
 - ✅ Side panel interface for easy access
 - ✅ Browser-side HLS/DASH mode for cookie/IP-bound streams
-- ✅ Live browser-side upload progress and NAS job progress
+- ✅ Live browser-side upload progress with separate CDN/NAS transfer rates, plus NAS job progress
 - ✅ Trusted cross-site CDN allowlist with exact-host one-click add
 - ✅ Cookie & header forwarding for authenticated streams
 - ✅ Context menu integration
@@ -256,7 +256,15 @@ The full list with inline comments lives in [`.env.example`](video-downloader/do
 |---|---|---|
 | `IMAGE_TAG` | `latest` | Pin to a specific release (e.g. `3.1.10`) instead of tracking latest |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose troubleshooting; `WARNING` to quiet down |
-| `MAX_DOWNLOAD_WORKERS` | `20` | Per-worker thread pool for HLS segment downloads |
+| `MAX_DOWNLOAD_WORKERS` | `10` | Per-worker thread pool for HLS/DASH segment downloads |
+| `MAX_SEGMENT_RESPONSE_BYTES` | `64 MiB` | Streamed in-memory ceiling for one NAS-direct HLS/DASH media segment |
+| `MAX_INFLIGHT_SEGMENT_BYTES` | `128 MiB` | Aggregate retained media-body budget per worker process; authoritative small Content-Length values reserve only their actual size |
+| `MAX_INIT_SEGMENT_BYTES` | `16 MiB` | Streamed in-memory ceiling for one fMP4 init object |
+| `MAX_CONCURRENT_UPLOADS_PER_JOB` | `12` | Server ceiling advertised to all browser-side plans; Direct DASH can use up to 12, ordinary manifests up to 6 |
+| `MAX_BROWSER_PLAN_BYTES` | `32 MiB` | Reject oversized serialized browser plans before staging |
+| `UPLOAD_STREAM_IDLE_TIMEOUT_SECONDS` | `300` | Abort a browser upload body that stops producing bytes |
+| `UPLOAD_STREAM_TOTAL_TIMEOUT_SECONDS` | `1800` | Hard request-body receive deadline, including lease housekeeping but excluding an already-running NAS write/fsync (never lower than idle timeout) |
+| `REDIS_SOCKET_TIMEOUT_SECONDS` | `5` | Bound Redis connect/read calls used by upload coordination and publish locks |
 | `FFMPEG_THREADS` | `2` | Threads ffmpeg uses during merge |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Per-IP API rate limit (0 disables) |
 | `ALLOWED_CLIENT_CIDRS` | _(empty)_ | Comma-separated CIDRs permitted to call the API; empty = no restriction |
@@ -353,6 +361,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <summary><strong>Full Changelog (click to expand)</strong></summary>
 
 ### [Unreleased]
+
+### [3.4.0] - 2026-08-24
+
+#### Added
+- Browser-side jobs now report CDN fetch and NAS upload timing separately. The sidepanel keeps each stage's active wall-clock timer and throughput visible, while the expandable details include successful/attempted bytes, summed request time, failures, cancellations, in-flight count, and selected concurrency. Session snapshots preserve diagnostics across sidepanel or service-worker restarts and on completed/failed rows.
+
+#### Changed
+- Direct DASH uses a server-recommended concurrency up to 12, clamped by the deployment's per-job upload cap and staging quota; ordinary HLS/MPD plans also honor a server recommendation up to 6. Transient NAS upload retries reuse the already-fetched CDN bytes instead of downloading the same signed range again.
+- NAS-direct DASH/HLS downloads keep at most `2 × MAX_DOWNLOAD_WORKERS` futures in flight instead of materializing the whole segment queue. Manifest, media, init, and AES-key bodies are streamed under explicit per-object and aggregate in-flight ceilings; concurrent segments that share an AES key use one single-flight key request. DASH XML depth/elements/templates/BaseURLs/expanded URLs and unsupported fallback shapes are bounded before expansion, including the API's pre-materialization plan-budget mirror.
+- Captured cookies and authorization stay scoped to the original manifest trust boundary across redirects. The final HLS/MPD URL supplies only the generated Referer/Origin needed by its own init, key, and media resources; deterministic range/size violations fail once without replaying every header strategy or segment retry, and DASH stops its all-or-nothing queue on the first definitive missing segment.
 
 ### [3.3.2] - 2026-08-24
 
@@ -479,7 +497,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### [2.3.5] - 2026-05-05
 
 #### Added
-- **Worker diagnostic logs for the HLS download / decryption pipeline**, to make root-causing future "downloaded but wrong" cases tractable without round-tripping through extra reproductions. Two new instrumentation points: (1) `_get_key_bytes` now logs the AES-128 key endpoint's Content-Type, length, and full hex, plus a WARNING when all 16 bytes fall in the printable-ASCII range (sometimes legitimate — some hosts genuinely use ASCII-text keys — but worth surfacing as it's an unusual key shape worth eyeballing); (2) new `_diagnose_segment_durations` runs after segment download finishes, sample-probes 5 segments (start, 25%, 50%, 75%, end) with ffprobe and compares the actually-decoded duration to the m3u8's `#EXTINF` declaration. Both are pure observability — neither fails the job — and together they give enough signal to distinguish "decryption broken", "individual segments wrong", and "merge step lost data" in a handful of log lines.
+- **Worker diagnostic logs for the HLS download / decryption pipeline**, to make root-causing future "downloaded but wrong" cases tractable without round-tripping through extra reproductions. Two new instrumentation points: (1) `_get_key_bytes` logs the AES-128 key endpoint's Content-Type, length, a short SHA-256 fingerprint (never the key), plus a WARNING when all 16 bytes fall in the printable-ASCII range (sometimes legitimate — some hosts genuinely use ASCII-text keys — but worth surfacing as it's an unusual key shape worth eyeballing); (2) new `_diagnose_segment_durations` runs after segment download finishes, sample-probes 5 segments (start, 25%, 50%, 75%, end) with ffprobe and compares the actually-decoded duration to the m3u8's `#EXTINF` declaration. Both are pure observability — neither fails the job — and together they give enough signal to distinguish "decryption broken", "individual segments wrong", and "merge step lost data" in a handful of log lines.
 
 #### Changed
 - **Reverted the v2.3.4 worker-side heuristic relaxation** that would have suppressed the `actual_duration < 0.85 * declared_duration` SUSPECT flag for jobs that had downloaded 100% of segments. The flag is the last line of defence against silent truncation in the worker pipeline — relaxing it without a compensating signal turned out to mask a real partial-output case. v2.3.5's diagnostics replace it as the primary debugging aid; the SUSPECT heuristic remains in its v2.3.3 form. The chrome-extension cross-tab fix from v2.3.4 is unaffected — that part stays.
