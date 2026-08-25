@@ -78,7 +78,7 @@ describe('the tile badge only claims what is true', () => {
   });
 
   it('says ACTIVE once segments have actually been seen', () => {
-    const html = renderWith({ ...base, duration: 7, playbackObserved: true });
+    const html = renderWith({ ...base, duration: 7, playbackObserved: true, lastSegmentAt: Date.now(), });
     expect(html).toContain('ACTIVE');
     expect(html).not.toContain('>LIVE<');
   });
@@ -86,7 +86,7 @@ describe('the tile badge only claims what is true', () => {
   it('prefers LIVE when a live stream is also being played', () => {
     // Both true is the normal case for a live stream in progress; one label is
     // enough, and live is the more specific claim.
-    const html = renderWith({ ...base, isLive: true, playbackObserved: true });
+    const html = renderWith({ ...base, isLive: true, playbackObserved: true, lastSegmentAt: Date.now(), });
     expect(html).toContain('LIVE');
     expect(html).not.toContain('ACTIVE');
   });
@@ -105,7 +105,7 @@ describe('the badge does not claim playback it cannot see', () => {
     // behind an age gate satisfies it while the user has agreed to nothing and
     // no video is on screen. The evidence supports "this stream is being
     // pulled" and stops there.
-    const html = renderWith({ ...base, duration: 7, playbackObserved: true });
+    const html = renderWith({ ...base, duration: 7, playbackObserved: true, lastSegmentAt: Date.now(), });
     expect(html).not.toContain('PLAYING');
   });
 
@@ -117,10 +117,42 @@ describe('the badge does not claim playback it cannot see', () => {
       ...base,
       url: 'https://cdn.example.com/ad/welcome/720p/chunklist_b2000000.m3u8',
       duration: 7,
-      playbackObserved: true,
+      playbackObserved: true, lastSegmentAt: Date.now(),
     };
     const html = renderWith(ad);
     expect(html).toContain('ACTIVE');
     expect(html).not.toContain('PLAYING');
+  });
+});
+
+describe('ACTIVE means active now, not ever', () => {
+  const WINDOW_MS = 30_000;   // mirrors ACTIVE_SEGMENT_WINDOW_MS
+
+  it('drops the badge once segments stop arriving', () => {
+    // The reported case: an advert preloaded one segment behind an age gate
+    // and then sat there. playbackObserved is set on the first segment and
+    // never cleared, so the badge stayed lit for a stream doing nothing.
+    const html = renderWith({
+      ...base,
+      duration: 7,
+      playbackObserved: true,
+      lastSegmentAt: Date.now() - (WINDOW_MS + 5_000),
+    });
+    expect(html).not.toContain('ACTIVE');
+  });
+
+  it('keeps it while segments are still arriving', () => {
+    const html = renderWith({
+      ...base,
+      duration: 7,
+      playbackObserved: true,
+      lastSegmentAt: Date.now() - 2_000,
+    });
+    expect(html).toContain('ACTIVE');
+  });
+
+  it('shows nothing for a stream that has never fetched a segment', () => {
+    const html = renderWith({ ...base, duration: 7, playbackObserved: true, lastSegmentAt: 0 });
+    expect(html).not.toContain('ACTIVE');
   });
 });

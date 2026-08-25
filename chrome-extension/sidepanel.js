@@ -33,6 +33,9 @@ let jobs = [];
 // otherwise overwrite job.progress with the API's stale 0).
 const liveBrowserProgress = new Map();  // jobId → progress + CDN/NAS transfer timings
 const BROWSER_TRANSFER_SNAPSHOT_KEY = 'wv2nasBrowserTransferSnapshots';
+// Mirrors ACTIVE_SEGMENT_WINDOW_MS in background.js, which already answers
+// "was a segment seen recently" — the question the ACTIVE badge is asking.
+const ACTIVE_SEGMENT_WINDOW_MS = 30_000;
 const LIVE_BROWSER_PROGRESS_TTL_MS = 5 * 60 * 1000;
 const TERMINAL_BROWSER_TRANSFER_TTL_MS = 24 * 60 * 60 * 1000;
 const BROWSER_LIVE_RETAIN_STATUSES = new Set([
@@ -1468,18 +1471,24 @@ function renderDetectedUrls(opts) {
     // that anything is playing, so a 7-second VOD ad on a page still showing
     // its age gate was being labelled LIVE.
     //
-    // playbackObserved is the real signal — but it means one media segment for
-    // this URL was fetched, set on the first match with no threshold and no
-    // continuity requirement. A player preloading an advert behind an age gate
-    // satisfies it while nothing is playing and the user has agreed to
-    // nothing, so labelling it PLAYING overclaimed in the same way LIVE did,
-    // one level down.
+    // ACTIVE means segments are arriving now, so it reads lastSegmentAt rather
+    // than playbackObserved.
     //
-    // What it honestly supports is "this is the stream the page is pulling",
-    // which is also what the badge is useful for: picking the right candidate
-    // out of several. ACTIVE says that and nothing more.
+    // playbackObserved is set on the first matching segment and never cleared,
+    // which makes it "was ever fetched" — an advert that preloaded once and
+    // stopped kept the badge lit indefinitely. The timestamp was already being
+    // recorded, and background.js already uses a 30s window under the name
+    // ACTIVE_SEGMENT_WINDOW_MS for exactly this question.
+    //
+    // The play-first gate deliberately keeps using playbackObserved: it asks
+    // whether a token was ever minted for this URL, and a token does not
+    // un-mint when the stream goes quiet.
     const isLiveStream = !!urlInfo.isLive;
-    const isStreamActive = !isLiveStream && !!urlInfo.playbackObserved;
+    const lastSegmentAt = Number(urlInfo.lastSegmentAt) || 0;
+    const segmentAge = lastSegmentAt > 0 ? Date.now() - lastSegmentAt : Infinity;
+    const isStreamActive = !isLiveStream
+      && segmentAge >= 0
+      && segmentAge <= ACTIVE_SEGMENT_WINDOW_MS;
 
     // Browser-side play-first gate: keep the candidate visible, but
     // lock sending until the page's player has started and issued the
