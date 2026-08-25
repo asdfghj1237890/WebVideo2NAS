@@ -791,6 +791,20 @@ async def delete_job(
         """), {"job_id": job_id, "now": _utcnow_naive()})
         db.commit()
         if result.rowcount == 0:
+            # Codex adversarial-review (medium): answer the state, not whether
+            # this particular call changed a row. The NAS commits the cancel
+            # before it answers, so a client whose response was lost — request
+            # timeout, dropped connection — cannot tell whether it landed. It
+            # retries, and a 404 to that retry makes a cancel that DID take
+            # effect look like a failure, so the extension never sends
+            # CANCEL_BROWSER_JOB and its browser-side upload keeps running
+            # against a job this API has already cancelled.
+            already = db.execute(text("""
+                SELECT status FROM jobs WHERE id = :job_id
+            """), {"job_id": job_id}).first()
+            if already is not None and already.status == 'cancelled':
+                logger.info(f"Job {job_id} already cancelled; DELETE is a no-op")
+                return {"message": "Job cancelled successfully"}
             raise HTTPException(status_code=404, detail="Job not found or cannot be cancelled")
         logger.info(f"Job {job_id} cancelled")
         return {"message": "Job cancelled successfully"}

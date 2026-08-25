@@ -5552,3 +5552,52 @@ def test_cancel_browser_finalizing_job_via_delete_flips_status_and_cleans_stagin
     assert resp.status_code == 200
     assert _read_job_status(api_main, job_id) == "cancelled"
     assert not staging.exists()
+
+
+def test_delete_is_idempotent_for_an_already_cancelled_job(monkeypatch, tmp_path):
+    """Codex adversarial-review (medium): the NAS commits the cancel before it
+    answers, so a client whose response was lost — request timeout, dropped
+    connection — cannot tell whether the DELETE landed. It retries.
+
+    Answering 404 to that retry made a cancel that DID take effect look like a
+    failure. The sidepanel only sends CANCEL_BROWSER_JOB on success, so a
+    browser-mode upload kept running against a job this API had already
+    cancelled, and no retry could ever recover: every one 404'd.
+
+    A repeat DELETE now reports the state rather than whether this particular
+    call changed a row."""
+    from fastapi.testclient import TestClient
+    api_main, job_id = _build_finalize_test_env(monkeypatch, tmp_path)
+
+    with TestClient(api_main.app) as client:
+        first = client.delete(
+            f"/api/jobs/{job_id}",
+            headers={"Authorization": "Bearer test-key-not-the-default-placeholder"},
+        )
+        assert first.status_code == 200
+        assert _read_job_status(api_main, job_id) == "cancelled"
+
+        # The retry the client makes after losing the first response.
+        second = client.delete(
+            f"/api/jobs/{job_id}",
+            headers={"Authorization": "Bearer test-key-not-the-default-placeholder"},
+        )
+
+    assert second.status_code == 200
+    assert second.json()["message"] == "Job cancelled successfully"
+    assert _read_job_status(api_main, job_id) == "cancelled"
+
+
+def test_delete_still_404s_for_a_job_that_does_not_exist(monkeypatch, tmp_path):
+    """The idempotent branch keys on an existing cancelled row, so it must not
+    turn a genuinely unknown job id into a success."""
+    from fastapi.testclient import TestClient
+    api_main, _job_id = _build_finalize_test_env(monkeypatch, tmp_path)
+
+    with TestClient(api_main.app) as client:
+        resp = client.delete(
+            "/api/jobs/does-not-exist",
+            headers={"Authorization": "Bearer test-key-not-the-default-placeholder"},
+        )
+
+    assert resp.status_code == 404

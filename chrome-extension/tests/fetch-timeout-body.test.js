@@ -78,15 +78,35 @@ describe('fetchJsonWithTimeout', () => {
     expect(data).toEqual([{ id: 1 }]);
   });
 
-  it('does not try to parse a body the server refused to send', async () => {
+  it('parses an error body too, since its detail is what gets shown', async () => {
     const ctx = loadSidePanel(async () => ({
       ok: false,
-      status: 401,
-      json: async () => { throw new Error('should not be read'); },
+      status: 404,
+      json: async () => ({ detail: 'Job not found or cannot be cancelled' }),
+    }));
+    const { response, data } = await ctx.fetchJsonWithTimeout('http://nas.example/api/jobs/1', {}, 1000);
+    expect(response.status).toBe(404);
+    expect(data.detail).toBe('Job not found or cannot be cancelled');
+  });
+
+  it('yields null rather than throwing when a body is not JSON', async () => {
+    const ctx = loadSidePanel(async () => ({
+      ok: false,
+      status: 502,
+      json: async () => { throw new Error('Unexpected token < in JSON'); },
     }));
     const { response, data } = await ctx.fetchJsonWithTimeout('http://nas.example/api/jobs', {}, 1000);
-    expect(response.status).toBe(401);
+    // A proxy's HTML error page must not mask the status it arrived with.
+    expect(response.status).toBe(502);
     expect(data).toBeNull();
+  });
+
+  it('still propagates an abort even though parse errors are swallowed', async () => {
+    // The swallow above must not turn a timed-out request into a quiet
+    // success with an empty body.
+    const ctx = loadSidePanel(stalledBody);
+    await expect(ctx.fetchJsonWithTimeout('http://nas.example/api/jobs', {}, 30))
+      .rejects.toThrow(/abort/i);
   });
 });
 

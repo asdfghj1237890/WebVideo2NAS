@@ -935,8 +935,18 @@ async function fetchJsonWithTimeout(url, options, timeoutMs) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    // Still inside the timer: an abort rejects the body read too.
-    const data = response.ok ? await response.json() : null;
+    // Still inside the timer: an abort rejects the body read too. Error
+    // responses are parsed as well — their detail is what gets shown to the
+    // user — but a body that simply is not JSON must not mask the status.
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (err) {
+      // An abort is the timeout firing, not a malformed payload. Propagate it
+      // so the caller sees a timed-out request rather than an empty success.
+      if (controller.signal.aborted) throw err;
+      data = null;
+    }
     return { response, data };
   } finally {
     clearTimeout(timer);
@@ -2260,34 +2270,65 @@ async function cancelJob(jobId) {
   }
 
   try {
-    const response = await fetchWithTimeout(`${settings.nasEndpoint}/api/jobs/${jobId}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${settings.apiKey}` }
-    }, NAS_JOBS_TIMEOUT_MS);
+    const { response, data } = await fetchJsonWithTimeout(
+      `${settings.nasEndpoint}/api/jobs/${jobId}`,
+      { method: 'DELETE', headers: { 'Authorization': `Bearer ${settings.apiKey}` } },
+      NAS_JOBS_TIMEOUT_MS,
+    );
 
     if (response.ok) {
-      // DELETE is the authoritative user-cancel transition. Only after
-      // the NAS accepts it do we stop any browser-mode offscreen upload,
-      // and we mark the resulting FAILED message as user-cancelled so
-      // background cleanup does not race DELETE with /abort.
-      try {
-        await chrome.runtime.sendMessage({
-          target: 'offscreen',
-          type: 'CANCEL_BROWSER_JOB',
-          payload: { jobId, userCancelled: true },
-        });
-      } catch (_) {
-        // No offscreen receiver (most jobs aren't browser-mode) — ignore.
-      }
-      showToast(t('toast.jobCancelled'));
-      await loadRecentJobs();
-    } else {
-      const error = await response.json();
-      showToast(`${error.detail || t('toast.failedToCancel')}`);
+      await applyCancelledJob(jobId);
+      return;
     }
+    showToast(`${(data && data.detail) || t('toast.failedToCancel')}`);
   } catch (error) {
+    // A timeout or dropped connection says nothing about whether the cancel
+    // landed: the NAS commits it before answering. Reporting failure here left
+    // browser-mode uploads running against a job the NAS had already
+    // cancelled, and a retry used to 404. Ask what actually happened.
     console.error('Error cancelling job:', error);
+    if (await jobIsCancelled(jobId)) {
+      await applyCancelledJob(jobId);
+      return;
+    }
     showToast(t('toast.failedToCancel'));
+  }
+}
+
+// Everything that follows an accepted cancel. Shared by the direct path and
+// the reconcile path, so a cancel whose response was lost still stops the
+// browser-side upload instead of leaving it running.
+async function applyCancelledJob(jobId) {
+  // DELETE is the authoritative user-cancel transition. Only once the NAS has
+  // accepted it do we stop any browser-mode offscreen upload, marking the
+  // resulting FAILED message as user-cancelled so background cleanup does not
+  // race DELETE with /abort.
+  try {
+    await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      type: 'CANCEL_BROWSER_JOB',
+      payload: { jobId, userCancelled: true },
+    });
+  } catch (_) {
+    // No offscreen receiver (most jobs aren't browser-mode) — ignore.
+  }
+  showToast(t('toast.jobCancelled'));
+  await loadRecentJobs();
+}
+
+// Best-effort reconciliation after a cancel request failed to report back.
+// Any doubt answers false, which keeps the pre-existing "report failure"
+// behaviour rather than claiming a cancel that may not have happened.
+async function jobIsCancelled(jobId) {
+  try {
+    const { response, data } = await fetchJsonWithTimeout(
+      `${settings.nasEndpoint}/api/jobs/${jobId}`,
+      { headers: { 'Authorization': `Bearer ${settings.apiKey}` } },
+      NAS_JOBS_TIMEOUT_MS,
+    );
+    return !!(response.ok && data && data.status === 'cancelled');
+  } catch (_) {
+    return false;
   }
 }
 
