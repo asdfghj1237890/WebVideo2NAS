@@ -106,6 +106,35 @@ describe('cancelJob when the DELETE response never arrives', () => {
   });
 });
 
+describe('cancelJob pins the NAS it is talking to', () => {
+  it('reconciles against the original NAS after a profile switch mid-cancel', async () => {
+    // settings is rewritten in place by storage.onChanged and by switching
+    // profile. Reading it again for the reconcile would ask NAS B whether a
+    // cancel sent to NAS A took effect — and B answers confidently about a job
+    // id it knows nothing about.
+    const urls = [];
+    const { ctx, offscreenMessages } = makeCtx({
+      deleteImpl: (url) => {
+        urls.push(url);
+        // The user switches profile while the DELETE is in flight.
+        ctx.__eval("settings = { nasEndpoint: 'http://other-nas.example:52052', apiKey: 'k2' };");
+        return rejects();
+      },
+      statusImpl: async (url) => {
+        urls.push(url);
+        return { ok: true, status: 200, json: async () => ({ status: 'cancelled' }) };
+      },
+    });
+
+    await ctx.cancelJob('job-1');
+
+    expect(urls.length).toBe(2);
+    for (const url of urls) expect(url).toContain('nas.example:52052');
+    for (const url of urls) expect(url).not.toContain('other-nas');
+    expect(offscreenMessages.length).toBe(1);
+  });
+});
+
 describe('cancelJob on the ordinary paths', () => {
   it('stops the upload when the DELETE is accepted', async () => {
     const { ctx, offscreenMessages } = makeCtx({

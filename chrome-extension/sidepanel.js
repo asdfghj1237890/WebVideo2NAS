@@ -2264,15 +2264,21 @@ function bindJobEvents(el, jobId) {
 }
 
 async function cancelJob(jobId) {
-  if (!settings.nasEndpoint || !settings.apiKey) {
+  // Pin the target for the whole operation. The settings object is rewritten
+  // in place by storage.onChanged and by switching profile, so the reconcile
+  // below could otherwise ask NAS B whether a cancel sent to NAS A took
+  // effect — and get a confident, wrong answer.
+  const endpoint = settings.nasEndpoint;
+  const apiKey = settings.apiKey;
+  if (!endpoint || !apiKey) {
     showToast(t('toast.nasNotConfigured'));
     return;
   }
 
   try {
     const { response, data } = await fetchJsonWithTimeout(
-      `${settings.nasEndpoint}/api/jobs/${jobId}`,
-      { method: 'DELETE', headers: { 'Authorization': `Bearer ${settings.apiKey}` } },
+      `${endpoint}/api/jobs/${jobId}`,
+      { method: 'DELETE', headers: { 'Authorization': `Bearer ${apiKey}` } },
       NAS_JOBS_TIMEOUT_MS,
     );
 
@@ -2287,7 +2293,7 @@ async function cancelJob(jobId) {
     // browser-mode uploads running against a job the NAS had already
     // cancelled, and a retry used to 404. Ask what actually happened.
     console.error('Error cancelling job:', error);
-    if (await jobIsCancelled(jobId)) {
+    if (await jobIsCancelled(jobId, endpoint, apiKey)) {
       await applyCancelledJob(jobId);
       return;
     }
@@ -2319,11 +2325,12 @@ async function applyCancelledJob(jobId) {
 // Best-effort reconciliation after a cancel request failed to report back.
 // Any doubt answers false, which keeps the pre-existing "report failure"
 // behaviour rather than claiming a cancel that may not have happened.
-async function jobIsCancelled(jobId) {
+async function jobIsCancelled(jobId, endpoint, apiKey) {
+  if (!endpoint || !apiKey) return false;
   try {
     const { response, data } = await fetchJsonWithTimeout(
-      `${settings.nasEndpoint}/api/jobs/${jobId}`,
-      { headers: { 'Authorization': `Bearer ${settings.apiKey}` } },
+      `${endpoint}/api/jobs/${jobId}`,
+      { headers: { 'Authorization': `Bearer ${apiKey}` } },
       NAS_JOBS_TIMEOUT_MS,
     );
     return !!(response.ok && data && data.status === 'cancelled');

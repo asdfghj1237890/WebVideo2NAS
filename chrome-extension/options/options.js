@@ -106,6 +106,36 @@ let onboardingDone = false;
 // step 2 kept claiming "done" for a config that had never been reached.
 let onbPingOkFor = null;
 
+// Bounds headers *and* body under one controller. fetch() resolves as soon as
+// the response head arrives, so a bound that stops there leaves .json()
+// unbounded: a NAS or proxy that answers 200 and then stalls the stream hangs
+// the caller forever. That matters here more than anywhere — onboarding step 2
+// tells the user to press [test], and a stalled test leaves the button
+// disabled with no result and no error, so the step can never complete.
+const NAS_TEST_TIMEOUT_MS = 8000;
+// The version probe is cosmetic, so it gets a shorter leash and never gates
+// the verdict.
+const NAS_VERSION_TIMEOUT_MS = 3000;
+
+async function fetchJsonWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (err) {
+      // An abort is the timeout firing, not a malformed payload.
+      if (controller.signal.aborted) throw err;
+      data = null;
+    }
+    return { response, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Fingerprint of the SAVED credentials, which is what both steps are judged
 // against. Judging step 2 on the live input fields let the two steps describe
 // different configurations: save an invalid endpoint, type a valid one, press
@@ -743,46 +773,51 @@ async function testConnection() {
   const testedFingerprint = JSON.stringify([nasEndpoint, apiKey]);
   const t0 = performance.now();
   try {
-    // health validates auth; root carries the version (no auth needed). Run in parallel.
-    const healthP = fetch(`${nasEndpoint}/api/health`, {
-      method: 'GET',
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-    });
-    const rootP = fetch(`${nasEndpoint}/`).catch(() => null);
-    const response = await healthP;
+    // health validates auth; root carries the version (no auth needed). Run in
+    // parallel, each on its own bound. The version probe is started here but
+    // deliberately not awaited before the verdict — see below.
+    const healthP = fetchJsonWithTimeout(
+      `${nasEndpoint}/api/health`,
+      { method: 'GET', headers: { 'Authorization': `Bearer ${apiKey}` } },
+      NAS_TEST_TIMEOUT_MS,
+    );
+    const versionP = fetchJsonWithTimeout(`${nasEndpoint}/`, {}, NAS_VERSION_TIMEOUT_MS)
+      .then(({ response: r, data: d }) => (r.ok && d && d.version ? String(d.version) : null))
+      .catch(() => null);
+
+    const { response, data } = await healthP;
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
-    const data = await response.json();
     const ms = Math.max(1, Math.round(performance.now() - t0));
 
-    if (data.status === 'healthy' || data.status === 'running') {
+    if (data && (data.status === 'healthy' || data.status === 'running')) {
       setPingState('pingRow',     'ok', `${ms} ms`);
       setPingState('lastPingRow', 'ok', `${ms} ms`);
 
-      // Pull server version from the root endpoint (best effort).
-      let version = null;
-      try {
-        const rootRes = await rootP;
-        if (rootRes && rootRes.ok) {
-          const rootJson = await rootRes.json();
-          if (rootJson && rootJson.version) version = String(rootJson.version);
-        }
-      } catch (_) { /* ignore */ }
-
+      // The verdict is /api/health's alone. Awaiting the version probe here
+      // used to hold the success state — and the disabled button — hostage to
+      // a request the comment already called best-effort. Paint now, fill the
+      // version in if and when it turns up.
       const note = document.createElement('span');
       note.className = 'comment-inline fade-up';
-      note.textContent = version
-        ? `# 200 OK · v${version} · ${ms}ms RTT`
-        : `# 200 OK · ${ms}ms RTT`;
-      note.title = note.textContent;
+      const baseNote = `# 200 OK · ${ms}ms RTT`;
+      note.textContent = baseNote;
+      note.title = baseNote;
       const noteSlot = $('lastPingNote');
       if (noteSlot) {
         noteSlot.textContent = '';
         noteSlot.appendChild(note);
       }
-      if (version) setText('serverVersion', `"${version}"`);
+      versionP.then((version) => {
+        if (!version) return;
+        setText('serverVersion', `"${version}"`);
+        const withVersion = `# 200 OK · v${version} · ${ms}ms RTT`;
+        note.textContent = withVersion;
+        note.title = withVersion;
+      }).catch(() => { /* cosmetic */ });
+
       showStatus(t('options.status.connectionOk'), 'success');
       onbPingOkFor = testedFingerprint;
       refreshOnboardingStatus();
