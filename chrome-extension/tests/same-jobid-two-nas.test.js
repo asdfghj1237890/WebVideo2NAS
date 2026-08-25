@@ -164,3 +164,59 @@ describe('cancel names the NAS it is aborting on', () => {
     expect(del.url).toContain('nas-b.example');
   });
 });
+
+describe('two rows with the same id render and cancel independently', () => {
+  // The reviewer's scenario stated directly: render both, click each cancel
+  // button, and check where each DELETE went. A bare-id DOM identity makes the
+  // two rows share one node, and a bare-id lookup makes both buttons act on
+  // whichever row happens to come first in the array.
+  function rowFor(ctx, jobId, scope, key) {
+    return ctx.__eval(`(() => {
+      const job = { id: '${jobId}', status: 'browser_uploading',
+                    __nasTarget: sidepanelCore.nasTarget('${scope}', '${key}') };
+      return rowDomId(job);
+    })()`);
+  }
+
+  it('gives each row its own DOM id', () => {
+    const { ctx } = makeSidePanel();
+    const a = rowFor(ctx, SHARED_ID, NAS_A, 'ka');
+    const b = rowFor(ctx, SHARED_ID, NAS_B, 'kb');
+    expect(a).not.toBe(b);
+    // Still a usable id: no raw quotes or slashes from the JSON key.
+    expect(a).toMatch(/^job-[A-Za-z0-9._~%-]+$/);
+  });
+
+  it('cancels the row that was clicked, not the first with that id', async () => {
+    const { ctx, sent } = makeSidePanel();
+    ctx.__eval(`jobs = [
+      { id: '${SHARED_ID}', status: 'browser_uploading',
+        __nasTarget: sidepanelCore.nasTarget('${NAS_A}', 'ka') },
+      { id: '${SHARED_ID}', status: 'browser_uploading',
+        __nasTarget: sidepanelCore.nasTarget('${NAS_B}', 'kb') }
+    ];`);
+
+    // Cancel the SECOND row — the one a bare-id lookup would never reach.
+    const keyB = ctx.__eval(`jobKeyFor(jobs[1])`);
+    await ctx.cancelJob(keyB);
+
+    const del = sent.find((m) => m && m.http === 'DELETE');
+    expect(del.url).toContain('nas-b.example');
+    const cancel = sent.find((m) => m && m.type === 'CANCEL_BROWSER_JOB');
+    expect(cancel.payload.nasScope).toBe(NAS_B);
+  });
+
+  it('still cancels a row that carries no target, by id', async () => {
+    // Pre-identity rows cannot be attributed any better than this, and must
+    // stay cancellable rather than becoming inert.
+    const { ctx, sent } = makeSidePanel();
+    ctx.__eval(`jobs = [{ id: '${SHARED_ID}', status: 'downloading' }];`);
+    ctx.__eval(`settings = { nasEndpoint: '${NAS_A}', apiKey: 'ka' };`);
+
+    await ctx.cancelJob(SHARED_ID);
+
+    const del = sent.find((m) => m && m.http === 'DELETE');
+    expect(del).toBeTruthy();
+    expect(del.url).toContain('nas-a.example');
+  });
+});

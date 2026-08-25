@@ -509,7 +509,7 @@ function handleBrowserJobProgress(message) {
   if (live.transferTimings) job.browserTransferTimings = live.transferTimings;
   if (live.concurrency) job.browserConcurrency = live.concurrency;
 
-  const itemEl = document.getElementById(`job-${idStr}`);
+  const itemEl = document.getElementById(rowDomId(job));
   if (!itemEl) return;
   const oldStatus = itemEl.dataset.status;
   itemEl.dataset.status = job.status;
@@ -518,7 +518,7 @@ function handleBrowserJobProgress(message) {
     && !itemEl.querySelector('[data-browser-transfer]');
   if (shouldFullRender(oldStatus, job.status) || needsTransferRender) {
     itemEl.innerHTML = getJobInnerHtml(job);
-    bindJobEvents(itemEl, idStr);
+    bindJobEvents(itemEl, job);
   } else {
     updateJobElement(itemEl, job);
   }
@@ -636,7 +636,6 @@ async function mergePersistedBrowserTransferSnapshots() {
       // no honest way to attribute them. Dropping beats guessing the current
       // scope and reviving the contamination this key exists to prevent.
       if (nasIdentity.isLegacyBrowserJobKey(storedKey)) continue;
-      const idStr = storedKey;
       const snapshotTs = Number(snapshot.ts) || 0;
       const snapshotTtl = snapshot.terminal
         ? TERMINAL_BROWSER_TRANSFER_TTL_MS
@@ -644,9 +643,9 @@ async function mergePersistedBrowserTransferSnapshots() {
       if (snapshotTs > 0 && Date.now() - snapshotTs > snapshotTtl) {
         continue;
       }
-      const current = liveBrowserProgress.get(idStr);
-      // idStr here is the stored composite key, already NAS-qualified.
-      liveBrowserProgress.set(idStr, mergeLiveBrowserProgress(current, {
+      // storedKey is already NAS-qualified; the map uses the same shape.
+      const current = liveBrowserProgress.get(storedKey);
+      liveBrowserProgress.set(storedKey, mergeLiveBrowserProgress(current, {
         done: snapshot.done,
         total: snapshot.total,
         percent: snapshot.percent,
@@ -1870,6 +1869,17 @@ function jobKeyFor(job) {
   return target ? nasIdentity.browserJobKey(target.scope, job.id) : null;
 }
 
+// A row's DOM id.
+//
+// Two NAS restored from the same database backup produce rows with the same
+// job id, and the merge can render both at once. Sharing one DOM node makes
+// them fight over it — and the cancel button bound to that node then acts on
+// whichever row happened to be found first. Encoded because the composite key
+// contains characters that are not valid raw in an id.
+function rowDomId(job) {
+  return 'job-' + encodeURIComponent(jobKeyFor(job) || String(job.id));
+}
+
 function withJobTarget(job, target) {
   if (job && target) job.__nasTarget = target;
   return job;
@@ -2017,12 +2027,13 @@ function renderJobs() {
 
   sortedJobs.forEach((job, index) => {
     const jobId = String(job.id);
-    let itemEl = document.getElementById(`job-${jobId}`);
+    const domId = rowDomId(job);
+    let itemEl = document.getElementById(domId);
 
     if (!itemEl) {
       itemEl = document.createElement('div');
       itemEl.className = 'job-row';
-      itemEl.id = `job-${jobId}`;
+      itemEl.id = domId;
       itemEl.dataset.status = job.status;
       itemEl.dataset.progress = job.progress;
 
@@ -2031,7 +2042,7 @@ function renderJobs() {
       else listElement.appendChild(itemEl);
 
       itemEl.innerHTML = getJobInnerHtml(job);
-      bindJobEvents(itemEl, jobId);
+      bindJobEvents(itemEl, job);
       // Initialize tween state to current progress (no animation on first paint)
       if (isActiveStatus(job.status)) {
         jobTweens.set(jobId, { shown: Number(job.progress) || 0, raf: 0 });
@@ -2044,7 +2055,7 @@ function renderJobs() {
 
       if (shouldFullRender(oldStatus, job.status)) {
         itemEl.innerHTML = getJobInnerHtml(job);
-        bindJobEvents(itemEl, jobId);
+        bindJobEvents(itemEl, job);
       } else {
         updateJobElement(itemEl, job);
       }
@@ -2360,10 +2371,15 @@ function applyRing(el, jobId, value) {
   if (shimmer) shimmer.style.left = `${Math.max(0, Math.min(100, value) - 12)}%`;
 }
 
-function bindJobEvents(el, jobId) {
+// The row is passed rather than an id so the cancel handler addresses the NAS
+// that owns it. Looking the row back up by bare id would pick whichever of two
+// same-numbered jobs came first in the array.
+function bindJobEvents(el, job) {
+  const jobId = String(job && job.id != null ? job.id : job);
   const cancelBtn = el.querySelector('[data-cancel]');
   if (cancelBtn) {
-    cancelBtn.addEventListener('click', () => cancelJob(jobId));
+    const key = (job && job.id != null) ? (jobKeyFor(job) || jobId) : jobId;
+    cancelBtn.addEventListener('click', () => cancelJob(key));
   }
   const details = el.querySelector('.error-details');
   if (details) {
@@ -2407,11 +2423,15 @@ function bindJobEvents(el, jobId) {
 // that did not happen would strand a job the NAS is still running, which is
 // the mirror of the bug that started this: not claiming one that did happen
 // left the upload running against a job already cancelled.
-async function cancelJob(jobId) {
+async function cancelJob(jobKeyOrId) {
   // The NAS that served *this row*. The list can hold rows from two different
   // NAS at once, because the merge retains a previous snapshot's active
-  // browser rows across a profile switch.
-  const row = jobs.find((job) => String(job.id) === String(jobId));
+  // browser rows across a profile switch — so resolve by the composite key
+  // first. The by-id fallback covers a row with no target stamp, which is the
+  // pre-identity shape and cannot be attributed any better than this.
+  const row = jobs.find((job) => jobKeyFor(job) === jobKeyOrId)
+    || jobs.find((job) => String(job.id) === String(jobKeyOrId));
+  const jobId = row ? String(row.id) : String(jobKeyOrId);
   const target = jobTargetOf(row) || jobsTarget || currentNasTarget();
   if (!target) {
     showToast(t('toast.nasNotConfigured'));

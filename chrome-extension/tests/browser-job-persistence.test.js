@@ -13,8 +13,18 @@ import { loadScriptIntoContext } from './helpers/load-script.js';
 // Job identity is namespaced by NAS — see nasIdentity.js. Snapshots are keyed
 // by [scope, jobId], and a message that names no NAS is deliberately not
 // persisted at all.
-const NAS = 'http://nas.example:52052';
+// Matches the nasEndpoint the persisted-job fixtures use, so a legacy bare
+// key migrates to exactly the scope these assertions look under.
+const NAS = 'http://nas/';
 const KEY = (jobId) => JSON.stringify([NAS, jobId]);
+
+// Persisted browser jobs are keyed by [nasScope, jobId] — see nasIdentity.js.
+// Records keep jobId and nasScope so the key is reproducible from the record,
+// which is what makes lossless migration of pre-identity entries possible.
+const JOB_KEY = (jobId, scope = NAS) => JSON.stringify([scope, jobId]);
+const jobRecord = (jobId, extra = {}) =>
+  ({ jobId, nasScope: NAS, nasEndpoint: NAS, ...extra });
+
 import path from 'node:path';
 
 const BACKGROUND_SCRIPT = path.resolve(__dirname, '..', 'background.js');
@@ -217,13 +227,14 @@ describe('persistence helpers', () => {
   it('_wv2nasPersistBrowserJob writes to chrome.storage.local under the canonical key', async () => {
     const chrome = makeChromeStub();
     const ctx = loadBackground({ chrome });
-    await ctx._wv2nasPersistBrowserJob('job-A', {
+    await ctx._wv2nasPersistBrowserJob(JOB_KEY('job-A'), {
+      jobId: 'job-A', nasScope: NAS,
       ruleIds: [10000, 15000], dnrSlot: 0, startedAt: 12345,
       nasEndpoint: 'http://nas/', apiKey: 'k',
     });
     const stored = chrome.storage.local._state.wv2nasBrowserJobs;
     expect(stored).toBeDefined();
-    expect(stored['job-A']).toMatchObject({
+    expect(stored[JOB_KEY('job-A')]).toMatchObject({
       jobId: 'job-A',
       ruleIds: [10000, 15000],
       dnrSlot: 0,
@@ -236,13 +247,14 @@ describe('persistence helpers', () => {
   it('_wv2nasPersistBrowserJob merges into existing entry (partial updates)', async () => {
     const chrome = makeChromeStub();
     const ctx = loadBackground({ chrome });
-    await ctx._wv2nasPersistBrowserJob('job-A', {
+    await ctx._wv2nasPersistBrowserJob(JOB_KEY('job-A'), {
+      jobId: 'job-A', nasScope: NAS,
       ruleIds: [10000], dnrSlot: 0, startedAt: 12345,
       nasEndpoint: 'http://nas/', apiKey: 'k',
     });
     // Partial update — should not lose nasEndpoint/apiKey/etc.
-    await ctx._wv2nasPersistBrowserJob('job-A', { ruleIds: [10000, 10001, 15000, 15001] });
-    const stored = chrome.storage.local._state.wv2nasBrowserJobs['job-A'];
+    await ctx._wv2nasPersistBrowserJob(JOB_KEY('job-A'), { jobId: 'job-A', nasScope: NAS, ruleIds: [10000, 10001, 15000, 15001] });
+    const stored = chrome.storage.local._state.wv2nasBrowserJobs[JOB_KEY('job-A')];
     expect(stored.ruleIds).toEqual([10000, 10001, 15000, 15001]);
     expect(stored.nasEndpoint).toBe('http://nas/');
     expect(stored.apiKey).toBe('k');
@@ -252,18 +264,21 @@ describe('persistence helpers', () => {
   it('_wv2nasUnpersistBrowserJob removes entry; idempotent on missing', async () => {
     const chrome = makeChromeStub({
       storageInitial: {
-        wv2nasBrowserJobs: { 'job-A': { jobId: 'job-A' }, 'job-B': { jobId: 'job-B' } },
+        wv2nasBrowserJobs: {
+          [JOB_KEY('job-A')]: jobRecord('job-A'),
+          [JOB_KEY('job-B')]: jobRecord('job-B'),
+        },
       },
     });
     const ctx = loadBackground({ chrome });
-    await ctx._wv2nasUnpersistBrowserJob('job-A');
+    await ctx._wv2nasUnpersistBrowserJob(JOB_KEY('job-A'));
     expect(chrome.storage.local._state.wv2nasBrowserJobs).toEqual({
-      'job-B': { jobId: 'job-B' },
+      [JOB_KEY('job-B')]: jobRecord('job-B'),
     });
     // Idempotent: removing again doesn't throw or trash other entries.
-    await ctx._wv2nasUnpersistBrowserJob('job-A');
+    await ctx._wv2nasUnpersistBrowserJob(JOB_KEY('job-A'));
     expect(chrome.storage.local._state.wv2nasBrowserJobs).toEqual({
-      'job-B': { jobId: 'job-B' },
+      [JOB_KEY('job-B')]: jobRecord('job-B'),
     });
   });
 });
@@ -296,7 +311,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
 
     const oldStart = Date.now() - 2 * 60 * 60 * 1000; // 2 hours ago
     chrome.storage.local._state.wv2nasBrowserJobs = {
-      'old-job': {
+      [JOB_KEY('old-job')]: {
         jobId: 'old-job', nasScope: NAS, ruleIds: [10000, 15000], dnrSlot: 0,
         startedAt: oldStart,
         nasEndpoint: 'http://nas/', apiKey: 'k',
@@ -326,7 +341,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'recent-job': {
+          [JOB_KEY('recent-job')]: {
             jobId: 'recent-job', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: recentStart,
             nasEndpoint: 'http://nas/', apiKey: 'k',
@@ -343,7 +358,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     // No abort POST.
     expect(fetchCalls.find((c) => c.url.includes('/abort'))).toBeUndefined();
     // Entry preserved.
-    expect(chrome.storage.local._state.wv2nasBrowserJobs['recent-job']).toBeDefined();
+    expect(chrome.storage.local._state.wv2nasBrowserJobs[JOB_KEY('recent-job')]).toBeDefined();
   });
 
   it('retries abortPending jobs even when heartbeat is recent', async () => {
@@ -353,7 +368,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     await new Promise((r) => setTimeout(r, 0));
     fetchCalls.length = 0;
     chrome.storage.local._state.wv2nasBrowserJobs = {
-      'pending-abort': {
+      [JOB_KEY('pending-abort')]: {
         jobId: 'pending-abort', nasScope: NAS,
         ruleIds: [],
         dnrSlot: null,
@@ -390,11 +405,11 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const oldStart = Date.now() - 3 * 60 * 60 * 1000;
     const recentStart = Date.now() - 1 * 60 * 1000;
     chrome.storage.local._state.wv2nasBrowserJobs = {
-      'old': {
+      [JOB_KEY('old')]: {
         jobId: 'old', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
         startedAt: oldStart, nasEndpoint: 'http://nas/', apiKey: 'k',
       },
-      'recent': {
+      [JOB_KEY('recent')]: {
         jobId: 'recent', nasScope: NAS, ruleIds: [10100], dnrSlot: 1,
         startedAt: recentStart, nasEndpoint: 'http://nas/', apiKey: 'k',
       },
@@ -407,7 +422,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     expect(dnrCalls).toHaveLength(1);
     expect(dnrCalls[0]).toEqual({ removeRuleIds: [10000] });
     expect(chrome.storage.local._state.wv2nasBrowserJobs).toEqual({
-      'recent': expect.objectContaining({ jobId: 'recent', nasScope: NAS }),
+      [JOB_KEY('recent')]: expect.objectContaining({ jobId: 'recent', nasScope: NAS }),
     });
   });
 
@@ -446,7 +461,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     // Active jobs map also restored so offscreen ref-count counts the
     // survivors.
     expect(ctx.__eval("_wv2nasActiveBrowserJobs.size")).toBe(2);
-    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has('survivor-A')")).toBe(true);
+    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has(JSON.stringify(['http://nas/', 'survivor-A']))")).toBe(true);
   });
 
   it('does NOT restore slot when survivor lacks dnrSlot field', async () => {
@@ -456,7 +471,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'malformed-survivor': {
+          [JOB_KEY('malformed-survivor')]: {
             jobId: 'malformed-survivor', nasScope: NAS, ruleIds: [10000],
             startedAt: recentStart,
             nasEndpoint: 'http://nas/', apiKey: 'k',
@@ -471,7 +486,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     // No slot was added (since none was persisted) — but the active
     // jobs entry still exists for offscreen ref-counting.
     expect(ctx.__eval("_wv2nasUsedDnrSlots.size")).toBe(0);
-    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has('malformed-survivor')")).toBe(true);
+    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has(JSON.stringify(['http://nas/', 'malformed-survivor']))")).toBe(true);
   });
 
   // Codex review #15: durable completion handler for SW-restart
@@ -486,7 +501,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'survivor-job': {
+          [JOB_KEY('survivor-job')]: {
             jobId: 'survivor-job', nasScope: NAS,
             ruleIds: [10000, 15000],
             dnrSlot: 0,
@@ -507,7 +522,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
 
     // Verify recovery state: slot reserved, active map populated.
     expect(ctx.__eval('_wv2nasUsedDnrSlots.has(0)')).toBe(true);
-    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has('survivor-job')")).toBe(true);
+    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has(JSON.stringify(['http://nas/', 'survivor-job']))")).toBe(true);
     dnrCalls.length = 0;
 
     // Now simulate the offscreen completing. The per-job in-memory
@@ -525,7 +540,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     // Slot released.
     expect(ctx.__eval('_wv2nasUsedDnrSlots.has(0)')).toBe(false);
     // Active map cleared.
-    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has('survivor-job')")).toBe(false);
+    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has(JSON.stringify(['http://nas/', 'survivor-job']))")).toBe(false);
     // Persisted entry gone.
     expect(chrome.storage.local._state.wv2nasBrowserJobs).toEqual({});
     // Offscreen closed (no more active jobs).
@@ -555,7 +570,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'failed-job': {
+          [JOB_KEY('failed-job')]: {
             jobId: 'failed-job', nasScope: NAS,
             ruleIds: [10000],
             dnrSlot: 2,
@@ -599,7 +614,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'failed-job': {
+          [JOB_KEY('failed-job')]: {
             jobId: 'failed-job', nasScope: NAS,
             ruleIds: [10000],
             dnrSlot: 2,
@@ -628,7 +643,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
 
     const abortCall = fetchCalls.find((c) => c.url.endsWith('/failed-job/abort'));
     expect(abortCall).toBeDefined();
-    const stored = chrome.storage.local._state.wv2nasBrowserJobs['failed-job'];
+    const stored = chrome.storage.local._state.wv2nasBrowserJobs[JOB_KEY('failed-job')];
     expect(stored).toMatchObject({
       abortPending: true,
       abortReason: 'Segment 47 returned 403',
@@ -644,7 +659,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'cancelled-job': {
+          [JOB_KEY('cancelled-job')]: {
             jobId: 'cancelled-job', nasScope: NAS,
             ruleIds: [10000],
             dnrSlot: 2,
@@ -682,7 +697,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'finalize-failed-job': {
+          [JOB_KEY('finalize-failed-job')]: {
             jobId: 'finalize-failed-job', nasScope: NAS,
             ruleIds: [10000],
             dnrSlot: 3,
@@ -728,7 +743,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'slow-but-alive': {
+          [JOB_KEY('slow-but-alive')]: {
             jobId: 'slow-but-alive', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: oldStart, lastHeartbeat: recentHeartbeat,
             nasEndpoint: 'http://nas/', apiKey: 'k',
@@ -744,7 +759,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     expect(dnrCalls).toEqual([]);
     expect(fetchCalls.find((c) => c.url.includes('/abort'))).toBeUndefined();
     // Persisted entry preserved.
-    expect(chrome.storage.local._state.wv2nasBrowserJobs['slow-but-alive']).toBeDefined();
+    expect(chrome.storage.local._state.wv2nasBrowserJobs[JOB_KEY('slow-but-alive')]).toBeDefined();
     // Slot still reserved.
     expect(ctx.__eval('_wv2nasUsedDnrSlots.has(0)')).toBe(true);
   });
@@ -758,7 +773,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'heartbeat-died': {
+          [JOB_KEY('heartbeat-died')]: {
             jobId: 'heartbeat-died', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: recentStart, lastHeartbeat: oldHeartbeat,
             nasEndpoint: 'http://nas/', apiKey: 'k',
@@ -784,7 +799,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'legacy-no-heartbeat': {
+          [JOB_KEY('legacy-no-heartbeat')]: {
             jobId: 'legacy-no-heartbeat', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: oldStart,  // no lastHeartbeat field
             nasEndpoint: 'http://nas/', apiKey: 'k',
@@ -804,7 +819,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'tracker': {
+          [JOB_KEY('tracker')]: {
             jobId: 'tracker', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: Date.now(), nasEndpoint: 'http://nas/', apiKey: 'k',
           },
@@ -816,17 +831,17 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
 
     // Simulate offscreen sending a heartbeat.
     const ts = Date.now();
-    await ctx._wv2nasPersistBrowserJob('tracker', { lastHeartbeat: ts });
+    await ctx._wv2nasPersistBrowserJob(JOB_KEY('tracker'), { jobId: 'tracker', nasScope: NAS, lastHeartbeat: ts });
 
     // Persisted state has lastHeartbeat.
-    expect(chrome.storage.local._state.wv2nasBrowserJobs['tracker'].lastHeartbeat).toBe(ts);
+    expect(chrome.storage.local._state.wv2nasBrowserJobs[JOB_KEY('tracker')].lastHeartbeat).toBe(ts);
   });
 
   it('late heartbeat for an unpersisted job does not recreate it', async () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'done-job': {
+          [JOB_KEY('done-job')]: {
             jobId: 'done-job', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: Date.now(), nasEndpoint: 'http://nas/', apiKey: 'k',
           },
@@ -835,10 +850,10 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     });
     const ctx = loadBackground({ chrome, fetchStub: makeFetchStub() });
 
-    await ctx._wv2nasUnpersistBrowserJob('done-job');
-    await ctx._wv2nasPersistBrowserJobHeartbeat('done-job', Date.now());
+    await ctx._wv2nasUnpersistBrowserJob(JOB_KEY('done-job'));
+    await ctx._wv2nasPersistBrowserJobHeartbeat(JOB_KEY('done-job'), Date.now());
 
-    expect(chrome.storage.local._state.wv2nasBrowserJobs['done-job']).toBeUndefined();
+    expect(chrome.storage.local._state.wv2nasBrowserJobs[JOB_KEY('done-job')]).toBeUndefined();
   });
 
 
@@ -883,14 +898,14 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     await ctx._wv2nasHandleDurableCompletion({
       target: 'service-worker',
       type: 'BROWSER_JOB_DONE',
-      payload: { jobId: 'job-A' },
+      payload: { jobId: 'job-A', nasScope: NAS },
     });
 
     // job-A cleanly removed.
-    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has('job-A')")).toBe(false);
+    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has(JSON.stringify(['http://nas/', 'job-A']))")).toBe(false);
     // job-B preserved — recovery added it before the handler ran its
     // size check.
-    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has('job-B')")).toBe(true);
+    expect(ctx.__eval("_wv2nasActiveBrowserJobs.has(JSON.stringify(['http://nas/', 'job-B']))")).toBe(true);
     // CORE INVARIANT: offscreen NOT closed because job-B is still
     // downloading. Without the gate, this would be called.
     expect(chrome.offscreen.closeDocument).not.toHaveBeenCalled();
@@ -905,7 +920,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'lone-job': {
+          [JOB_KEY('lone-job')]: {
             jobId: 'lone-job', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: ts, lastHeartbeat: recent,
             nasEndpoint: 'http://nas/', apiKey: 'k',
@@ -941,9 +956,9 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
 
     const oldStart = Date.now() - 2 * 60 * 60 * 1000;
     chrome.storage.local._state.wv2nasBrowserJobs = {
-      'a': { jobId: 'a', nasScope: NAS, ruleIds: [10000], dnrSlot: 0, startedAt: oldStart,
+      [JOB_KEY('a')]: { jobId: 'a', nasScope: NAS, ruleIds: [10000], dnrSlot: 0, startedAt: oldStart,
              nasEndpoint: 'http://nas/', apiKey: 'k' },
-      'b': { jobId: 'b', nasScope: NAS, ruleIds: [10100], dnrSlot: 1, startedAt: oldStart,
+      [JOB_KEY('b')]: { jobId: 'b', nasScope: NAS, ruleIds: [10100], dnrSlot: 1, startedAt: oldStart,
              nasEndpoint: 'http://nas/', apiKey: 'k' },
     };
     dnrCalls.length = 0;
@@ -955,13 +970,13 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     // Abort failures keep persisted retry entries so the next SW boot
     // can retry server-side staging cleanup.
     const jobs = chrome.storage.local._state.wv2nasBrowserJobs;
-    expect(jobs.a).toMatchObject({
+    expect(jobs[JOB_KEY('a')]).toMatchObject({
       abortPending: true,
       lastHeartbeat: 0,
       ruleIds: [],
       dnrSlot: null,
     });
-    expect(jobs.b).toMatchObject({
+    expect(jobs[JOB_KEY('b')]).toMatchObject({
       abortPending: true,
       lastHeartbeat: 0,
       ruleIds: [],
@@ -990,16 +1005,16 @@ describe('persistence concurrency safety (Codex adversarial-review)', () => {
     // job is dropped. With the mutex, the second call waits for the
     // first to commit before reading.
     await Promise.all([
-      ctx._wv2nasPersistBrowserJob('job-A', { ruleIds: [10000], dnrSlot: 0 }),
-      ctx._wv2nasPersistBrowserJob('job-B', { ruleIds: [10100], dnrSlot: 1 }),
+      ctx._wv2nasPersistBrowserJob(JOB_KEY('job-A'), { jobId: 'job-A', nasScope: NAS, ruleIds: [10000], dnrSlot: 0 }),
+      ctx._wv2nasPersistBrowserJob(JOB_KEY('job-B'), { jobId: 'job-B', nasScope: NAS, ruleIds: [10100], dnrSlot: 1 }),
     ]);
 
     const stored = chrome.storage.local._state.wv2nasBrowserJobs;
-    expect(stored['job-A']).toBeDefined();
-    expect(stored['job-B']).toBeDefined();
-    expect(stored['job-A'].dnrSlot).toBe(0);
-    expect(stored['job-B'].dnrSlot).toBe(1);
-    expect(Object.keys(stored).sort()).toEqual(['job-A', 'job-B']);
+    expect(stored[JOB_KEY('job-A')]).toBeDefined();
+    expect(stored[JOB_KEY('job-B')]).toBeDefined();
+    expect(stored[JOB_KEY('job-A')].dnrSlot).toBe(0);
+    expect(stored[JOB_KEY('job-B')].dnrSlot).toBe(1);
+    expect(Object.keys(stored).sort()).toEqual([JOB_KEY('job-A'), JOB_KEY('job-B')].sort());
   });
 
   it('many concurrent persists of distinct jobs all survive', async () => {
@@ -1008,12 +1023,12 @@ describe('persistence concurrency safety (Codex adversarial-review)', () => {
 
     const ids = Array.from({ length: 12 }, (_, i) => `job-${i}`);
     await Promise.all(ids.map((jid, i) =>
-      ctx._wv2nasPersistBrowserJob(jid, { dnrSlot: i, startedAt: 1000 + i })
+      ctx._wv2nasPersistBrowserJob(JOB_KEY(jid), { jobId: jid, nasScope: NAS, dnrSlot: i, startedAt: 1000 + i })
     ));
 
     const stored = chrome.storage.local._state.wv2nasBrowserJobs;
     for (const jid of ids) {
-      expect(stored[jid]).toBeDefined();
+      expect(stored[JOB_KEY(jid)]).toBeDefined();
     }
     expect(Object.keys(stored)).toHaveLength(12);
   });
@@ -1025,45 +1040,45 @@ describe('persistence concurrency safety (Codex adversarial-review)', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'job-A': { jobId: 'job-A', startedAt: 1, lastHeartbeat: 100, dnrSlot: 0 },
-          'job-B': { jobId: 'job-B', startedAt: 2, lastHeartbeat: 200, dnrSlot: 1 },
+          [JOB_KEY('job-A')]: { jobId: 'job-A', nasScope: NAS, startedAt: 1, lastHeartbeat: 100, dnrSlot: 0 },
+          [JOB_KEY('job-B')]: { jobId: 'job-B', nasScope: NAS, startedAt: 2, lastHeartbeat: 200, dnrSlot: 1 },
         },
       },
     });
     const ctx = loadBackground({ chrome });
 
     await Promise.all([
-      ctx._wv2nasPersistBrowserJob('job-A', { lastHeartbeat: 5000 }),
-      ctx._wv2nasPersistBrowserJob('job-B', { lastHeartbeat: 5000 }),
+      ctx._wv2nasPersistBrowserJob(JOB_KEY('job-A'), { jobId: 'job-A', nasScope: NAS, lastHeartbeat: 5000 }),
+      ctx._wv2nasPersistBrowserJob(JOB_KEY('job-B'), { jobId: 'job-B', nasScope: NAS, lastHeartbeat: 5000 }),
     ]);
 
     const stored = chrome.storage.local._state.wv2nasBrowserJobs;
     // Both heartbeats applied; neither job's metadata lost.
-    expect(stored['job-A'].lastHeartbeat).toBe(5000);
-    expect(stored['job-B'].lastHeartbeat).toBe(5000);
-    expect(stored['job-A'].dnrSlot).toBe(0);
-    expect(stored['job-B'].dnrSlot).toBe(1);
+    expect(stored[JOB_KEY('job-A')].lastHeartbeat).toBe(5000);
+    expect(stored[JOB_KEY('job-B')].lastHeartbeat).toBe(5000);
+    expect(stored[JOB_KEY('job-A')].dnrSlot).toBe(0);
+    expect(stored[JOB_KEY('job-B')].dnrSlot).toBe(1);
   });
 
   it('concurrent persist + unpersist serializes correctly', async () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'existing': { jobId: 'existing', nasScope: NAS, dnrSlot: 0 },
+          [JOB_KEY('existing')]: { jobId: 'existing', nasScope: NAS, dnrSlot: 0 },
         },
       },
     });
     const ctx = loadBackground({ chrome });
 
     await Promise.all([
-      ctx._wv2nasPersistBrowserJob('new', { dnrSlot: 1 }),
-      ctx._wv2nasUnpersistBrowserJob('existing'),
+      ctx._wv2nasPersistBrowserJob(JOB_KEY('new'), { jobId: 'new', nasScope: NAS, dnrSlot: 1 }),
+      ctx._wv2nasUnpersistBrowserJob(JOB_KEY('existing')),
     ]);
 
     const stored = chrome.storage.local._state.wv2nasBrowserJobs;
-    expect(stored['new']).toBeDefined();
-    expect(stored['existing']).toBeUndefined();
-    expect(Object.keys(stored)).toEqual(['new']);
+    expect(stored[JOB_KEY('new')]).toBeDefined();
+    expect(stored[JOB_KEY('existing')]).toBeUndefined();
+    expect(Object.keys(stored)).toEqual([JOB_KEY('new')]);
   });
 
   it('a failing persist does not poison the chain for subsequent calls', async () => {
@@ -1082,13 +1097,13 @@ describe('persistence concurrency safety (Codex adversarial-review)', () => {
     // First persist's underlying set throws. The helper swallows the
     // error (per _wv2nasWritePersistedBrowserJobs), so the await
     // resolves; downstream callers must still proceed.
-    await ctx._wv2nasPersistBrowserJob('A', { dnrSlot: 0 });
-    await ctx._wv2nasPersistBrowserJob('B', { dnrSlot: 1 });
+    await ctx._wv2nasPersistBrowserJob(JOB_KEY('A'), { jobId: 'A', nasScope: NAS, dnrSlot: 0 });
+    await ctx._wv2nasPersistBrowserJob(JOB_KEY('B'), { jobId: 'B', nasScope: NAS, dnrSlot: 1 });
 
     const stored = chrome.storage.local._state.wv2nasBrowserJobs;
     // 'A' is lost (the throw blew away its write); 'B' must still be
     // present — that's the chain-not-poisoned property.
-    expect(stored['B']).toBeDefined();
+    expect(stored[JOB_KEY('B')]).toBeDefined();
   });
 
   it('recovery sweep preserves a heartbeat written concurrently', async () => {
@@ -1117,12 +1132,12 @@ describe('persistence concurrency safety (Codex adversarial-review)', () => {
     // 'fresh'.
     await Promise.all([
       ctx._wv2nasRecoverStaleBrowserJobs(),
-      ctx._wv2nasPersistBrowserJob('fresh', { dnrSlot: 2, startedAt: Date.now() }),
+      ctx._wv2nasPersistBrowserJob(JOB_KEY('fresh'), { jobId: 'fresh', nasScope: NAS, dnrSlot: 2, startedAt: Date.now() }),
     ]);
 
     const stored = chrome.storage.local._state.wv2nasBrowserJobs;
-    expect(stored['stale']).toBeUndefined();
-    expect(stored['fresh']).toBeDefined();
-    expect(stored['fresh'].dnrSlot).toBe(2);
+    expect(stored[JOB_KEY('stale')]).toBeUndefined();
+    expect(stored[JOB_KEY('fresh')]).toBeDefined();
+    expect(stored[JOB_KEY('fresh')].dnrSlot).toBe(2);
   });
 });

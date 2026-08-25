@@ -3399,6 +3399,37 @@ async function _wv2nasInstallVariantDnrRule(variantUrl, dnrContext, trusted = fa
 // ---------------------------------------------------------------------------
 
 const _BROWSER_JOB_PERSIST_KEY = 'wv2nasBrowserJobs';
+
+// Job ids are unique per NAS, not globally — see nasIdentity.js. Everything
+// the service worker tracks per job is therefore keyed by NAS + id: the
+// persisted store, the active-job map, heartbeats, completion matching and
+// recovery. Two NAS restored from the same database backup otherwise overwrite
+// each other's records, and a single DONE can retire both waiters — closing
+// offscreen early, removing the wrong DNR rules, or aborting the other NAS's
+// staging with credentials that were overwritten.
+//
+// Migration happens here, in the one read path, so no caller has to think
+// about it. Unlike the session snapshots, these records already carry their
+// own nasEndpoint, so a pre-identity entry can be re-keyed losslessly instead
+// of dropped — this store lives in storage.local and survives restarts, so
+// discarding it would strand recovery for a job that was in flight during the
+// upgrade. A record with no endpoint is unusable anyway (abort needs it).
+function _wv2nasMigratePersistedBrowserJobs(jobs) {
+  if (!jobs || typeof jobs !== 'object') return {};
+  const identity = globalThis.WV2NNasIdentity;
+  const out = {};
+  for (const [key, data] of Object.entries(jobs)) {
+    if (!data || typeof data !== 'object') continue;
+    if (!identity.isLegacyBrowserJobKey(key)) {
+      out[key] = data;
+      continue;
+    }
+    const migrated = identity.browserJobKey(data.nasEndpoint, data.jobId || key);
+    if (!migrated) continue;
+    out[migrated] = { ...data, jobId: String(data.jobId || key), nasScope: data.nasEndpoint };
+  }
+  return out;
+}
 // Live browser-transfer counters belong to the browser session rather than
 // durable job recovery. Keeping a small, bounded snapshot map in
 // storage.session lets a reopened sidepanel (or a restarted MV3 service
@@ -3424,7 +3455,7 @@ const _BROWSER_JOB_STALE_MS = 60 * 60 * 1000;
 async function _wv2nasReadPersistedBrowserJobs() {
   try {
     const cur = await chrome.storage.local.get(_BROWSER_JOB_PERSIST_KEY);
-    return cur[_BROWSER_JOB_PERSIST_KEY] || {};
+    return _wv2nasMigratePersistedBrowserJobs(cur[_BROWSER_JOB_PERSIST_KEY] || {});
   } catch (e) {
     console.warn('[wv2nas] read persisted browser jobs failed:', e);
     return {};
@@ -3621,21 +3652,20 @@ async function _wv2nasPersistBrowserTransferSnapshot(msg) {
   });
 }
 
-async function _wv2nasPersistBrowserJob(jobId, data) {
+async function _wv2nasPersistBrowserJob(jobKey, data) {
   return _wv2nasWithPersistLock(async () => {
     const jobs = await _wv2nasReadPersistedBrowserJobs();
-    jobs[jobId] = { ...(jobs[jobId] || {}), ...data, jobId };
+    jobs[jobKey] = { ...(jobs[jobKey] || {}), ...data };
     await _wv2nasWritePersistedBrowserJobs(jobs);
   });
 }
 
-async function _wv2nasPersistBrowserJobHeartbeat(jobId, ts) {
+async function _wv2nasPersistBrowserJobHeartbeat(jobKey, ts) {
   return _wv2nasWithPersistLock(async () => {
     const jobs = await _wv2nasReadPersistedBrowserJobs();
-    if (!jobs[jobId]) return false;
-    jobs[jobId] = {
-      ...jobs[jobId],
-      jobId,
+    if (!jobs[jobKey]) return false;
+    jobs[jobKey] = {
+      ...jobs[jobKey],
       lastHeartbeat: Number(ts) || Date.now(),
     };
     await _wv2nasWritePersistedBrowserJobs(jobs);
@@ -3643,17 +3673,17 @@ async function _wv2nasPersistBrowserJobHeartbeat(jobId, ts) {
   });
 }
 
-async function _wv2nasUnpersistBrowserJob(jobId) {
+async function _wv2nasUnpersistBrowserJob(jobKey) {
   return _wv2nasWithPersistLock(async () => {
     const jobs = await _wv2nasReadPersistedBrowserJobs();
-    if (jobs[jobId]) {
-      delete jobs[jobId];
+    if (jobs[jobKey]) {
+      delete jobs[jobKey];
       await _wv2nasWritePersistedBrowserJobs(jobs);
     }
   });
 }
 
-async function _wv2nasPersistAbortRetry(jobId, reason, { dnrCleaned = false } = {}) {
+async function _wv2nasPersistAbortRetry(jobKey, reason, { dnrCleaned = false } = {}) {
   const patch = {
     abortPending: true,
     abortReason: (reason || 'Browser-side job failed before finalize').slice(0, 500),
@@ -3668,7 +3698,7 @@ async function _wv2nasPersistAbortRetry(jobId, reason, { dnrCleaned = false } = 
     patch.ruleIds = [];
     patch.dnrSlot = null;
   }
-  await _wv2nasPersistBrowserJob(jobId, patch);
+  await _wv2nasPersistBrowserJob(jobKey, patch);
 }
 
 // Codex review #15: durable completion handler. Registered at SW
@@ -3688,6 +3718,11 @@ async function _wv2nasPersistAbortRetry(jobId, reason, { dnrCleaned = false } = 
 // Worst case: cleanup runs twice. Cheap.
 async function _wv2nasHandleDurableCompletion(msg) {
   const jobId = msg && msg.payload && msg.payload.jobId;
+  // A DONE from one NAS must not retire an identically numbered job on
+  // another. Without the scope, either message ends both waiters.
+  const jobKey = globalThis.WV2NNasIdentity.browserJobKey(
+    msg && msg.payload && msg.payload.nasScope, jobId);
+  if (!jobKey) return;
   if (!jobId) return;
   // Capture final counters before cleanup removes the durable job entry. This
   // also preserves a failed transfer's partial CDN/NAS timings for the next
@@ -3701,7 +3736,7 @@ async function _wv2nasHandleDurableCompletion(msg) {
   // recovery hasn't run yet.
   await _wv2nasInitRecovery();
   const jobs = await _wv2nasReadPersistedBrowserJobs();
-  const data = jobs[jobId];
+  const data = jobs[jobKey];
   if (!data) {
     // In-memory listener already cleaned up (normal path) — nothing
     // to do. Or the job_id is bogus; either way safe to ignore.
@@ -3723,7 +3758,7 @@ async function _wv2nasHandleDurableCompletion(msg) {
   if (typeof data.dnrSlot === 'number' && dnrCleanupOk) {
     _wv2nasUsedDnrSlots.delete(data.dnrSlot);
   }
-  _wv2nasActiveBrowserJobs.delete(jobId);
+  _wv2nasActiveBrowserJobs.delete(jobKey);
 
   if (_wv2nasActiveBrowserJobs.size === 0) {
     await _closeOffscreenDocument();
@@ -3740,15 +3775,15 @@ async function _wv2nasHandleDurableCompletion(msg) {
     && data.nasEndpoint && data.apiKey;
   if (needsAbort) {
     const reason = msg.payload.error || 'Durable handler abort';
-    await _wv2nasPersistAbortRetry(jobId, reason, { dnrCleaned: dnrCleanupOk });
+    await _wv2nasPersistAbortRetry(jobKey, reason, { dnrCleaned: dnrCleanupOk });
     const abortOk = await _wv2nasAbortBrowserJob(
       data.nasEndpoint, data.apiKey, jobId, reason,
     );
     if (abortOk) {
-      await _wv2nasUnpersistBrowserJob(jobId);
+      await _wv2nasUnpersistBrowserJob(jobKey);
     }
   } else {
-    await _wv2nasUnpersistBrowserJob(jobId);
+    await _wv2nasUnpersistBrowserJob(jobKey);
   }
 }
 
@@ -3797,10 +3832,13 @@ async function _wv2nasRecoverStaleBrowserJobs() {
   // heartbeat/persist calls (possible during boot if a queued
   // BROWSER_JOB_DONE/FAILED message wakes the SW alongside this
   // sweep) and dropped their entries.
-  const staleJobIds = [];
+  // Composite keys, since that is what the store is keyed by.
+  const staleJobKeys = [];
   let recovered = 0;
 
-  for (const [jobId, data] of Object.entries(jobs)) {
+  for (const [jobKey, data] of Object.entries(jobs)) {
+    // The store is keyed by NAS + id; the NAS API is addressed by id alone.
+    const jobId = String(data.jobId || '');
     const startedAt = Number(data.startedAt) || 0;
     const lastHeartbeat = Number(data.lastHeartbeat) || 0;
     const now2 = now;  // local alias for clarity below
@@ -3837,7 +3875,7 @@ async function _wv2nasRecoverStaleBrowserJobs() {
       if (typeof data.dnrSlot === 'number') {
         _wv2nasUsedDnrSlots.add(data.dnrSlot);
       }
-      _wv2nasActiveBrowserJobs.set(jobId, {
+      _wv2nasActiveBrowserJobs.set(jobKey, {
         dnrSlot: data.dnrSlot,
         ruleIds: Array.isArray(data.ruleIds) ? data.ruleIds : [],
       });
@@ -3876,10 +3914,10 @@ async function _wv2nasRecoverStaleBrowserJobs() {
       _wv2nasUsedDnrSlots.delete(data.dnrSlot);
     }
     if (abortOk) {
-      staleJobIds.push(jobId);
+      staleJobKeys.push(jobKey);
     } else {
       await _wv2nasPersistAbortRetry(
-        jobId,
+        jobKey,
         data.abortReason || 'Stale browser job recovered at SW boot',
         { dnrCleaned: dnrCleanupOk },
       );
@@ -3891,8 +3929,8 @@ async function _wv2nasRecoverStaleBrowserJobs() {
   // are preserved. Each unpersist re-reads the latest state under the
   // lock, so we never accidentally resurrect an entry that was being
   // added concurrently.
-  for (const jobId of staleJobIds) {
-    await _wv2nasUnpersistBrowserJob(jobId);
+  for (const staleKey of staleJobKeys) {
+    await _wv2nasUnpersistBrowserJob(staleKey);
   }
   if (recovered > 0) {
     console.warn(`[wv2nas] recovered ${recovered} stale browser job(s) at SW boot`);
@@ -4146,14 +4184,16 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
 
     // Register active job BEFORE further side effects so the offscreen
     // ref-count guard sees this job in the map.
-    _wv2nasActiveBrowserJobs.set(jobId, { dnrSlot, ruleIds });
+    const jobKey = globalThis.WV2NNasIdentity.browserJobKey(nasEndpoint, jobId);
+    _wv2nasActiveBrowserJobs.set(jobKey, { dnrSlot, ruleIds });
 
     // Codex review #12: persist to chrome.storage.local so a SW
     // restart (MV3 evicts SWs aggressively) doesn't strand DNR rules
     // and server-side staging. The boot-time watchdog
     // _wv2nasRecoverStaleBrowserJobs walks this storage on every SW
     // init and aborts/cleans any job older than _BROWSER_JOB_STALE_MS.
-    await _wv2nasPersistBrowserJob(jobId, {
+    await _wv2nasPersistBrowserJob(jobKey, {
+      jobId: String(jobId), nasScope: nasEndpoint,
       ruleIds, dnrSlot, startedAt: Date.now(),
       nasEndpoint, apiKey,
     });
@@ -4192,7 +4232,7 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
       // MV3 service worker is killed after updateSessionRules succeeds
       // but before the post-update persist, the boot watchdog still has
       // every rule ID it must remove.
-      await _wv2nasPersistBrowserJob(jobId, { ruleIds: idsToRemove });
+      await _wv2nasPersistBrowserJob(jobKey, { ruleIds: idsToRemove });
       await chrome.declarativeNetRequest.updateSessionRules({
         removeRuleIds: idsToRemove,
         addRules: rules,
@@ -4205,10 +4245,10 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
       });
     }
     ruleIds = newIds;
-    _wv2nasActiveBrowserJobs.get(jobId).ruleIds = ruleIds;
+    _wv2nasActiveBrowserJobs.get(jobKey).ruleIds = ruleIds;
     // Codex review #12: keep persisted ruleIds in sync so the boot
     // watchdog removes the LATEST rule set (not the phase-1 stub).
-    await _wv2nasPersistBrowserJob(jobId, { ruleIds });
+    await _wv2nasPersistBrowserJob(jobKey, { ruleIds });
 
     // 3) Ensure offscreen exists. Idempotent — reuses existing doc when
     // another concurrent job already opened it.
@@ -4305,8 +4345,13 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     if (dnrCleanupOk) {
       _wv2nasReleaseDnrSlot(dnrSlot);
     }
-    if (jobId) {
-      _wv2nasActiveBrowserJobs.delete(jobId);
+    // nasEndpoint is the NAS this listener's job belongs to, so the key it
+    // built at start time is reproducible here.
+    const jobKey = jobId
+      ? globalThis.WV2NNasIdentity.browserJobKey(nasEndpoint, jobId)
+      : null;
+    if (jobKey) {
+      _wv2nasActiveBrowserJobs.delete(jobKey);
     }
     if (_wv2nasActiveBrowserJobs.size === 0) {
       // Last active job — safe to free the offscreen document. If another
@@ -4325,17 +4370,17 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     //      a queued job's staged segments),
     //   4. The failure was not produced by an accepted user cancel
     //      (DELETE owns that state transition and staging cleanup).
-    if (jobId && !completionSucceeded && !finalizeAttempted && !userCancelled) {
-      await _wv2nasPersistAbortRetry(jobId, abortReason, { dnrCleaned: dnrCleanupOk });
+    if (jobKey && !completionSucceeded && !finalizeAttempted && !userCancelled) {
+      await _wv2nasPersistAbortRetry(jobKey, abortReason, { dnrCleaned: dnrCleanupOk });
       const abortOk = await _wv2nasAbortBrowserJob(nasEndpoint, apiKey, jobId, abortReason);
       if (abortOk) {
-        await _wv2nasUnpersistBrowserJob(jobId);
+        await _wv2nasUnpersistBrowserJob(jobKey);
       }
-    } else if (jobId) {
+    } else if (jobKey) {
       // Codex review #12: remove from chrome.storage so the boot
       // watchdog doesn't double-clean a job that already finished
       // normally. unpersist is idempotent (no-op if entry missing).
-      await _wv2nasUnpersistBrowserJob(jobId);
+      await _wv2nasUnpersistBrowserJob(jobKey);
     }
   }
 }
@@ -4374,12 +4419,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
     // watchdog can use it as liveness signal. Fire-and-forget — a
     // missed heartbeat write isn't fatal (next one will land).
     const jobId = msg.payload && msg.payload.jobId;
-    if (jobId) {
+    // Heartbeats refresh one NAS's record, never the other's identically
+    // numbered one.
+    const jobKey = globalThis.WV2NNasIdentity.browserJobKey(
+      msg.payload && msg.payload.nasScope, jobId);
+    if (jobKey) {
       // Only refresh known persisted jobs. A DONE/FAILED cleanup can race
       // with a queued heartbeat from the offscreen document; recreating the
       // deleted entry would make the next SW boot recover a phantom job.
       _wv2nasPersistBrowserJobHeartbeat(
-        jobId,
+        jobKey,
         msg.payload && msg.payload.ts,
       ).catch(() => {});
     }
