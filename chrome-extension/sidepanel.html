@@ -96,6 +96,22 @@
         </button>
       </div>
 
+      <!-- First-run coach strip. Same shape as the update banner, but it
+           advances on state that is already on screen — connection chip,
+           detected list, job list — and retires itself once a job exists.
+           Gated on the shared chrome.storage.local 'onboardingCompleted' flag. -->
+      <div id="onbCoach" class="onb-coach" hidden>
+        <span class="onb-coach-dot" aria-hidden="true"></span>
+        <span id="onbCoachText" class="onb-coach-text"></span>
+        <button id="onbCoachAction" class="onb-coach-action" type="button" hidden></button>
+        <button id="onbCoachDismiss" class="onb-coach-dismiss" type="button" title="">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+               stroke-width="1.6" stroke-linecap="round">
+            <path d="M4 4l8 8M12 4l-8 8"/>
+          </svg>
+        </button>
+      </div>
+
       <!-- Toolbar: visible for many-mode or whenever multiple qualities exist. -->
       <div id="toolbar" class="toolbar" hidden>
         <div class="search">

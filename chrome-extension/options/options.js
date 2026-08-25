@@ -1,6 +1,7 @@
 // Options Page Script for WebVideo2NAS — terminal/dotfile UI.
 
 const NAV_FILES = {
+  getting_started: 'getting_started.toml',
   connection:  'connection.toml',
   profiles:    'profiles.toml',
   prefs:       'prefs.toml',
@@ -91,6 +92,50 @@ async function setTheme(next) {
 // Only connection.toml goes through the explicit save/discard flow.
 // profiles + prefs auto-save on edit; about is read-only.
 const PANES_WITH_SAVE = new Set(['connection']);
+
+// ---------- First-run onboarding ----------
+// Shared with background.js (which opens this page once) and with the side
+// panel's coach strip. One flag, three surfaces.
+const ONBOARDING_FLAG = 'onboardingCompleted';
+
+// Steps 1-2 are observable from this page. Steps 3-4 happen in the side
+// panel, so they are labelled as tracked there rather than faked here.
+let onboardingDone = false;
+let onbPingOk = false;
+
+function refreshOnboardingStatus() {
+  const endpointSet = !!(savedSnapshot.nasEndpoint && savedSnapshot.apiKey);
+  const mark = (n, state) => {
+    const el = $('onbStatus' + n);
+    if (!el) return;
+    el.classList.remove('todo', 'done');
+    if (state !== 'manual') el.classList.add(state);
+    const label = state === 'done' ? t('onboarding.status.done')
+      : state === 'todo' ? t('onboarding.status.todo')
+      : t('onboarding.status.manual');
+    el.textContent = '# ' + label;
+  };
+  mark(1, endpointSet ? 'done' : 'todo');
+  mark(2, onbPingOk ? 'done' : 'todo');
+  mark(3, 'manual');
+  mark(4, 'manual');
+
+  // Sidebar badge: only while onboarding is unfinished and something is left.
+  const badge = $('onbNavTodo');
+  if (badge) badge.hidden = onboardingDone || (endpointSet && onbPingOk);
+
+  const doneBtn = $('onbDoneBtn');
+  if (doneBtn) doneBtn.disabled = onboardingDone;
+}
+
+async function completeOnboarding() {
+  onboardingDone = true;
+  refreshOnboardingStatus();
+  try {
+    await chrome.storage.local.set({ [ONBOARDING_FLAG]: true });
+    showStatus(t('onboarding.doneToast') || 'Onboarding dismissed', 'success');
+  } catch (_) { /* the UI already reflects it; a retry costs nothing */ }
+}
 
 function switchNav(id) {
   if (!NAV_FILES[id]) return;
@@ -274,6 +319,20 @@ function localizeStaticText() {
 
   // Profiles
   setText('addProfileText', t('options.profiles.addBtn') || '[profile.new] — save current as profile');
+
+  // getting_started.toml
+  setText('onbNavLabel', t('onboarding.nav.label'));
+  setText('onbIntro1', t('onboarding.intro1'));
+  setText('onbIntro2', t('onboarding.intro2'));
+  for (const n of [1, 2, 3, 4]) {
+    setText('onbTitle' + n, '"' + t('onboarding.step' + n + '.title') + '"');
+    setText('onbBody' + n, t('onboarding.step' + n + '.body'));
+  }
+  setText('onbAction1', t('onboarding.step1.action'));
+  setText('onbAction2', t('onboarding.step2.action'));
+  setText('onbDoneBtn', t('onboarding.done'));
+  setText('onbDoneHint', t('onboarding.doneHint'));
+  refreshOnboardingStatus();
 
   syncCommentTitles();
 }
@@ -679,6 +738,8 @@ async function testConnection() {
       }
       if (version) setText('serverVersion', `"${version}"`);
       showStatus(t('options.status.connectionOk'), 'success');
+      onbPingOk = true;
+      refreshOnboardingStatus();
 
       // Sidebar host hint
       try {
@@ -864,6 +925,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     btn.addEventListener('click', () => switchNav(btn.dataset.nav));
   });
 
+  // getting_started.toml: shortcut buttons + the dismiss action
+  document.querySelectorAll('[data-onb-goto]').forEach(btn => {
+    btn.addEventListener('click', () => switchNav(btn.dataset.onbGoto));
+  });
+  const onbDone = $('onbDoneBtn');
+  if (onbDone) onbDone.addEventListener('click', () => { completeOnboarding(); });
+
   // Wire up theme toggle
   $('themeToggleBtn').addEventListener('click', () => {
     setTheme(theme === 'light' ? 'dark' : 'light');
@@ -966,6 +1034,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       saveSettings();
     }
   });
+
+  // First run lands on getting_started.toml. background.js opens this page
+  // once on install; this decides which pane it shows. localizeStaticText()
+  // already called refreshOnboardingStatus(), but that ran before
+  // savedSnapshot was populated, so step 1 needs a second look here.
+  try {
+    const stored = await chrome.storage.local.get([ONBOARDING_FLAG]);
+    onboardingDone = !!(stored && stored[ONBOARDING_FLAG]);
+  } catch (_) {
+    // Storage unreadable — treat onboarding as done rather than nagging.
+    onboardingDone = true;
+  }
+  refreshOnboardingStatus();
+  if (!onboardingDone) switchNav('getting_started');
 
   refreshDirtyIndicator();
   recomputeGutter();

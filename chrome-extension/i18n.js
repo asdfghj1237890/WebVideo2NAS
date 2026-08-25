@@ -242,7 +242,36 @@
 
       'update.banner.text': 'New version {version} available',
       'update.banner.download': 'Update on GitHub',
-      'update.banner.dismiss': 'Dismiss'
+      'update.banner.dismiss': 'Dismiss',
+
+      // Onboarding. Shown once per install, gated on the
+      // chrome.storage.local 'onboardingCompleted' flag.
+      'onboarding.nav.label': 'getting_started.toml',
+      'onboarding.intro1': '# First run — four steps and you are set up.',
+      'onboarding.intro2': '# This page stays in the sidebar, so you can come back any time.',
+      'onboarding.step1.title': 'Set the NAS address',
+      'onboarding.step1.body': 'Open connection.toml and fill in endpoint + api_key, then save.',
+      'onboarding.step1.action': 'open connection.toml',
+      'onboarding.step2.title': 'Test the connection',
+      'onboarding.step2.body': 'Press [test] in connection.toml. The dot turns green once the NAS answers.',
+      'onboarding.step2.action': 'go run the test',
+      'onboarding.step3.title': 'Open the side panel',
+      'onboarding.step3.body': 'Click the WebVideo2NAS icon in the Chrome toolbar. Downloads are driven from there.',
+      'onboarding.step4.title': 'Send your first video',
+      'onboarding.step4.body': 'Open a video page and press play. Detected videos show up in the panel — press the arrow to send one to the NAS.',
+      'onboarding.status.todo': 'todo',
+      'onboarding.status.done': 'done',
+      'onboarding.status.manual': 'tracked in the side panel',
+      'onboarding.done': "Got it — don't show this again",
+      'onboarding.doneHint': '# keeps the page in the sidebar, just stops opening it on start',
+      'onboarding.doneToast': 'Onboarding dismissed',
+
+      // Side-panel coach strip. Advances on real state, not on clicks.
+      'onboarding.coach.step1': '1/3 · set your NAS address',
+      'onboarding.coach.step1.action': 'settings',
+      'onboarding.coach.step2': '2/3 · open a video page and press play',
+      'onboarding.coach.step3': '3/3 · press the arrow to send it to your NAS',
+      'onboarding.coach.dismiss': 'Dismiss'
     },
     'zh-TW': {
       'status.checking': '檢查中…',
@@ -454,7 +483,35 @@
 
       'update.banner.text': '新版本 {version} 已發布',
       'update.banner.download': '前往 GitHub 下載',
-      'update.banner.dismiss': '關閉提醒'
+      'update.banner.dismiss': '關閉提醒',
+
+      // Onboarding
+      'onboarding.nav.label': 'getting_started.toml',
+      'onboarding.intro1': '# 第一次使用 — 四個步驟就設定完成。',
+      'onboarding.intro2': '# 這一頁會留在側欄，隨時可以回來看。',
+      'onboarding.step1.title': '設定 NAS 位址',
+      'onboarding.step1.body': '打開 connection.toml，填入 endpoint 和 api_key 後儲存。',
+      'onboarding.step1.action': '前往 connection.toml',
+      'onboarding.step2.title': '測試連線',
+      'onboarding.step2.body': '在 connection.toml 按 [test]。NAS 有回應時圓點會變綠色。',
+      'onboarding.step2.action': '前往測試連線',
+      'onboarding.step3.title': '打開側邊欄',
+      'onboarding.step3.body': '點 Chrome 工具列上的 WebVideo2NAS 圖示。下載都是從那裡操作的。',
+      'onboarding.step4.title': '送出第一部影片',
+      'onboarding.step4.body': '打開影片頁面並按播放。偵測到的影片會出現在側邊欄，按箭頭就能送到 NAS。',
+      'onboarding.status.todo': '未完成',
+      'onboarding.status.done': '完成',
+      'onboarding.status.manual': '在側邊欄追蹤',
+      'onboarding.done': '知道了 — 不要再顯示',
+      'onboarding.doneHint': '# 頁面仍留在側欄，只是不再自動開啟',
+      'onboarding.doneToast': '已關閉新手引導',
+
+      // 側邊欄引導條
+      'onboarding.coach.step1': '1/3 · 先設定 NAS 位址',
+      'onboarding.coach.step1.action': '設定',
+      'onboarding.coach.step2': '2/3 · 打開影片頁面並按播放',
+      'onboarding.coach.step3': '3/3 · 按箭頭把影片送到 NAS',
+      'onboarding.coach.dismiss': '關閉'
     },
     'zh-CN': {
       'status.checking': '检查中…',

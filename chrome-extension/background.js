@@ -1653,14 +1653,48 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 });
 
 // Create context menu
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   chrome.contextMenus.create({
     id: "sendToNAS",
     title: "Send to NAS",
     contexts: ["link", "page"]
   });
   maybeCheckExtensionUpdate().catch(() => {});
+  maybeOpenOnboarding(details).catch(() => {});
 });
+
+// ---------------------------------------------------------------------------
+// First-run onboarding.
+//
+// Opens the options page once, on the first install that has not been through
+// onboarding yet. Two things shape this:
+//
+//   * chrome.sidePanel.open() requires a user gesture and onInstalled has
+//     none, so onboarding cannot start by revealing the side panel. The
+//     options page is the only surface reachable from here.
+//   * The extension is sideloaded from GitHub Release zips, so a fresh
+//     unpacked load fires reason === 'install' every time. Gating on reason
+//     alone would reopen the tab on every developer reload, so the persisted
+//     flag is the real gate and reason only keeps version bumps quiet.
+//
+// The flag is also set by the options page and by the side-panel coach strip;
+// all three surfaces share this one key.
+
+const ONBOARDING_FLAG = 'onboardingCompleted';
+
+async function maybeOpenOnboarding(details) {
+  if (!details || details.reason !== 'install') return;
+  let done = false;
+  try {
+    const stored = await chrome.storage.local.get([ONBOARDING_FLAG]);
+    done = !!(stored && stored[ONBOARDING_FLAG]);
+  } catch (_) {
+    // Storage unavailable — stay quiet rather than reopening the tab blindly.
+    return;
+  }
+  if (done) return;
+  chrome.runtime.openOptionsPage();
+}
 
 // ---------------------------------------------------------------------------
 // Extension update check.

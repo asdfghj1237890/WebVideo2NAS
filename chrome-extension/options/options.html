@@ -59,6 +59,19 @@
         <div class="sidebar-section-label">── files ──</div>
 
         <nav class="nav" id="navList">
+          <button class="nav-item" type="button" data-nav="getting_started">
+            <span class="nav-arrow">▸</span>
+            <span class="nav-icon">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 18h6M10 22h4"/>
+                <path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/>
+              </svg>
+            </span>
+            <span class="nav-label" id="onbNavLabel">getting_started.toml</span>
+            <span class="nav-count" id="onbNavTodo" hidden>!</span>
+          </button>
+
           <button class="nav-item active" type="button" data-nav="connection">
             <span class="nav-arrow">▸</span>
             <span class="nav-icon">
@@ -150,6 +163,73 @@
           <div class="editor" id="editor">
 
             <!-- ====== connection.toml ====== -->
+            <!-- ====== getting_started.toml ====== -->
+            <section class="pane" data-pane="getting_started">
+              <div class="comment" id="onbIntro1"></div>
+              <div class="comment" id="onbIntro2"></div>
+              <div class="spacer"></div>
+
+              <div class="section-head">
+                <span>[step.1]</span>
+                <span class="onb-status" id="onbStatus1"></span>
+              </div>
+              <div class="kv">
+                <span class="key">goal</span>
+                <span class="eq">=</span>
+                <span class="val readonly" id="onbTitle1">""</span>
+              </div>
+              <div class="onb-body" id="onbBody1"></div>
+              <div class="onb-actions">
+                <button class="inline-btn" type="button" id="onbAction1" data-onb-goto="connection"></button>
+              </div>
+              <div class="spacer"></div>
+
+              <div class="section-head">
+                <span>[step.2]</span>
+                <span class="onb-status" id="onbStatus2"></span>
+              </div>
+              <div class="kv">
+                <span class="key">goal</span>
+                <span class="eq">=</span>
+                <span class="val readonly" id="onbTitle2">""</span>
+              </div>
+              <div class="onb-body" id="onbBody2"></div>
+              <div class="onb-actions">
+                <button class="inline-btn" type="button" id="onbAction2" data-onb-goto="connection"></button>
+              </div>
+              <div class="spacer"></div>
+
+              <div class="section-head">
+                <span>[step.3]</span>
+                <span class="onb-status" id="onbStatus3"></span>
+              </div>
+              <div class="kv">
+                <span class="key">goal</span>
+                <span class="eq">=</span>
+                <span class="val readonly" id="onbTitle3">""</span>
+              </div>
+              <div class="onb-body" id="onbBody3"></div>
+              <div class="spacer"></div>
+
+              <div class="section-head">
+                <span>[step.4]</span>
+                <span class="onb-status" id="onbStatus4"></span>
+              </div>
+              <div class="kv">
+                <span class="key">goal</span>
+                <span class="eq">=</span>
+                <span class="val readonly" id="onbTitle4">""</span>
+              </div>
+              <div class="onb-body" id="onbBody4"></div>
+              <div class="spacer"></div>
+
+              <div class="section-head">[done]</div>
+              <div class="onb-actions">
+                <button class="inline-btn" type="button" id="onbDoneBtn"></button>
+                <span class="comment-inline" id="onbDoneHint"></span>
+              </div>
+            </section>
+
             <section class="pane active" data-pane="connection">
               <div class="comment"># WebVideo2NAS — connection</div>
               <div class="comment"># edit values inline · click :w to save</div>

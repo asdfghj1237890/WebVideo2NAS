@@ -315,6 +315,32 @@ input:focus-visible, select:focus-visible { outline: none; }
   font-weight: 500;
 }
 
+/* ==== getting_started.toml — first-run onboarding ==== */
+/* .comment is pinned to a single 26px editor line. Step help runs to two or
+   three lines, so it gets its own box that still lands on the 26px grid and
+   is capped at a comfortable measure instead of stretching to the pane. */
+.onb-body {
+  color: var(--text-mid);
+  line-height: 26px;
+  padding-left: 10px;
+  max-width: 74ch;
+  transition: color 320ms;
+}
+.onb-actions {
+  display: flex; align-items: center; gap: 10px;
+  min-height: 26px;
+  padding-left: 10px;
+}
+/* Status marker on each [step.N] head. 'manual' means this step is tracked by
+   the side-panel strip, not here — the options page cannot observe it. */
+.onb-status {
+  font-weight: 600;
+  color: var(--text-faint);
+  transition: color 320ms;
+}
+.onb-status.done { color: var(--accent); }
+.onb-status.todo { color: var(--warn); }
+
 /* Hidden-mode task history table — lives at the bottom of hidden_mode.toml.
    Read-only view of chrome.storage.local.avTaskHistory; row colour echoes
    the side panel's status hues (warn for pending, accent for sent, err

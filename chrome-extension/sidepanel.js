@@ -339,6 +339,68 @@ async function showUpdateBannerFor(status) {
   banner.hidden = false;
 }
 
+// ---------- First-run coach strip ----------
+// Shares chrome.storage.local's 'onboardingCompleted' with the options page:
+// one onboarding, three surfaces. Every step is read off state that is
+// already rendered, so the strip keeps no bookkeeping of its own.
+const ONBOARDING_FLAG = 'onboardingCompleted';
+// Assume finished until storage says otherwise, so a storage failure stays
+// quiet instead of coaching a user who has been here for months.
+let onboardingDone = true;
+
+async function initOnboardingCoach() {
+  try {
+    const stored = await chrome.storage.local.get([ONBOARDING_FLAG]);
+    onboardingDone = !!(stored && stored[ONBOARDING_FLAG]);
+  } catch (_) {
+    onboardingDone = true;
+  }
+  const dismiss = document.getElementById('onbCoachDismiss');
+  // onclick, not addEventListener — a re-init must not stack handlers.
+  if (dismiss) dismiss.onclick = () => { finishOnboarding(); };
+  const action = document.getElementById('onbCoachAction');
+  if (action) action.onclick = () => { chrome.runtime.openOptionsPage(); };
+  refreshOnboardingCoach();
+}
+
+async function finishOnboarding() {
+  onboardingDone = true;
+  const el = document.getElementById('onbCoach');
+  if (el) el.hidden = true;
+  try { await chrome.storage.local.set({ [ONBOARDING_FLAG]: true }); } catch (_) { /* ignore */ }
+}
+
+function refreshOnboardingCoach() {
+  const el = document.getElementById('onbCoach');
+  if (!el) return;
+  if (onboardingDone) { el.hidden = true; return; }
+
+  // A job on record means the user already completed the round trip.
+  if (jobs.length > 0) { finishOnboarding(); return; }
+
+  const chip = document.getElementById('connectionStatus');
+  const connected = !!chip && chip.classList.contains('connected');
+  let key = 'onboarding.coach.step3';
+  let showAction = false;
+  if (!connected) {
+    key = 'onboarding.coach.step1';
+    showAction = true;
+  } else if (detectedUrls.length === 0) {
+    key = 'onboarding.coach.step2';
+  }
+
+  const textEl = document.getElementById('onbCoachText');
+  if (textEl) textEl.textContent = t(key);
+  const actionEl = document.getElementById('onbCoachAction');
+  if (actionEl) {
+    actionEl.textContent = t('onboarding.coach.step1.action');
+    actionEl.hidden = !showAction;
+  }
+  const dismiss = document.getElementById('onbCoachDismiss');
+  if (dismiss) dismiss.title = t('onboarding.coach.dismiss');
+  el.hidden = false;
+}
+
 // ---------- Init ----------
 document.addEventListener('DOMContentLoaded', async () => {
   await loadSettingsFromStorage();
@@ -354,6 +416,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   setupEventListeners();
   initUpdateBanner();
+  initOnboardingCoach();
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message && message.action === 'detectedUrlsUpdated') {
@@ -836,6 +899,7 @@ function setConnectionState(state, label, tooltip) {
   el.classList.add(state);
   el.title = tooltip || '';
   txt.textContent = label;
+  refreshOnboardingCoach();
 }
 
 async function checkConnection() {
@@ -1091,6 +1155,7 @@ function renderDetectedUrls(opts) {
   opts = opts || {};
   const listElement = document.getElementById('detectedUrlsList');
   if (!listElement) return;
+  refreshOnboardingCoach();
 
   const total = detectedUrls.length;
   const isMany = total > MANY_THRESHOLD;
@@ -1725,6 +1790,7 @@ async function loadRecentJobs() {
 function renderJobs() {
   const listElement = document.getElementById('recentJobsList');
   if (!listElement) return;
+  refreshOnboardingCoach();
 
   // Apply sort mode (time keeps NAS order; active/failed groups by status rank).
   const sortedJobs = sortJobs(jobs, jobSort);
