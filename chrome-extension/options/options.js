@@ -106,17 +106,35 @@ let onboardingDone = false;
 // step 2 kept claiming "done" for a config that had never been reached.
 let onbPingOkFor = null;
 
-function onbCredentialFingerprint() {
-  const endpoint = ($('nasEndpoint') && $('nasEndpoint').value || '').trim();
-  const apiKey = ($('apiKey') && $('apiKey').value || '').trim();
+// Fingerprint of the SAVED credentials, which is what both steps are judged
+// against. Judging step 2 on the live input fields let the two steps describe
+// different configurations: save an invalid endpoint, type a valid one, press
+// Test without saving, and both ticked green while the side panel went on
+// dialling the invalid one it had actually been given.
+function onbSavedFingerprint() {
+  const endpoint = (savedSnapshot.nasEndpoint || '').trim();
+  const apiKey = (savedSnapshot.apiKey || '').trim();
   if (!endpoint || !apiKey) return null;
   // Array form rather than a hand-rolled separator: no character has to be
   // assumed absent from a URL or a token.
   return JSON.stringify([endpoint, apiKey]);
 }
 
+// Pure so the decision is testable without a DOM, in the spirit of the
+// *Core.js files. onbPingOkFor identifies the exact credentials that passed,
+// so a tick requires those to also be the saved ones.
+function onboardingStepStates(savedFingerprint, pingOkFor) {
+  const endpointSet = savedFingerprint !== null;
+  const pingOk = endpointSet && pingOkFor === savedFingerprint;
+  return {
+    step1: endpointSet ? 'done' : 'todo',
+    step2: pingOk ? 'done' : 'todo',
+    badgeHidden: endpointSet && pingOk,
+  };
+}
+
 function refreshOnboardingStatus() {
-  const endpointSet = !!(savedSnapshot.nasEndpoint && savedSnapshot.apiKey);
+  const states = onboardingStepStates(onbSavedFingerprint(), onbPingOkFor);
   const mark = (n, state) => {
     const el = $('onbStatus' + n);
     if (!el) return;
@@ -127,16 +145,14 @@ function refreshOnboardingStatus() {
       : t('onboarding.status.manual');
     el.textContent = '# ' + label;
   };
-  const fingerprint = onbCredentialFingerprint();
-  const pingOk = !!fingerprint && onbPingOkFor === fingerprint;
-  mark(1, endpointSet ? 'done' : 'todo');
-  mark(2, pingOk ? 'done' : 'todo');
+  mark(1, states.step1);
+  mark(2, states.step2);
   mark(3, 'manual');
   mark(4, 'manual');
 
   // Sidebar badge: only while onboarding is unfinished and something is left.
   const badge = $('onbNavTodo');
-  if (badge) badge.hidden = onboardingDone || (endpointSet && pingOk);
+  if (badge) badge.hidden = onboardingDone || states.badgeHidden;
 
   const doneBtn = $('onbDoneBtn');
   if (doneBtn) doneBtn.disabled = onboardingDone;
@@ -564,6 +580,7 @@ async function switchActiveProfile(id) {
   $('nasEndpoint').value = p.endpoint || '';
   $('apiKey').value      = p.apiKey   || '';
   savedSnapshot = { nasEndpoint: p.endpoint || '', apiKey: p.apiKey || '' };
+  refreshOnboardingStatus();
   await chrome.storage.sync.set({
     nasEndpoint:     p.endpoint || '',
     apiKey:          p.apiKey   || '',
@@ -661,6 +678,7 @@ async function saveSettings() {
 
   $('nasEndpoint').value = cleanEndpoint;
   savedSnapshot = { nasEndpoint: cleanEndpoint, apiKey };
+  refreshOnboardingStatus();
   refreshDirtyIndicator();
   showStatus(t('options.status.saved'), 'success');
 
@@ -756,7 +774,7 @@ async function testConnection() {
       }
       if (version) setText('serverVersion', `"${version}"`);
       showStatus(t('options.status.connectionOk'), 'success');
-      if (testedFingerprint === onbCredentialFingerprint()) onbPingOkFor = testedFingerprint;
+      onbPingOkFor = testedFingerprint;
       refreshOnboardingStatus();
 
       // Sidebar host hint
@@ -960,10 +978,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Wire up connection inputs
   $('nasEndpoint').addEventListener('input', refreshDirtyIndicator);
   $('apiKey').addEventListener('input', refreshDirtyIndicator);
-  // Step 2 is keyed on the current field values, so it has to re-render when
-  // they change — otherwise the tick lingers until something else repaints.
-  $('nasEndpoint').addEventListener('input', refreshOnboardingStatus);
-  $('apiKey').addEventListener('input', refreshOnboardingStatus);
 
   // Wire up inline buttons
   $('testBtn').addEventListener('click', testConnection);
