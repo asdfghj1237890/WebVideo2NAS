@@ -105,6 +105,11 @@ let onboardingDone = false;
 // boolean stayed true after the user edited or saved different credentials, so
 // step 2 kept claiming "done" for a config that had never been reached.
 let onbPingOkFor = null;
+// Recorded by the side panel — see SIDE_PANEL_OPENED_FLAG / FIRST_SEND_FLAG
+// there. Steps 3 and 4 used to be hardcoded as untrackable, which made them
+// permanently unfinishable on a checklist that invites completion.
+let onbSidePanelOpened = false;
+let onbFirstSendDone = false;
 
 // Bounds headers *and* body under one controller. fetch() resolves as soon as
 // the response head arrives, so a bound that stops there leaves .json()
@@ -169,20 +174,20 @@ function refreshOnboardingStatus() {
     const el = $('onbStatus' + n);
     if (!el) return;
     el.classList.remove('todo', 'done');
-    if (state !== 'manual') el.classList.add(state);
-    const label = state === 'done' ? t('onboarding.status.done')
-      : state === 'todo' ? t('onboarding.status.todo')
-      : t('onboarding.status.manual');
-    el.textContent = '# ' + label;
+    el.classList.add(state);
+    el.textContent = '# ' + t('onboarding.status.' + state);
   };
   mark(1, states.step1);
   mark(2, states.step2);
-  mark(3, 'manual');
-  mark(4, 'manual');
+  mark(3, onbSidePanelOpened ? 'done' : 'todo');
+  mark(4, onbFirstSendDone ? 'done' : 'todo');
 
   // Sidebar badge: only while onboarding is unfinished and something is left.
   const badge = $('onbNavTodo');
-  if (badge) badge.hidden = onboardingDone || states.badgeHidden;
+  if (badge) {
+    const allDone = states.badgeHidden && onbSidePanelOpened && onbFirstSendDone;
+    badge.hidden = onboardingDone || allDone;
+  }
 
   const doneBtn = $('onbDoneBtn');
   if (doneBtn) doneBtn.disabled = onboardingDone;
@@ -192,8 +197,23 @@ function refreshOnboardingStatus() {
 // user finishes onboarding from the panel, this page must stop showing the
 // checklist as outstanding while it sits open in another tab.
 function applyOnboardingFlagChange(areaName, changes) {
-  if (areaName !== 'local' || !changes || !changes.onboardingCompleted) return false;
-  onboardingDone = !!changes.onboardingCompleted.newValue;
+  if (areaName !== 'local' || !changes) return false;
+  let touched = false;
+  if (changes.onboardingCompleted) {
+    onboardingDone = !!changes.onboardingCompleted.newValue;
+    touched = true;
+  }
+  // Steps 3 and 4 land here live, so the checklist ticks while the user is
+  // looking at the panel rather than only on the next options page load.
+  if (changes.onboardingSidePanelOpened) {
+    onbSidePanelOpened = !!changes.onboardingSidePanelOpened.newValue;
+    touched = true;
+  }
+  if (changes.onboardingFirstSendDone) {
+    onbFirstSendDone = !!changes.onboardingFirstSendDone.newValue;
+    touched = true;
+  }
+  if (!touched) return false;
   refreshOnboardingStatus();
   return true;
 }
@@ -1124,8 +1144,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // already called refreshOnboardingStatus(), but that ran before
   // savedSnapshot was populated, so step 1 needs a second look here.
   try {
-    const stored = await chrome.storage.local.get([ONBOARDING_FLAG]);
+    const stored = await chrome.storage.local.get([
+      ONBOARDING_FLAG, 'onboardingSidePanelOpened', 'onboardingFirstSendDone',
+    ]);
     onboardingDone = !!(stored && stored[ONBOARDING_FLAG]);
+    onbSidePanelOpened = !!(stored && stored.onboardingSidePanelOpened);
+    onbFirstSendDone = !!(stored && stored.onboardingFirstSendDone);
   } catch (_) {
     // Storage unreadable — treat onboarding as done rather than nagging.
     onboardingDone = true;

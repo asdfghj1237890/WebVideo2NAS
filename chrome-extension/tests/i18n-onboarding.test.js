@@ -43,7 +43,6 @@ const REQUIRED_KEYS = [
   'onboarding.step4.body',
   'onboarding.status.todo',
   'onboarding.status.done',
-  'onboarding.status.manual',
   'onboarding.done',
   'onboarding.doneHint',
   'onboarding.doneToast',

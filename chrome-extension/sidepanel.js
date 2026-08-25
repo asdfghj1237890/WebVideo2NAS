@@ -382,6 +382,17 @@ async function showUpdateBannerFor(status) {
 // one onboarding, three surfaces. Every step is read off state that is
 // already rendered, so the strip keeps no bookkeeping of its own.
 const ONBOARDING_FLAG = 'onboardingCompleted';
+// Steps 3 and 4 of the options checklist happen here, not there. They were
+// labelled "tracked in the side panel" while nothing was actually tracked, so
+// they could never leave that state — a checklist with two steps permanently
+// unfinishable. These record them.
+//
+// Separate from ONBOARDING_FLAG on purpose: that one conflates "the user
+// dismissed onboarding" with "the user finished it", which is fine for
+// deciding whether to show the strip and useless for saying whether a step
+// was done.
+const SIDE_PANEL_OPENED_FLAG = 'onboardingSidePanelOpened';
+const FIRST_SEND_FLAG = 'onboardingFirstSendDone';
 // Assume finished until storage says otherwise, so a storage failure stays
 // quiet instead of coaching a user who has been here for months.
 let onboardingDone = true;
@@ -393,9 +404,18 @@ async function initOnboardingCoach() {
   } catch (_) {
     onboardingDone = true;
   }
+  // Opening the panel is step 3. Written once — a repeat write on every open
+  // would be noise, and storage.onChanged fires for it.
+  try {
+    const seen = await chrome.storage.local.get([SIDE_PANEL_OPENED_FLAG]);
+    if (!(seen && seen[SIDE_PANEL_OPENED_FLAG])) {
+      await chrome.storage.local.set({ [SIDE_PANEL_OPENED_FLAG]: true });
+    }
+  } catch (_) { /* the strip still works without it */ }
+
   const dismiss = document.getElementById('onbCoachDismiss');
   // onclick, not addEventListener — a re-init must not stack handlers.
-  if (dismiss) dismiss.onclick = () => { finishOnboarding(); };
+  if (dismiss) dismiss.onclick = () => { finishOnboarding({ completed: false }); };
   const action = document.getElementById('onbCoachAction');
   if (action) action.onclick = () => { chrome.runtime.openOptionsPage(); };
   refreshOnboardingCoach();
@@ -413,11 +433,15 @@ function applyOnboardingFlagChange(areaName, changes) {
   return true;
 }
 
-async function finishOnboarding() {
+// completed:true means the user actually sent something; false means they
+// dismissed the strip. Both hide it, only one is evidence that step 4 happened.
+async function finishOnboarding({ completed = false } = {}) {
   onboardingDone = true;
   const el = document.getElementById('onbCoach');
   if (el) el.hidden = true;
-  try { await chrome.storage.local.set({ [ONBOARDING_FLAG]: true }); } catch (_) { /* ignore */ }
+  const patch = { [ONBOARDING_FLAG]: true };
+  if (completed) patch[FIRST_SEND_FLAG] = true;
+  try { await chrome.storage.local.set(patch); } catch (_) { /* ignore */ }
 }
 
 function refreshOnboardingCoach() {
@@ -428,7 +452,7 @@ function refreshOnboardingCoach() {
   // Completion means this user drove a send from this panel. jobs[] is the
   // NAS's history, which a fresh install pointed at an existing NAS would
   // inherit — that is remote state, not evidence the user did the thing.
-  if (sentUrls.size > 0) { finishOnboarding(); return; }
+  if (sentUrls.size > 0) { finishOnboarding({ completed: true }); return; }
 
   const chip = document.getElementById('connectionStatus');
   const connected = !!chip && chip.classList.contains('connected');
