@@ -169,7 +169,7 @@ describe('cancelJob targets the NAS that served the row', () => {
     });
 
     // A list was served by NAS A...
-    ctx.__eval("jobsSource = { endpoint: 'http://nas-a.example:52052', apiKey: 'ka' };");
+    ctx.__eval("jobsTarget = sidepanelCore.nasTarget('http://nas-a.example:52052', 'ka');");
     // ...and then the user switched profile to NAS B.
     ctx.__eval("settings = { nasEndpoint: 'http://nas-b.example:52052', apiKey: 'kb' };");
 

@@ -42,8 +42,23 @@ const BROWSER_JOB_PHASE = {
 let expandedErrorIds = new Set();
 let activeTabId = null;
 let loadDetectedUrlsSeq = 0;
-let loadRecentJobsSeq = 0;
-let checkConnectionSeq = 0;
+// Every NAS request goes through these. See sidepanelCore for the reasoning:
+// nine review passes found the same defect — a mutable settings object read
+// again when a response landed — in five separate places, and two of the
+// individual patches introduced the next one. The point of the guard is that
+// a response cannot be applied without naming which NAS it was for.
+const requestGuard = sidepanelCore.createRequestGuard();
+
+function nasTargetOf(endpoint, apiKey) {
+  return sidepanelCore.nasTarget(endpoint, apiKey);
+}
+
+// The NAS as currently configured. Read at the moment it is needed and never
+// stored: what must not drift is the target a request was issued against, and
+// that is captured by value at request time.
+function currentNasTarget() {
+  return nasTargetOf(settings.nasEndpoint, settings.apiKey);
+}
 
 // Design state
 let theme = 'dark';
@@ -979,45 +994,41 @@ async function checkConnection() {
   // That is not only a cosmetic chip: the onboarding coach strip decides which
   // step to show by reading this chip's class, so a stale verdict advanced
   // onboarding for a NAS that had never answered.
-  const seq = ++checkConnectionSeq;
-  const endpoint = settings.nasEndpoint;
-  const apiKey = settings.apiKey;
-  // Newest check wins, and only while it still describes what is configured.
-  const isCurrent = () => seq === checkConnectionSeq
-    && endpoint === settings.nasEndpoint
-    && apiKey === settings.apiKey;
+  const target = currentNasTarget();
+  // Bump the generation even without a target, so clearing the configuration
+  // invalidates whatever is still in flight.
+  const isCurrent = requestGuard.begin('connection', target);
 
-  if (!endpoint || !apiKey) {
+  if (!target) {
     setConnectionState('disconnected', t('status.notConfigured'), '');
     return;
   }
 
-  setConnectionState('checking', t('status.checking'), endpoint);
+  setConnectionState('checking', t('status.checking'), target.endpoint);
 
   try {
-    const url = `${endpoint}/api/health`;
-    const response = await fetchWithTimeout(url, {
+    const response = await fetchWithTimeout(`${target.endpoint}/api/health`, {
       method: 'GET',
-      headers: { 'Authorization': `Bearer ${apiKey}` }
+      headers: { 'Authorization': `Bearer ${target.apiKey}` }
     }, 5000);
 
-    if (!isCurrent()) return;
+    if (!isCurrent(currentNasTarget())) return;
 
     if (response.ok) {
-      setConnectionState('connected', shortHost(endpoint),
-        `${endpoint}\n/api/health: OK`);
+      setConnectionState('connected', shortHost(target.endpoint),
+        `${target.endpoint}\n/api/health: OK`);
     } else {
       const reason = connectionReasonFromResponse(response);
       setConnectionState('disconnected',
         reason ? `${t('status.disconnected')} - ${reason}` : t('status.disconnected'),
-        `${endpoint}\n/api/health: ${reason}`);
+        `${target.endpoint}\n/api/health: ${reason}`);
     }
   } catch (error) {
-    if (!isCurrent()) return;
+    if (!isCurrent(currentNasTarget())) return;
     const reason = connectionReasonFromError(error);
     setConnectionState('disconnected',
       reason ? `${t('status.disconnected')} - ${reason}` : t('status.disconnected'),
-      `${endpoint}\n/api/health: ${reason || t('status.disconnected')}`);
+      `${target.endpoint}\n/api/health: ${reason || t('status.disconnected')}`);
   }
 }
 
@@ -1794,8 +1805,8 @@ async function sendToNAS(url, pageUrl) {
 
 // Single-flight guard for the periodic poll.
 //
-// Every loadRecentJobs() call bumps loadRecentJobsSeq, and the response checks
-// that sequence to discard an older overlapping poll. Driving that from an
+// Every loadRecentJobs() call opens a new generation on the 'jobs' stream, and
+// the response checks it to discard an older overlapping poll. Driving that from an
 // unconditional 2s interval turned it against itself: a NAS answering slower
 // than the interval had its in-flight request superseded by the very next
 // tick, so each response arrived to find the sequence moved on and was dropped
@@ -1806,12 +1817,12 @@ async function sendToNAS(url, pageUrl) {
 // A tick that lands while a request is still out is now skipped. Explicit
 // callers (the refresh button, a profile change, post-cancel) keep calling
 // loadRecentJobs directly: those genuinely mean "replace what is in flight",
-// which is what the sequence check is for.
+// which is what opening a new generation is for.
 let recentJobsInFlight = null;
 
-// The NAS that served the most recent jobs list. Only a fallback now — see
-// the per-row source below.
-let jobsSource = { endpoint: '', apiKey: '' };
+// The NAS that served the most recent jobs list. Only a fallback for a row
+// that somehow carries no target of its own.
+let jobsTarget = null;
 
 // Which NAS served a given row.
 //
@@ -1827,13 +1838,13 @@ let jobsSource = { endpoint: '', apiKey: '' };
 // with, so a row always cancels against the NAS that actually owns it —
 // otherwise the DELETE either does nothing or, when both NAS were restored
 // from the same database backup, irreversibly cancels the wrong job.
-function withJobSource(job, source) {
-  if (job && source) job.__nasSource = source;
+function withJobTarget(job, target) {
+  if (job && target) job.__nasTarget = target;
   return job;
 }
 
-function jobSourceOf(job) {
-  return (job && job.__nasSource && job.__nasSource.endpoint) ? job.__nasSource : null;
+function jobTargetOf(job) {
+  return (job && job.__nasTarget && job.__nasTarget.id) ? job.__nasTarget : null;
 }
 
 function pollRecentJobs() {
@@ -1845,32 +1856,27 @@ function pollRecentJobs() {
 }
 
 async function loadRecentJobs() {
-  const requestSeq = ++loadRecentJobsSeq;
+  const target = currentNasTarget();
+  const isCurrent = requestGuard.begin('jobs', target);
   await mergePersistedBrowserTransferSnapshots();
-  if (requestSeq !== loadRecentJobsSeq) return;
-  // Read the target once. settings can be rewritten in place mid-request, and
-  // the rows this produces must stay attributable to where they came from.
-  const endpoint = settings.nasEndpoint;
-  const apiKey = settings.apiKey;
-  if (!endpoint || !apiKey) return;
+  if (!target) return;
+  if (!isCurrent(currentNasTarget())) return;
 
   try {
     const { response, data: apiJobs } = await fetchJsonWithTimeout(
-      `${endpoint}/api/jobs?limit=20`,
-      { headers: { 'Authorization': `Bearer ${apiKey}` } },
+      `${target.endpoint}/api/jobs?limit=20`,
+      { headers: { 'Authorization': `Bearer ${target.apiKey}` } },
       NAS_JOBS_TIMEOUT_MS,
     );
 
     if (response.ok) {
-      // Ignore an older overlapping poll that completed after a newer one.
-      if (requestSeq !== loadRecentJobsSeq) return;
-      // These rows are now the ones on screen; record who served them.
-      const source = { endpoint, apiKey };
-      jobsSource = source;
+      // Newest poll only, and only while it still describes the current NAS.
+      if (!isCurrent(currentNasTarget())) return;
+      jobsTarget = target;
       // A transfer may advance while the API request is in flight. Merge the
       // SW-persisted snapshot again so this poll cannot paint an older value.
       await mergePersistedBrowserTransferSnapshots();
-      if (requestSeq !== loadRecentJobsSeq) return;
+      if (!isCurrent(currentNasTarget())) return;
 
       const previousJobs = jobs;
       const previousById = new Map(previousJobs.map((job) => [String(job.id), job]));
@@ -1902,7 +1908,7 @@ async function loadRecentJobs() {
             live.updatedAt = now;
           }
         }
-        mergedJobs.push(withJobSource(job, source));
+        mergedJobs.push(withJobTarget(job, target));
       }
 
       // The API row can briefly be absent while create/finalize commits, or
@@ -1916,12 +1922,12 @@ async function loadRecentJobs() {
         if (!live) continue;
         if (now - (Number(live.updatedAt) || 0) <= LIVE_BROWSER_PROGRESS_TTL_MS
             && BROWSER_LIVE_RETAIN_STATUSES.has(previousJob.status)) {
-          // Read the source before merging: the merge builds a new object, and
+          // Read the target before merging: the merge builds a new object, and
           // this row is NOT from the response we just received.
-          const retainedSource = jobSourceOf(previousJob) || source;
-          mergedJobs.push(withJobSource(
+          const retainedTarget = jobTargetOf(previousJob) || target;
+          mergedJobs.push(withJobTarget(
             mergeBrowserJobWithLive(previousJob, live, previousJob),
-            retainedSource,
+            retainedTarget,
           ));
         }
       }
@@ -2352,66 +2358,57 @@ function bindJobEvents(el, jobId) {
   }
 }
 
-// Whether a DELETE response leaves the outcome genuinely unknown.
+// ---- Cancel ---------------------------------------------------------------
 //
-// A response is not proof. A reverse proxy can answer 504 after the backend
-// has already committed, and delete_job commits the status flip before it
-// reads job metadata, so a post-commit exception surfaces as 500 on a cancel
-// that did take effect. 408 and 429 are equally uninformative. Only a
-// deterministic 4xx — 401, 403, 404 — actually tells us the cancel did not
-// happen. With DELETE now idempotent, an already-cancelled job answers 200,
-// so a 404 really does mean "no such job".
-function cancelOutcomeIsAmbiguous(status) {
-  return status === 408 || status === 429 || status >= 500;
-}
-
+// Cancel is a three-state machine, not a success/failure pair. The NAS commits
+// the cancel before it answers, so neither a non-2xx response nor a request
+// that never came back proves it did not happen. The transition table lives in
+// sidepanelCore so it can be reasoned about without a DOM; this function is
+// the plumbing around it.
+//
+// Only a confirmed cancellation stops the browser-side upload. Claiming one
+// that did not happen would strand a job the NAS is still running, which is
+// the mirror of the bug that started this: not claiming one that did happen
+// left the upload running against a job already cancelled.
 async function cancelJob(jobId) {
-  // Target the NAS that served *this row*. settings may already point
-  // somewhere else, and the list can hold rows from two different NAS at once
-  // while a retained browser job outlives a profile switch.
+  // The NAS that served *this row*. The list can hold rows from two different
+  // NAS at once, because the merge retains a previous snapshot's active
+  // browser rows across a profile switch.
   const row = jobs.find((job) => String(job.id) === String(jobId));
-  const source = jobSourceOf(row) || jobsSource;
-  const endpoint = source.endpoint || settings.nasEndpoint;
-  const apiKey = source.apiKey || settings.apiKey;
-  if (!endpoint || !apiKey) {
+  const target = jobTargetOf(row) || jobsTarget || currentNasTarget();
+  if (!target) {
     showToast(t('toast.nasNotConfigured'));
     return;
   }
 
+  const { CANCEL_OUTCOME, classifyCancelResponse, classifyCancelFailure,
+          resolveCancelAction } = sidepanelCore;
+
+  let outcome;
+  let detail = null;
   try {
     const { response, data } = await fetchJsonWithTimeout(
-      `${endpoint}/api/jobs/${jobId}`,
-      { method: 'DELETE', headers: { 'Authorization': `Bearer ${apiKey}` } },
+      `${target.endpoint}/api/jobs/${jobId}`,
+      { method: 'DELETE', headers: { 'Authorization': `Bearer ${target.apiKey}` } },
       NAS_JOBS_TIMEOUT_MS,
     );
-
-    if (response.ok) {
-      await applyCancelledJob(jobId);
-      return;
-    }
-    // Same reconciliation as the thrown case: an ambiguous status says nothing
-    // about whether the NAS committed. Reporting failure here recreated the
-    // exact split state this reconcile was added to remove — NAS cancelled,
-    // browser still uploading, because CANCEL_BROWSER_JOB only goes out on a
-    // success path.
-    if (cancelOutcomeIsAmbiguous(response.status)
-        && await jobIsCancelled(jobId, endpoint, apiKey)) {
-      await applyCancelledJob(jobId);
-      return;
-    }
-    showToast(`${(data && data.detail) || t('toast.failedToCancel')}`);
+    outcome = classifyCancelResponse(response.status);
+    detail = data && data.detail;
   } catch (error) {
-    // A timeout or dropped connection says nothing about whether the cancel
-    // landed: the NAS commits it before answering. Reporting failure here left
-    // browser-mode uploads running against a job the NAS had already
-    // cancelled, and a retry used to 404. Ask what actually happened.
     console.error('Error cancelling job:', error);
-    if (await jobIsCancelled(jobId, endpoint, apiKey)) {
-      await applyCancelledJob(jobId);
-      return;
-    }
-    showToast(t('toast.failedToCancel'));
+    outcome = classifyCancelFailure();
   }
+
+  // Ask only when the answer would change what we do.
+  const reconciled = outcome === CANCEL_OUTCOME.UNKNOWN
+    ? await jobIsCancelled(jobId, target)
+    : null;
+
+  if (resolveCancelAction(outcome, reconciled) === 'apply') {
+    await applyCancelledJob(jobId);
+    return;
+  }
+  showToast(`${detail || t('toast.failedToCancel')}`);
 }
 
 // Everything that follows an accepted cancel. Shared by the direct path and
@@ -2435,20 +2432,22 @@ async function applyCancelledJob(jobId) {
   await loadRecentJobs();
 }
 
-// Best-effort reconciliation after a cancel request failed to report back.
-// Any doubt answers false, which keeps the pre-existing "report failure"
-// behaviour rather than claiming a cancel that may not have happened.
-async function jobIsCancelled(jobId, endpoint, apiKey) {
-  if (!endpoint || !apiKey) return false;
+// true / false / null, where null means the question could not be answered.
+// Distinguishing "not cancelled" from "could not ask" matters: only the former
+// is evidence, and resolveCancelAction treats both as "do not claim success"
+// while keeping the distinction available.
+async function jobIsCancelled(jobId, target) {
+  if (!target) return null;
   try {
     const { response, data } = await fetchJsonWithTimeout(
-      `${endpoint}/api/jobs/${jobId}`,
-      { headers: { 'Authorization': `Bearer ${apiKey}` } },
+      `${target.endpoint}/api/jobs/${jobId}`,
+      { headers: { 'Authorization': `Bearer ${target.apiKey}` } },
       NAS_JOBS_TIMEOUT_MS,
     );
-    return !!(response.ok && data && data.status === 'cancelled');
+    if (!response.ok) return null;
+    return !!(data && data.status === 'cancelled');
   } catch (_) {
-    return false;
+    return null;
   }
 }
 

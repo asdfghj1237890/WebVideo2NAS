@@ -71,11 +71,11 @@ describe('a retained row cancels against its own NAS', () => {
     // The list holds a fresh B row and a retained A row — the state the merge
     // produces after switching profile while a browser job is still active.
     ctx.__eval(`jobs = [
-      { id: 'b-job', status: 'downloading', __nasSource: { endpoint: '${NAS_B}', apiKey: 'kb' } },
-      { id: 'a-job', status: 'browser_uploading', __nasSource: { endpoint: '${NAS_A}', apiKey: 'ka' } }
+      { id: 'b-job', status: 'downloading', __nasTarget: sidepanelCore.nasTarget('${NAS_B}', 'kb') },
+      { id: 'a-job', status: 'browser_uploading', __nasTarget: sidepanelCore.nasTarget('${NAS_A}', 'ka') }
     ];`);
     // Snapshot-wide source and live settings both point at B.
-    ctx.__eval(`jobsSource = { endpoint: '${NAS_B}', apiKey: 'kb' };`);
+    ctx.__eval(`jobsTarget = sidepanelCore.nasTarget('${NAS_B}', 'kb');`);
     ctx.__eval(`settings = { nasEndpoint: '${NAS_B}', apiKey: 'kb' };`);
 
     await ctx.cancelJob('a-job');
@@ -89,9 +89,9 @@ describe('a retained row cancels against its own NAS', () => {
   it('sends a fresh row to the NAS that served it', async () => {
     const { ctx, calls } = makeCtx();
     ctx.__eval(`jobs = [
-      { id: 'b-job', status: 'downloading', __nasSource: { endpoint: '${NAS_B}', apiKey: 'kb' } }
+      { id: 'b-job', status: 'downloading', __nasTarget: sidepanelCore.nasTarget('${NAS_B}', 'kb') }
     ];`);
-    ctx.__eval(`jobsSource = { endpoint: '${NAS_B}', apiKey: 'kb' };`);
+    ctx.__eval(`jobsTarget = sidepanelCore.nasTarget('${NAS_B}', 'kb');`);
     ctx.__eval(`settings = { nasEndpoint: '${NAS_B}', apiKey: 'kb' };`);
 
     await ctx.cancelJob('b-job');

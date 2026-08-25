@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { loadScriptIntoContext } from './helpers/load-script.js';
 
-// The jobs poll invalidated its own answers. loadRecentJobs() bumps
-// loadRecentJobsSeq on entry and the response checks it to discard an older
+// The jobs poll invalidated its own answers. loadRecentJobs() opens
+// a new generation on the 'jobs' stream and the response checks it to discard an older
 // overlapping poll — sound on its own, but it was driven by an unconditional
 // 2s setInterval. A NAS answering slower than 2s therefore had every in-flight
 // request superseded by the next tick, so each response arrived to find the
