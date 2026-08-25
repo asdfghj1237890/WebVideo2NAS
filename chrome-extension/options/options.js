@@ -101,7 +101,19 @@ const ONBOARDING_FLAG = 'onboardingCompleted';
 // Steps 1-2 are observable from this page. Steps 3-4 happen in the side
 // panel, so they are labelled as tracked there rather than faked here.
 let onboardingDone = false;
-let onbPingOk = false;
+// Fingerprint of the endpoint + key that last tested OK, or null. A plain
+// boolean stayed true after the user edited or saved different credentials, so
+// step 2 kept claiming "done" for a config that had never been reached.
+let onbPingOkFor = null;
+
+function onbCredentialFingerprint() {
+  const endpoint = ($('nasEndpoint') && $('nasEndpoint').value || '').trim();
+  const apiKey = ($('apiKey') && $('apiKey').value || '').trim();
+  if (!endpoint || !apiKey) return null;
+  // Array form rather than a hand-rolled separator: no character has to be
+  // assumed absent from a URL or a token.
+  return JSON.stringify([endpoint, apiKey]);
+}
 
 function refreshOnboardingStatus() {
   const endpointSet = !!(savedSnapshot.nasEndpoint && savedSnapshot.apiKey);
@@ -115,14 +127,16 @@ function refreshOnboardingStatus() {
       : t('onboarding.status.manual');
     el.textContent = '# ' + label;
   };
+  const fingerprint = onbCredentialFingerprint();
+  const pingOk = !!fingerprint && onbPingOkFor === fingerprint;
   mark(1, endpointSet ? 'done' : 'todo');
-  mark(2, onbPingOk ? 'done' : 'todo');
+  mark(2, pingOk ? 'done' : 'todo');
   mark(3, 'manual');
   mark(4, 'manual');
 
   // Sidebar badge: only while onboarding is unfinished and something is left.
   const badge = $('onbNavTodo');
-  if (badge) badge.hidden = onboardingDone || (endpointSet && onbPingOk);
+  if (badge) badge.hidden = onboardingDone || (endpointSet && pingOk);
 
   const doneBtn = $('onbDoneBtn');
   if (doneBtn) doneBtn.disabled = onboardingDone;
@@ -695,6 +709,10 @@ async function testConnection() {
   $('testBtn').disabled = true;
   setText('testBtnText', t('options.btn.testing') || 'pinging…');
 
+  // Pin the credentials this run is vouching for. If the user edits the
+  // fields while the request is in flight, the result must not be credited to
+  // whatever is on screen when it lands.
+  const testedFingerprint = JSON.stringify([nasEndpoint, apiKey]);
   const t0 = performance.now();
   try {
     // health validates auth; root carries the version (no auth needed). Run in parallel.
@@ -738,7 +756,7 @@ async function testConnection() {
       }
       if (version) setText('serverVersion', `"${version}"`);
       showStatus(t('options.status.connectionOk'), 'success');
-      onbPingOk = true;
+      if (testedFingerprint === onbCredentialFingerprint()) onbPingOkFor = testedFingerprint;
       refreshOnboardingStatus();
 
       // Sidebar host hint
@@ -751,6 +769,8 @@ async function testConnection() {
     }
   } catch (error) {
     console.error('Connection test failed:', error);
+    if (onbPingOkFor === testedFingerprint) onbPingOkFor = null;
+    refreshOnboardingStatus();
     let label = t('options.ping.unreachable') || 'unreachable';
     let toast = t('options.status.connectionFailedPrefix');
     if (String(error.message).includes('Failed to fetch')) {
@@ -940,6 +960,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Wire up connection inputs
   $('nasEndpoint').addEventListener('input', refreshDirtyIndicator);
   $('apiKey').addEventListener('input', refreshDirtyIndicator);
+  // Step 2 is keyed on the current field values, so it has to re-render when
+  // they change — otherwise the tick lingers until something else repaints.
+  $('nasEndpoint').addEventListener('input', refreshOnboardingStatus);
+  $('apiKey').addEventListener('input', refreshOnboardingStatus);
 
   // Wire up inline buttons
   $('testBtn').addEventListener('click', testConnection);

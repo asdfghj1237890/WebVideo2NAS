@@ -672,7 +672,33 @@
 
       'update.banner.text': '新版本 {version} 已发布',
       'update.banner.download': '前往 GitHub 下载',
-      'update.banner.dismiss': '关闭提醒'
+      'update.banner.dismiss': '关闭提醒',
+
+      // Onboarding
+      'onboarding.nav.label': 'getting_started.toml',
+      'onboarding.intro1': '# 第一次使用 — 四个步骤就设置完成。',
+      'onboarding.intro2': '# 这一页会留在侧栏，随时可以回来看。',
+      'onboarding.step1.title': '设置 NAS 地址',
+      'onboarding.step1.body': '打开 connection.toml，填入 endpoint 和 api_key 后保存。',
+      'onboarding.step1.action': '前往 connection.toml',
+      'onboarding.step2.title': '测试连接',
+      'onboarding.step2.body': '在 connection.toml 按 [test]。NAS 有响应时圆点会变绿色。',
+      'onboarding.step2.action': '前往测试连接',
+      'onboarding.step3.title': '打开侧边栏',
+      'onboarding.step3.body': '点 Chrome 工具栏上的 WebVideo2NAS 图标。下载都是从那里操作的。',
+      'onboarding.step4.title': '发送第一部视频',
+      'onboarding.step4.body': '打开视频页面并按播放。检测到的视频会出现在侧边栏，按箭头就能发送到 NAS。',
+      'onboarding.status.todo': '未完成',
+      'onboarding.status.done': '完成',
+      'onboarding.status.manual': '在侧边栏跟踪',
+      'onboarding.done': '知道了 — 不要再显示',
+      'onboarding.doneHint': '# 页面仍留在侧栏，只是不再自动打开',
+      'onboarding.doneToast': '已关闭新手引导',
+      'onboarding.coach.step1': '1/3 · 先设置 NAS 地址',
+      'onboarding.coach.step1.action': '设置',
+      'onboarding.coach.step2': '2/3 · 打开视频页面并按播放',
+      'onboarding.coach.step3': '3/3 · 按箭头把视频发送到 NAS',
+      'onboarding.coach.dismiss': '关闭'
     },
     ja: {
       'status.checking': '確認中…',
@@ -804,7 +830,33 @@
 
       'update.banner.text': '新しいバージョン {version} が公開されました',
       'update.banner.download': 'GitHub で更新',
-      'update.banner.dismiss': '閉じる'
+      'update.banner.dismiss': '閉じる',
+
+      // Onboarding
+      'onboarding.nav.label': 'getting_started.toml',
+      'onboarding.intro1': '# 初回セットアップ — 4 ステップで完了します。',
+      'onboarding.intro2': '# このページはサイドバーに残るので、いつでも戻れます。',
+      'onboarding.step1.title': 'NAS のアドレスを設定',
+      'onboarding.step1.body': 'connection.toml を開き、endpoint と api_key を入力して保存します。',
+      'onboarding.step1.action': 'connection.toml を開く',
+      'onboarding.step2.title': '接続をテスト',
+      'onboarding.step2.body': 'connection.toml で [test] を押します。NAS が応答するとドットが緑になります。',
+      'onboarding.step2.action': 'テストを実行',
+      'onboarding.step3.title': 'サイドパネルを開く',
+      'onboarding.step3.body': 'Chrome ツールバーの WebVideo2NAS アイコンをクリックします。ダウンロードはそこから操作します。',
+      'onboarding.step4.title': '最初の動画を送る',
+      'onboarding.step4.body': '動画ページを開いて再生します。検出された動画がパネルに表示されるので、矢印を押して NAS に送ります。',
+      'onboarding.status.todo': '未完了',
+      'onboarding.status.done': '完了',
+      'onboarding.status.manual': 'サイドパネルで確認',
+      'onboarding.done': '了解 — 今後は表示しない',
+      'onboarding.doneHint': '# ページはサイドバーに残り、自動で開かなくなるだけです',
+      'onboarding.doneToast': 'オンボーディングを閉じました',
+      'onboarding.coach.step1': '1/3 · NAS のアドレスを設定',
+      'onboarding.coach.step1.action': '設定',
+      'onboarding.coach.step2': '2/3 · 動画ページを開いて再生',
+      'onboarding.coach.step3': '3/3 · 矢印を押して NAS に送信',
+      'onboarding.coach.dismiss': '閉じる'
     },
     ko: {
       'status.checking': '확인 중...',
@@ -936,7 +988,33 @@
 
       'update.banner.text': '새 버전 {version} 사용 가능',
       'update.banner.download': 'GitHub에서 업데이트',
-      'update.banner.dismiss': '닫기'
+      'update.banner.dismiss': '닫기',
+
+      // Onboarding
+      'onboarding.nav.label': 'getting_started.toml',
+      'onboarding.intro1': '# 첫 실행 — 네 단계면 설정이 끝납니다.',
+      'onboarding.intro2': '# 이 페이지는 사이드바에 남아 있으니 언제든 다시 볼 수 있습니다.',
+      'onboarding.step1.title': 'NAS 주소 설정',
+      'onboarding.step1.body': 'connection.toml 을 열고 endpoint 와 api_key 를 입력한 뒤 저장하세요.',
+      'onboarding.step1.action': 'connection.toml 열기',
+      'onboarding.step2.title': '연결 테스트',
+      'onboarding.step2.body': 'connection.toml 에서 [test] 를 누르세요. NAS 가 응답하면 점이 초록색으로 바뀝니다.',
+      'onboarding.step2.action': '테스트 실행',
+      'onboarding.step3.title': '사이드 패널 열기',
+      'onboarding.step3.body': 'Chrome 툴바의 WebVideo2NAS 아이콘을 클릭하세요. 다운로드는 거기서 진행합니다.',
+      'onboarding.step4.title': '첫 영상 보내기',
+      'onboarding.step4.body': '영상 페이지를 열고 재생하세요. 감지된 영상이 패널에 나타나면 화살표를 눌러 NAS 로 보냅니다.',
+      'onboarding.status.todo': '미완료',
+      'onboarding.status.done': '완료',
+      'onboarding.status.manual': '사이드 패널에서 확인',
+      'onboarding.done': '확인 — 다시 표시하지 않기',
+      'onboarding.doneHint': '# 페이지는 사이드바에 남고, 자동으로 열리지만 않습니다',
+      'onboarding.doneToast': '온보딩을 닫았습니다',
+      'onboarding.coach.step1': '1/3 · NAS 주소를 설정하세요',
+      'onboarding.coach.step1.action': '설정',
+      'onboarding.coach.step2': '2/3 · 영상 페이지를 열고 재생하세요',
+      'onboarding.coach.step3': '3/3 · 화살표를 눌러 NAS 로 보내세요',
+      'onboarding.coach.dismiss': '닫기'
     },
     fr: {
       'status.checking': 'Vérification…',
@@ -1068,7 +1146,33 @@
 
       'update.banner.text': 'Nouvelle version {version} disponible',
       'update.banner.download': 'Mettre à jour sur GitHub',
-      'update.banner.dismiss': 'Ignorer'
+      'update.banner.dismiss': 'Ignorer',
+
+      // Onboarding
+      'onboarding.nav.label': 'getting_started.toml',
+      'onboarding.intro1': "# Première utilisation — quatre étapes et c'est prêt.",
+      'onboarding.intro2': '# Cette page reste dans la barre latérale, revenez-y quand vous voulez.',
+      'onboarding.step1.title': "Définir l'adresse du NAS",
+      'onboarding.step1.body': 'Ouvrez connection.toml, renseignez endpoint et api_key, puis enregistrez.',
+      'onboarding.step1.action': 'ouvrir connection.toml',
+      'onboarding.step2.title': 'Tester la connexion',
+      'onboarding.step2.body': 'Appuyez sur [test] dans connection.toml. Le point passe au vert dès que le NAS répond.',
+      'onboarding.step2.action': 'lancer le test',
+      'onboarding.step3.title': 'Ouvrir le panneau latéral',
+      'onboarding.step3.body': "Cliquez sur l'icône WebVideo2NAS dans la barre d'outils Chrome. Les téléchargements se pilotent depuis là.",
+      'onboarding.step4.title': 'Envoyer votre première vidéo',
+      'onboarding.step4.body': 'Ouvrez une page vidéo et lancez la lecture. Les vidéos détectées apparaissent dans le panneau — appuyez sur la flèche pour en envoyer une vers le NAS.',
+      'onboarding.status.todo': 'à faire',
+      'onboarding.status.done': 'terminé',
+      'onboarding.status.manual': 'suivi dans le panneau latéral',
+      'onboarding.done': "J'ai compris — ne plus afficher",
+      'onboarding.doneHint': "# la page reste dans la barre latérale, elle ne s'ouvre simplement plus au démarrage",
+      'onboarding.doneToast': 'Guide de démarrage masqué',
+      'onboarding.coach.step1': "1/3 · définissez l'adresse de votre NAS",
+      'onboarding.coach.step1.action': 'paramètres',
+      'onboarding.coach.step2': '2/3 · ouvrez une page vidéo et lancez la lecture',
+      'onboarding.coach.step3': '3/3 · appuyez sur la flèche pour envoyer vers le NAS',
+      'onboarding.coach.dismiss': 'Masquer'
     },
     es: {
       'status.checking': 'Comprobando…',
@@ -1200,7 +1304,33 @@
 
       'update.banner.text': 'Nueva versión {version} disponible',
       'update.banner.download': 'Actualizar en GitHub',
-      'update.banner.dismiss': 'Descartar'
+      'update.banner.dismiss': 'Descartar',
+
+      // Onboarding
+      'onboarding.nav.label': 'getting_started.toml',
+      'onboarding.intro1': '# Primera vez — cuatro pasos y listo.',
+      'onboarding.intro2': '# Esta página se queda en la barra lateral, vuelve cuando quieras.',
+      'onboarding.step1.title': 'Configurar la dirección del NAS',
+      'onboarding.step1.body': 'Abre connection.toml, rellena endpoint y api_key, y guarda.',
+      'onboarding.step1.action': 'abrir connection.toml',
+      'onboarding.step2.title': 'Probar la conexión',
+      'onboarding.step2.body': 'Pulsa [test] en connection.toml. El punto se pone verde cuando el NAS responde.',
+      'onboarding.step2.action': 'ejecutar la prueba',
+      'onboarding.step3.title': 'Abrir el panel lateral',
+      'onboarding.step3.body': 'Haz clic en el icono de WebVideo2NAS en la barra de Chrome. Las descargas se manejan desde ahí.',
+      'onboarding.step4.title': 'Enviar tu primer vídeo',
+      'onboarding.step4.body': 'Abre una página de vídeo y dale a reproducir. Los vídeos detectados aparecen en el panel — pulsa la flecha para enviar uno al NAS.',
+      'onboarding.status.todo': 'pendiente',
+      'onboarding.status.done': 'hecho',
+      'onboarding.status.manual': 'se sigue en el panel lateral',
+      'onboarding.done': 'Entendido — no volver a mostrar',
+      'onboarding.doneHint': '# la página sigue en la barra lateral, solo deja de abrirse al inicio',
+      'onboarding.doneToast': 'Guía inicial ocultada',
+      'onboarding.coach.step1': '1/3 · configura la dirección de tu NAS',
+      'onboarding.coach.step1.action': 'ajustes',
+      'onboarding.coach.step2': '2/3 · abre una página de vídeo y dale a reproducir',
+      'onboarding.coach.step3': '3/3 · pulsa la flecha para enviarlo al NAS',
+      'onboarding.coach.dismiss': 'Ocultar'
     },
     pt: {
       'status.checking': 'Verificando…',
@@ -1332,7 +1462,33 @@
 
       'update.banner.text': 'Nova versão {version} disponível',
       'update.banner.download': 'Atualizar no GitHub',
-      'update.banner.dismiss': 'Dispensar'
+      'update.banner.dismiss': 'Dispensar',
+
+      // Onboarding
+      'onboarding.nav.label': 'getting_started.toml',
+      'onboarding.intro1': '# Primeira utilização — quatro passos e está pronto.',
+      'onboarding.intro2': '# Esta página fica na barra lateral, volte quando quiser.',
+      'onboarding.step1.title': 'Definir o endereço do NAS',
+      'onboarding.step1.body': 'Abra connection.toml, preencha endpoint e api_key e guarde.',
+      'onboarding.step1.action': 'abrir connection.toml',
+      'onboarding.step2.title': 'Testar a ligação',
+      'onboarding.step2.body': 'Carregue em [test] no connection.toml. O ponto fica verde assim que o NAS responder.',
+      'onboarding.step2.action': 'executar o teste',
+      'onboarding.step3.title': 'Abrir o painel lateral',
+      'onboarding.step3.body': 'Clique no ícone do WebVideo2NAS na barra do Chrome. Os downloads são feitos a partir daí.',
+      'onboarding.step4.title': 'Enviar o primeiro vídeo',
+      'onboarding.step4.body': 'Abra uma página de vídeo e carregue em reproduzir. Os vídeos detetados aparecem no painel — carregue na seta para enviar um para o NAS.',
+      'onboarding.status.todo': 'por fazer',
+      'onboarding.status.done': 'concluído',
+      'onboarding.status.manual': 'acompanhado no painel lateral',
+      'onboarding.done': 'Percebi — não mostrar novamente',
+      'onboarding.doneHint': '# a página continua na barra lateral, apenas deixa de abrir ao iniciar',
+      'onboarding.doneToast': 'Guia inicial dispensado',
+      'onboarding.coach.step1': '1/3 · defina o endereço do seu NAS',
+      'onboarding.coach.step1.action': 'definições',
+      'onboarding.coach.step2': '2/3 · abra uma página de vídeo e carregue em reproduzir',
+      'onboarding.coach.step3': '3/3 · carregue na seta para enviar para o NAS',
+      'onboarding.coach.dismiss': 'Dispensar'
     }
   };
 

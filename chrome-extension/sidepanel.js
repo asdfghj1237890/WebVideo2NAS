@@ -375,8 +375,10 @@ function refreshOnboardingCoach() {
   if (!el) return;
   if (onboardingDone) { el.hidden = true; return; }
 
-  // A job on record means the user already completed the round trip.
-  if (jobs.length > 0) { finishOnboarding(); return; }
+  // Completion means this user drove a send from this panel. jobs[] is the
+  // NAS's history, which a fresh install pointed at an existing NAS would
+  // inherit — that is remote state, not evidence the user did the thing.
+  if (sentUrls.size > 0) { finishOnboarding(); return; }
 
   const chip = document.getElementById('connectionStatus');
   const connected = !!chip && chip.classList.contains('connected');
@@ -1520,6 +1522,7 @@ async function flyToNAS(tileEl, url, pageUrl) {
     const result = await sendPromise;
     if (result && result.success) {
       sentUrls.add(url);
+      refreshOnboardingCoach();
     } else {
       sentUrls.delete(url);
       selected.add(url);
@@ -1569,6 +1572,7 @@ async function flyToNAS(tileEl, url, pageUrl) {
   await animationDone;
   if (result && result.success) {
     sentUrls.add(url);
+    refreshOnboardingCoach();
     if (tileEl && tileEl.parentNode) {
       tileEl.classList.remove('sending');
       tileEl.classList.add('sent');

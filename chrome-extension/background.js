@@ -1683,16 +1683,30 @@ chrome.runtime.onInstalled.addListener((details) => {
 const ONBOARDING_FLAG = 'onboardingCompleted';
 
 async function maybeOpenOnboarding(details) {
-  if (!details || details.reason !== 'install') return;
-  let done = false;
+  if (!details) return;
+
+  let stored;
   try {
-    const stored = await chrome.storage.local.get([ONBOARDING_FLAG]);
-    done = !!(stored && stored[ONBOARDING_FLAG]);
+    stored = await chrome.storage.local.get([ONBOARDING_FLAG]);
   } catch (_) {
-    // Storage unavailable — stay quiet rather than reopening the tab blindly.
+    // Storage unavailable — stay quiet rather than acting on a guess.
     return;
   }
-  if (done) return;
+  const recorded = !!stored && Object.prototype.hasOwnProperty.call(stored, ONBOARDING_FLAG);
+
+  if (details.reason !== 'install') {
+    // Upgrading an install that predates onboarding. Write the flag now so the
+    // absence of it never has to be interpreted later: without this, the side
+    // panel reads "no flag" as "first run" and coaches a long-time user, and
+    // whether they see it would depend on whether the NAS happens to return
+    // job history — remote state deciding a local first-run question.
+    if (!recorded) {
+      try { await chrome.storage.local.set({ [ONBOARDING_FLAG]: true }); } catch (_) { /* ignore */ }
+    }
+    return;
+  }
+
+  if (recorded && stored[ONBOARDING_FLAG]) return;
   chrome.runtime.openOptionsPage();
 }
 
