@@ -106,6 +106,82 @@ describe('cancelJob when the DELETE response never arrives', () => {
   });
 });
 
+describe('cancelJob reconciles ambiguous HTTP failures too', () => {
+  // A response is not proof. A proxy can answer 504 after the backend
+  // committed, and delete_job commits the status flip before it reads job
+  // metadata, so a post-commit exception surfaces as 500 on a cancel that did
+  // take effect. Only reconciling on a thrown request left exactly the split
+  // state — NAS cancelled, browser still uploading — that the reconcile was
+  // added to remove.
+  for (const status of [408, 429, 500, 502, 503, 504]) {
+    it(`treats ${status} as unknown and checks the real state`, async () => {
+      const { ctx, offscreenMessages } = makeCtx({
+        deleteImpl: jsonResponse(status, { detail: 'gateway timeout' }),
+        statusImpl: jsonResponse(200, { status: 'cancelled' }),
+      });
+
+      await ctx.cancelJob('job-1');
+
+      expect(offscreenMessages.length).toBe(1);
+    });
+  }
+
+  for (const status of [400, 401, 403, 404]) {
+    it(`takes ${status} at face value without reconciling`, async () => {
+      const { ctx, offscreenMessages } = makeCtx({
+        deleteImpl: jsonResponse(status, { detail: 'nope' }),
+        // Would say cancelled if asked — the point is that it is not asked.
+        statusImpl: jsonResponse(200, { status: 'cancelled' }),
+      });
+
+      await ctx.cancelJob('job-1');
+
+      expect(offscreenMessages).toEqual([]);
+    });
+  }
+
+  it('still reports failure when an ambiguous status did not cancel anything', async () => {
+    const { ctx, offscreenMessages, toasts } = makeCtx({
+      deleteImpl: jsonResponse(503, { detail: 'unavailable' }),
+      statusImpl: jsonResponse(200, { status: 'downloading' }),
+    });
+
+    await ctx.cancelJob('job-1');
+
+    expect(offscreenMessages).toEqual([]);
+    expect(toasts.length).toBe(1);
+  });
+});
+
+describe('cancelJob targets the NAS that served the row', () => {
+  it('uses the snapshot source, not the profile switched to afterwards', async () => {
+    // The rows stay on screen and clickable after a profile switch, until a
+    // new list loads — indefinitely if the new NAS is unreachable. Sending
+    // NAS A's job id to NAS B either cancels nothing or, when both were
+    // restored from the same backup, cancels the wrong job irreversibly.
+    const urls = [];
+    const { ctx, offscreenMessages } = makeCtx({
+      deleteImpl: async (url) => {
+        urls.push(url);
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+      statusImpl: async (url) => { urls.push(url); return { ok: true, status: 200, json: async () => ({}) }; },
+    });
+
+    // A list was served by NAS A...
+    ctx.__eval("jobsSource = { endpoint: 'http://nas-a.example:52052', apiKey: 'ka' };");
+    // ...and then the user switched profile to NAS B.
+    ctx.__eval("settings = { nasEndpoint: 'http://nas-b.example:52052', apiKey: 'kb' };");
+
+    await ctx.cancelJob('job-1');
+
+    expect(urls.length).toBe(1);
+    expect(urls[0]).toContain('nas-a.example');
+    expect(urls[0]).not.toContain('nas-b.example');
+    expect(offscreenMessages.length).toBe(1);
+  });
+});
+
 describe('cancelJob pins the NAS it is talking to', () => {
   it('reconciles against the original NAS after a profile switch mid-cancel', async () => {
     // settings is rewritten in place by storage.onChanged and by switching

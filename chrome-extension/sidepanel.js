@@ -1786,6 +1786,19 @@ async function sendToNAS(url, pageUrl) {
 // which is what the sequence check is for.
 let recentJobsInFlight = null;
 
+// The NAS that produced the rows currently on screen.
+//
+// Pinning settings at click time is too late: storage.onChanged rewrites
+// settings the moment a profile changes, while the old rows stay rendered and
+// clickable until a new list loads — indefinitely, if the new NAS is
+// unreachable or answers 401. Cancelling one of those rows then sent NAS A's
+// job id to NAS B, which either cancels nothing or, if both NAS were restored
+// from the same database backup, irreversibly cancels the wrong job.
+//
+// Bind to the source of the snapshot instead, so a row always acts on the NAS
+// it came from.
+let jobsSource = { endpoint: '', apiKey: '' };
+
 function pollRecentJobs() {
   if (recentJobsInFlight) return recentJobsInFlight;
   recentJobsInFlight = loadRecentJobs()
@@ -1798,18 +1811,24 @@ async function loadRecentJobs() {
   const requestSeq = ++loadRecentJobsSeq;
   await mergePersistedBrowserTransferSnapshots();
   if (requestSeq !== loadRecentJobsSeq) return;
-  if (!settings.nasEndpoint || !settings.apiKey) return;
+  // Read the target once. settings can be rewritten in place mid-request, and
+  // the rows this produces must stay attributable to where they came from.
+  const endpoint = settings.nasEndpoint;
+  const apiKey = settings.apiKey;
+  if (!endpoint || !apiKey) return;
 
   try {
     const { response, data: apiJobs } = await fetchJsonWithTimeout(
-      `${settings.nasEndpoint}/api/jobs?limit=20`,
-      { headers: { 'Authorization': `Bearer ${settings.apiKey}` } },
+      `${endpoint}/api/jobs?limit=20`,
+      { headers: { 'Authorization': `Bearer ${apiKey}` } },
       NAS_JOBS_TIMEOUT_MS,
     );
 
     if (response.ok) {
       // Ignore an older overlapping poll that completed after a newer one.
       if (requestSeq !== loadRecentJobsSeq) return;
+      // These rows are now the ones on screen; record who served them.
+      jobsSource = { endpoint, apiKey };
       // A transfer may advance while the API request is in flight. Merge the
       // SW-persisted snapshot again so this poll cannot paint an older value.
       await mergePersistedBrowserTransferSnapshots();
@@ -2289,13 +2308,25 @@ function bindJobEvents(el, jobId) {
   }
 }
 
+// Whether a DELETE response leaves the outcome genuinely unknown.
+//
+// A response is not proof. A reverse proxy can answer 504 after the backend
+// has already committed, and delete_job commits the status flip before it
+// reads job metadata, so a post-commit exception surfaces as 500 on a cancel
+// that did take effect. 408 and 429 are equally uninformative. Only a
+// deterministic 4xx — 401, 403, 404 — actually tells us the cancel did not
+// happen. With DELETE now idempotent, an already-cancelled job answers 200,
+// so a 404 really does mean "no such job".
+function cancelOutcomeIsAmbiguous(status) {
+  return status === 408 || status === 429 || status >= 500;
+}
+
 async function cancelJob(jobId) {
-  // Pin the target for the whole operation. The settings object is rewritten
-  // in place by storage.onChanged and by switching profile, so the reconcile
-  // below could otherwise ask NAS B whether a cancel sent to NAS A took
-  // effect — and get a confident, wrong answer.
-  const endpoint = settings.nasEndpoint;
-  const apiKey = settings.apiKey;
+  // Target the NAS that served the row, not whatever is configured now. See
+  // jobsSource — settings may already point somewhere else while this row is
+  // still on screen.
+  const endpoint = jobsSource.endpoint || settings.nasEndpoint;
+  const apiKey = jobsSource.apiKey || settings.apiKey;
   if (!endpoint || !apiKey) {
     showToast(t('toast.nasNotConfigured'));
     return;
@@ -2309,6 +2340,16 @@ async function cancelJob(jobId) {
     );
 
     if (response.ok) {
+      await applyCancelledJob(jobId);
+      return;
+    }
+    // Same reconciliation as the thrown case: an ambiguous status says nothing
+    // about whether the NAS committed. Reporting failure here recreated the
+    // exact split state this reconcile was added to remove — NAS cancelled,
+    // browser still uploading, because CANCEL_BROWSER_JOB only goes out on a
+    // success path.
+    if (cancelOutcomeIsAmbiguous(response.status)
+        && await jobIsCancelled(jobId, endpoint, apiKey)) {
       await applyCancelledJob(jobId);
       return;
     }
