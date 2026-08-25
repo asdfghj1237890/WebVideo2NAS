@@ -43,6 +43,7 @@ let expandedErrorIds = new Set();
 let activeTabId = null;
 let loadDetectedUrlsSeq = 0;
 let loadRecentJobsSeq = 0;
+let checkConnectionSeq = 0;
 
 // Design state
 let theme = 'dark';
@@ -967,34 +968,56 @@ function setConnectionState(state, label, tooltip) {
 async function checkConnection() {
   await loadSettingsFromStorage();
 
-  if (!settings.nasEndpoint || !settings.apiKey) {
+  // Generation + target guard.
+  //
+  // Two checks can be in flight at once — the 2s job poll, the refresh button
+  // and storage.onChanged all trigger one — and every line below used to read
+  // the mutable global settings at *response* time. An A check finishing after
+  // a switch to B therefore painted A's verdict onto B, and the reverse order
+  // marked an already-verified B as unreachable.
+  //
+  // That is not only a cosmetic chip: the onboarding coach strip decides which
+  // step to show by reading this chip's class, so a stale verdict advanced
+  // onboarding for a NAS that had never answered.
+  const seq = ++checkConnectionSeq;
+  const endpoint = settings.nasEndpoint;
+  const apiKey = settings.apiKey;
+  // Newest check wins, and only while it still describes what is configured.
+  const isCurrent = () => seq === checkConnectionSeq
+    && endpoint === settings.nasEndpoint
+    && apiKey === settings.apiKey;
+
+  if (!endpoint || !apiKey) {
     setConnectionState('disconnected', t('status.notConfigured'), '');
     return;
   }
 
-  setConnectionState('checking', t('status.checking'), settings.nasEndpoint);
+  setConnectionState('checking', t('status.checking'), endpoint);
 
   try {
-    const url = `${settings.nasEndpoint}/api/health`;
+    const url = `${endpoint}/api/health`;
     const response = await fetchWithTimeout(url, {
       method: 'GET',
-      headers: { 'Authorization': `Bearer ${settings.apiKey}` }
+      headers: { 'Authorization': `Bearer ${apiKey}` }
     }, 5000);
 
+    if (!isCurrent()) return;
+
     if (response.ok) {
-      setConnectionState('connected', shortHost(settings.nasEndpoint),
-        `${settings.nasEndpoint}\n/api/health: OK`);
+      setConnectionState('connected', shortHost(endpoint),
+        `${endpoint}\n/api/health: OK`);
     } else {
       const reason = connectionReasonFromResponse(response);
       setConnectionState('disconnected',
         reason ? `${t('status.disconnected')} - ${reason}` : t('status.disconnected'),
-        `${settings.nasEndpoint}\n/api/health: ${reason}`);
+        `${endpoint}\n/api/health: ${reason}`);
     }
   } catch (error) {
+    if (!isCurrent()) return;
     const reason = connectionReasonFromError(error);
     setConnectionState('disconnected',
       reason ? `${t('status.disconnected')} - ${reason}` : t('status.disconnected'),
-      `${settings.nasEndpoint}\n/api/health: ${reason || t('status.disconnected')}`);
+      `${endpoint}\n/api/health: ${reason || t('status.disconnected')}`);
   }
 }
 
@@ -1786,18 +1809,32 @@ async function sendToNAS(url, pageUrl) {
 // which is what the sequence check is for.
 let recentJobsInFlight = null;
 
-// The NAS that produced the rows currently on screen.
-//
-// Pinning settings at click time is too late: storage.onChanged rewrites
-// settings the moment a profile changes, while the old rows stay rendered and
-// clickable until a new list loads — indefinitely, if the new NAS is
-// unreachable or answers 401. Cancelling one of those rows then sent NAS A's
-// job id to NAS B, which either cancels nothing or, if both NAS were restored
-// from the same database backup, irreversibly cancels the wrong job.
-//
-// Bind to the source of the snapshot instead, so a row always acts on the NAS
-// it came from.
+// The NAS that served the most recent jobs list. Only a fallback now — see
+// the per-row source below.
 let jobsSource = { endpoint: '', apiKey: '' };
+
+// Which NAS served a given row.
+//
+// Pinning settings at click time was too late: storage.onChanged rewrites
+// settings the moment a profile changes, while old rows stay rendered and
+// clickable until a new list loads. But a single snapshot-wide source is not
+// enough either, because the merge below deliberately retains a previous
+// snapshot's active browser rows for up to the live-progress TTL. After
+// switching A to B, the list holds B's rows *and* retained A rows, and one
+// shared source silently re-attributed the retained ones to B.
+//
+// Stamp each row instead. Retained rows keep the source they were fetched
+// with, so a row always cancels against the NAS that actually owns it —
+// otherwise the DELETE either does nothing or, when both NAS were restored
+// from the same database backup, irreversibly cancels the wrong job.
+function withJobSource(job, source) {
+  if (job && source) job.__nasSource = source;
+  return job;
+}
+
+function jobSourceOf(job) {
+  return (job && job.__nasSource && job.__nasSource.endpoint) ? job.__nasSource : null;
+}
 
 function pollRecentJobs() {
   if (recentJobsInFlight) return recentJobsInFlight;
@@ -1828,7 +1865,8 @@ async function loadRecentJobs() {
       // Ignore an older overlapping poll that completed after a newer one.
       if (requestSeq !== loadRecentJobsSeq) return;
       // These rows are now the ones on screen; record who served them.
-      jobsSource = { endpoint, apiKey };
+      const source = { endpoint, apiKey };
+      jobsSource = source;
       // A transfer may advance while the API request is in flight. Merge the
       // SW-persisted snapshot again so this poll cannot paint an older value.
       await mergePersistedBrowserTransferSnapshots();
@@ -1864,7 +1902,7 @@ async function loadRecentJobs() {
             live.updatedAt = now;
           }
         }
-        mergedJobs.push(job);
+        mergedJobs.push(withJobSource(job, source));
       }
 
       // The API row can briefly be absent while create/finalize commits, or
@@ -1878,7 +1916,13 @@ async function loadRecentJobs() {
         if (!live) continue;
         if (now - (Number(live.updatedAt) || 0) <= LIVE_BROWSER_PROGRESS_TTL_MS
             && BROWSER_LIVE_RETAIN_STATUSES.has(previousJob.status)) {
-          mergedJobs.push(mergeBrowserJobWithLive(previousJob, live, previousJob));
+          // Read the source before merging: the merge builds a new object, and
+          // this row is NOT from the response we just received.
+          const retainedSource = jobSourceOf(previousJob) || source;
+          mergedJobs.push(withJobSource(
+            mergeBrowserJobWithLive(previousJob, live, previousJob),
+            retainedSource,
+          ));
         }
       }
       for (const [id, live] of Array.from(liveBrowserProgress.entries())) {
@@ -2322,11 +2366,13 @@ function cancelOutcomeIsAmbiguous(status) {
 }
 
 async function cancelJob(jobId) {
-  // Target the NAS that served the row, not whatever is configured now. See
-  // jobsSource — settings may already point somewhere else while this row is
-  // still on screen.
-  const endpoint = jobsSource.endpoint || settings.nasEndpoint;
-  const apiKey = jobsSource.apiKey || settings.apiKey;
+  // Target the NAS that served *this row*. settings may already point
+  // somewhere else, and the list can hold rows from two different NAS at once
+  // while a retained browser job outlives a profile switch.
+  const row = jobs.find((job) => String(job.id) === String(jobId));
+  const source = jobSourceOf(row) || jobsSource;
+  const endpoint = source.endpoint || settings.nasEndpoint;
+  const apiKey = source.apiKey || settings.apiKey;
   if (!endpoint || !apiKey) {
     showToast(t('toast.nasNotConfigured'));
     return;
