@@ -25,13 +25,47 @@ _VALID_INIT_LABELS = ("video", "audio")
 
 
 class BrowserJobPaths:
-    """Filesystem path service for browser-side staging jobs."""
+    """Filesystem path service for browser-side staging jobs.
+
+    SECURITY — read before relaxing anything in this class.
+
+    Sixteen CodeQL py/path-injection alerts against main.py's staging sinks
+    were dismissed as false positives on the strength of the constraints
+    below, after tracing every sink back to segment_path()/init_segment_path().
+    A dismissal is permanent: CodeQL treats a reappearing alert as the same one
+    and will NOT re-raise it. So if these constraints are loosened, nothing
+    external will warn you — this docstring is the only thing standing in for
+    that alarm.
+
+    What the dismissal rests on:
+
+      * job_id never reaches a path un-canonicalised. canonical_job_id()
+        enforces a strict UUID regex AND a uuid.UUID() round-trip, and it is
+        called by staging_path_for() itself rather than by callers, so it
+        cannot be skipped by adding a new caller.
+      * staging_path_for() then re-checks containment against the resolved
+        staging root with commonpath plus a prefix test.
+      * track and label come from fixed allowlists; seq is an int bounded to
+        [0, max_segments) and rendered through a fixed format.
+
+    In other words: no caller-supplied string is ever concatenated into a
+    path. Callers in main.py append only server-generated hex (uuid4().hex,
+    secrets.token_hex) for .part, marker and lock names.
+
+    If you widen the job_id format, move validation out to the callers, or
+    drop the containment re-check, re-open those alerts and re-do the trace
+    before shipping.
+    """
 
     def __init__(self, staging_dir: str, max_segments: int):
         self.staging_dir = staging_dir
         self.max_segments = max_segments
 
     def canonical_job_id(self, job_id: str) -> str:
+        # Regex first, then a uuid.UUID() round-trip: the regex rejects the
+        # obvious traversal shapes and the round-trip normalises anything the
+        # regex would accept in more than one spelling, so two requests cannot
+        # address the same directory by different names.
         raw = str(job_id or "")
         if not _UUID_RE.fullmatch(raw):
             raise HTTPException(status_code=400, detail="Invalid job_id format")
@@ -44,6 +78,11 @@ class BrowserJobPaths:
         self.canonical_job_id(job_id)
 
     def staging_path_for(self, job_id: str) -> Path:
+        # Canonicalise here rather than trusting the caller. Every staging path
+        # in main.py funnels through this method, so validating inside it is
+        # what makes "no unvalidated job_id can reach the filesystem" a
+        # property of the class instead of a convention. See the class
+        # docstring: the dismissed CodeQL alerts depend on it.
         safe_job_id = self.canonical_job_id(job_id)
         base = os.path.normpath(os.path.realpath(self.staging_dir))
         candidate = os.path.normpath(os.path.realpath(os.path.join(base, safe_job_id)))
