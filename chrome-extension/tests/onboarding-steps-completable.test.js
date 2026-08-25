@@ -120,3 +120,97 @@ describe('every checklist step can reach done', () => {
     expect(stepState(getEl, 4)).toBe('todo');
   });
 });
+
+// The scenario reported after the previous fix: step 3 ticked, step 4 never
+// did. Recording "the user sent their first video" lived inside
+// refreshOnboardingCoach, which returns early once onboarding is marked done —
+// so anyone who had dismissed the strip, or completed onboarding once, could
+// never write the flag. A fact about usage must not be gated on the UI that
+// displays it.
+function loadSidePanel({ storedLocal = {} } = {}) {
+  const writes = [];
+  const local = { ...storedLocal };
+  const ctx = loadScriptIntoContext('sidepanel.js', {
+    chrome: {
+      storage: {
+        sync: { get: async () => ({}) },
+        local: {
+          get: async (keys) => {
+            const out = {};
+            for (const k of [].concat(keys)) {
+              if (Object.prototype.hasOwnProperty.call(local, k)) out[k] = local[k];
+            }
+            return out;
+          },
+          set: async (obj) => { writes.push(obj); Object.assign(local, obj); },
+        },
+        session: { get: async () => ({}) },
+        onChanged: { addListener() {} },
+      },
+      runtime: {
+        onMessage: { addListener() {} }, openOptionsPage: () => {},
+        sendMessage: async () => {}, lastError: null,
+      },
+      tabs: {
+        query: (_q, cb) => cb([]), onUpdated: { addListener() {} },
+        onActivated: { addListener() {} },
+      },
+    },
+    document: {
+      addEventListener() {}, getElementById: () => null,
+      querySelector: () => null, querySelectorAll: () => [],
+      createElement: () => ({ classList: { add() {} } }),
+      documentElement: { setAttribute() {} }, body: { appendChild() {} },
+    },
+    window: {}, navigator: { clipboard: {} },
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+  });
+  return { ctx, writes };
+}
+
+const settle = async () => { for (let i = 0; i < 10; i += 1) await Promise.resolve(); };
+const FIRST_SEND = 'onboardingFirstSendDone';
+
+describe('the first send is recorded regardless of the coach strip', () => {
+  it('records it for a user who already dismissed onboarding', async () => {
+    const { ctx, writes } = loadSidePanel({ storedLocal: { onboardingCompleted: true } });
+    ctx.__eval('onboardingDone = true; firstSendRecorded = false;');
+
+    await ctx.recordFirstSend();
+    await settle();
+
+    expect(writes.some((w) => w[FIRST_SEND] === true)).toBe(true);
+  });
+
+  it('records it for a first-time user too', async () => {
+    const { ctx, writes } = loadSidePanel();
+    ctx.__eval('onboardingDone = false; firstSendRecorded = false;');
+
+    await ctx.recordFirstSend();
+    await settle();
+
+    expect(writes.some((w) => w[FIRST_SEND] === true)).toBe(true);
+  });
+
+  it('writes once, not on every subsequent send', async () => {
+    const { ctx, writes } = loadSidePanel();
+    ctx.__eval('onboardingDone = false; firstSendRecorded = false;');
+
+    await ctx.recordFirstSend();
+    await ctx.recordFirstSend();
+    await ctx.recordFirstSend();
+    await settle();
+
+    expect(writes.filter((w) => w[FIRST_SEND] === true).length).toBe(1);
+  });
+
+  it('allows a retry when the write failed', async () => {
+    // Swallowing a storage failure for good would lose the step silently.
+    const { ctx } = loadSidePanel();
+    ctx.__eval('onboardingDone = false; firstSendRecorded = false;');
+    ctx.chrome.storage.local.set = async () => { throw new Error('storage full'); };
+
+    await ctx.recordFirstSend();
+    expect(ctx.__eval('firstSendRecorded')).toBe(false);
+  });
+});

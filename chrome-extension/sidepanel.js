@@ -396,11 +396,15 @@ const FIRST_SEND_FLAG = 'onboardingFirstSendDone';
 // Assume finished until storage says otherwise, so a storage failure stays
 // quiet instead of coaching a user who has been here for months.
 let onboardingDone = true;
+// Whether the first-send flag is already on disk, so a send does not rewrite
+// it every time.
+let firstSendRecorded = false;
 
 async function initOnboardingCoach() {
   try {
-    const stored = await chrome.storage.local.get([ONBOARDING_FLAG]);
+    const stored = await chrome.storage.local.get([ONBOARDING_FLAG, FIRST_SEND_FLAG]);
     onboardingDone = !!(stored && stored[ONBOARDING_FLAG]);
+    firstSendRecorded = !!(stored && stored[FIRST_SEND_FLAG]);
   } catch (_) {
     onboardingDone = true;
   }
@@ -435,6 +439,25 @@ function applyOnboardingFlagChange(areaName, changes) {
 
 // completed:true means the user actually sent something; false means they
 // dismissed the strip. Both hide it, only one is evidence that step 4 happened.
+// Records the first confirmed send.
+//
+// This is a fact about what the user did, so it is written where the send is
+// confirmed — not inside refreshOnboardingCoach, which returns early once
+// onboarding is marked done. Hanging it there made the flag unwritable for
+// anyone who had dismissed the strip or completed onboarding once, leaving
+// checklist step 4 permanently unfinishable. A fact must not be conditional on
+// the UI that happens to display it.
+async function recordFirstSend() {
+  if (firstSendRecorded) return;
+  firstSendRecorded = true;
+  try {
+    await chrome.storage.local.set({ [FIRST_SEND_FLAG]: true });
+  } catch (_) {
+    // Allow a retry on the next send rather than swallowing it for good.
+    firstSendRecorded = false;
+  }
+}
+
 async function finishOnboarding({ completed = false } = {}) {
   onboardingDone = true;
   const el = document.getElementById('onbCoach');
@@ -1682,6 +1705,7 @@ async function flyToNAS(tileEl, url, pageUrl) {
     const result = await sendPromise;
     if (result && result.success) {
       sentUrls.add(url);
+      recordFirstSend();
       refreshOnboardingCoach();
     } else {
       sentUrls.delete(url);
@@ -1732,6 +1756,7 @@ async function flyToNAS(tileEl, url, pageUrl) {
   await animationDone;
   if (result && result.success) {
     sentUrls.add(url);
+    recordFirstSend();
     refreshOnboardingCoach();
     if (tileEl && tileEl.parentNode) {
       tileEl.classList.remove('sending');
