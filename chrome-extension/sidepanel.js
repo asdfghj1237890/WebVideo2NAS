@@ -1394,8 +1394,11 @@ function renderDetectedUrls(opts) {
     const blocked = detectedUrls.some((u) => urlInfoRequiresPlayFirst(u));
     playFirstHint.hidden = !blocked;
     if (blocked) {
+      // The short line. empty.playFirst.title was written for exactly this
+      // surface and never wired up; the long version stays on the send
+      // button's tooltip, where explaining why belongs.
       const text = document.getElementById('playFirstHintText');
-      if (text) text.textContent = t('url.playFirst.tooltip');
+      if (text) text.textContent = t('empty.playFirst.title');
     }
   }
 

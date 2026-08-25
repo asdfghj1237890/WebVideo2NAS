@@ -1190,11 +1190,6 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* Without this the display above beats the attribute and the hint never goes
    away — the defect this stylesheet's other elements are all guarded against. */
 .play-first-hint[hidden] { display: none; }
-.play-first-hint-icon {
-  color: var(--warn);
-  flex-shrink: 0;
-  line-height: 1.4;
-}
 .play-first-hint-text { min-width: 0; }
 
 /* ==== First-run coach strip ==== */
