@@ -4257,7 +4257,15 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
     const completion = new Promise((resolve, reject) => {
       function onMessage(msg) {
         if (!msg || msg.target !== 'service-worker') return;
-        if (msg.payload && msg.payload.jobId !== jobId) return;
+        // Match on NAS + id. With a bare id, one NAS's DONE resolved both
+        // waiters when two NAS were restored from the same database backup —
+        // the other job then tore down its own DNR rules, active entry and
+        // persisted state, and could close the shared offscreen document out
+        // from under a transfer that was still running.
+        if (!msg.payload) return;
+        const eventKey = globalThis.WV2NNasIdentity.browserJobKey(
+          msg.payload.nasScope, msg.payload.jobId);
+        if (eventKey !== jobKey) return;
         if (msg.type === 'BROWSER_JOB_DONE') {
           chrome.runtime.onMessage.removeListener(onMessage);
           resolve(msg.payload.summary || {});

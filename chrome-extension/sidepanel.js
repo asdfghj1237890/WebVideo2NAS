@@ -129,8 +129,14 @@ function tHtml(key, vars) {
   return i18n.tHtml(key, vars);
 }
 
-async function loadSettingsFromStorage() {
-  settings = await chrome.storage.sync.get([
+// Reads settings and returns them; the caller decides whether to install them.
+//
+// Assigning the global here meant a stale invocation still reverted the
+// effective NAS even when its result was refused for painting: the connection
+// chip stayed correct while the next jobs poll quietly queried the old NAS.
+// Guarding the paint was never enough — the mutation had to be gated too.
+async function readSettingsFromStorage() {
+  return chrome.storage.sync.get([
     'nasEndpoint', 'apiKey', 'uiLanguage', 'uiTheme', 'jobSort',
     'hiddenMode', 'hiddenModeUrlTemplate',
     'trustedCdnSuffixes',
@@ -143,6 +149,12 @@ async function loadSettingsFromStorage() {
     // even though NAS-direct doesn't need play-first).
     'useBrowserSide',
   ]);
+}
+
+// Installs a snapshot as the current settings. Separated from the read so a
+// caller that has been superseded can drop its result instead of applying it.
+function applySettingsSnapshot(snapshot) {
+  settings = snapshot || {};
   if (settings.jobSort && JOB_SORT_CYCLE.includes(settings.jobSort)) {
     jobSort = settings.jobSort;
   } else {
@@ -151,6 +163,10 @@ async function loadSettingsFromStorage() {
   }
   applyHiddenModeVisibility();
   return settings;
+}
+
+async function loadSettingsFromStorage() {
+  return applySettingsSnapshot(await readSettingsFromStorage());
 }
 
 
@@ -1002,8 +1018,11 @@ async function checkConnection() {
   // generation — arriving last would make it the newest and the guard would
   // wave it through. Ordering, not the guard, is what closes that.
   const isNewest = requestGuard.open('connection');
-  await loadSettingsFromStorage();
+  const snapshot = await readSettingsFromStorage();
+  // Superseded while the read was out: drop it rather than installing a NAS
+  // the user has already navigated away from.
   if (!isNewest()) return;
+  applySettingsSnapshot(snapshot);
 
   // Generation + target guard.
   //
@@ -1921,8 +1940,13 @@ async function loadRecentJobs() {
       if (!isCurrent(currentNasTarget())) return;
 
       const previousJobs = jobs;
-      const previousById = new Map(previousJobs.map((job) => [String(job.id), job]));
-      const apiIds = new Set(apiJobs.map((job) => String(job.id)));
+      // Indexed by NAS + id. With bare ids, B's rows suppressed retention of
+      // A's still-active ones, and a B row could pick up A's previous state as
+      // its own — undoing the isolation the rest of this keying provides.
+      const previousByKey = new Map(previousJobs.map(
+        (job) => [jobKeyFor(job) || String(job.id), job]));
+      const apiKeys = new Set(apiJobs.map(
+        (job) => nasIdentity.browserJobKey(target.scope, String(job.id))));
       const now = Date.now();
       // Polling is not liveness. Drop stale client-only overlays before they
       // can promote an API browser_pending row or revive old progress.
@@ -1940,10 +1964,10 @@ async function loadRecentJobs() {
         const idStr = String(job.id);
         // This response came from `target`, so its rows own that NAS's
         // progress entries and no others.
-        const live = liveBrowserProgress.get(
-          nasIdentity.browserJobKey(target.scope, idStr));
+        const apiKey = nasIdentity.browserJobKey(target.scope, idStr);
+        const live = liveBrowserProgress.get(apiKey);
         if (live && BROWSER_LIVE_RETAIN_STATUSES.has(apiJob.status)) {
-          job = mergeBrowserJobWithLive(apiJob, live, previousById.get(idStr));
+          job = mergeBrowserJobWithLive(apiJob, live, previousByKey.get(apiKey));
         } else if (live) {
           // Keep final transfer diagnostics on downstream/terminal API rows,
           // but never let the browser snapshot override their status/progress.
@@ -1961,8 +1985,8 @@ async function loadRecentJobs() {
       // active browser row until the live snapshot expires instead of
       // pruning it on one poll.
       for (const previousJob of previousJobs) {
-        const idStr = String(previousJob.id);
-        if (apiIds.has(idStr)) continue;
+        const previousKey = jobKeyFor(previousJob) || String(previousJob.id);
+        if (apiKeys.has(previousKey)) continue;
         // A retained row belongs to whichever NAS served it, which after a
         // profile switch is not the one this poll asked.
         const live = liveBrowserProgress.get(jobKeyFor(previousJob));
@@ -2001,7 +2025,9 @@ function renderJobs() {
 
   // Apply sort mode (time keeps NAS order; active/failed groups by status rank).
   const sortedJobs = sortJobs(jobs, jobSort);
-  const currentJobIds = new Set(sortedJobs.map(j => String(j.id)));
+  // Keyed the same way as the rows themselves, and read back from the element
+  // rather than reconstructed from its id.
+  const currentJobKeys = new Set(sortedJobs.map((j) => jobKeyFor(j) || String(j.id)));
 
   if (sortedJobs.length === 0) {
     if (!listElement.querySelector('.empty-state')) {
@@ -2017,7 +2043,7 @@ function renderJobs() {
     }
     // Stop tweens on missing jobs
     for (const id of Array.from(jobTweens.keys())) {
-      if (!currentJobIds.has(id)) stopTween(id);
+      if (!currentJobKeys.has(id)) stopTween(id);
     }
     return;
   }
@@ -2027,6 +2053,7 @@ function renderJobs() {
 
   sortedJobs.forEach((job, index) => {
     const jobId = String(job.id);
+    const jobKey = jobKeyFor(job) || jobId;
     const domId = rowDomId(job);
     let itemEl = document.getElementById(domId);
 
@@ -2034,6 +2061,7 @@ function renderJobs() {
       itemEl = document.createElement('div');
       itemEl.className = 'job-row';
       itemEl.id = domId;
+      itemEl.dataset.jobKey = jobKey;
       itemEl.dataset.status = job.status;
       itemEl.dataset.progress = job.progress;
 
@@ -2069,21 +2097,20 @@ function renderJobs() {
 
       // Smoothly tween the ring/bar to the new value
       if (isActiveStatus(job.status)) {
-        startTween(itemEl, jobId, Number(job.progress) || 0);
+        startTween(itemEl, jobKey, Number(job.progress) || 0);
       } else {
-        stopTween(jobId);
+        stopTween(jobKey);
       }
     }
   });
 
   // Remove vanished jobs
   Array.from(listElement.children).forEach(child => {
-    if (child.id && child.id.startsWith('job-')) {
-      const id = child.id.replace('job-', '');
-      if (!currentJobIds.has(id)) {
-        stopTween(id);
-        child.remove();
-      }
+    const key = child.dataset && child.dataset.jobKey;
+    if (!key) return;
+    if (!currentJobKeys.has(key)) {
+      stopTween(key);
+      child.remove();
     }
   });
 }

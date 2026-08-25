@@ -115,7 +115,7 @@ describe('a stale connection check cannot paint the wrong profile', () => {
 
     const painted = [];
     ctx.setConnectionState = (state, label) => { painted.push({ state, label }); };
-    ctx.loadSettingsFromStorage = async () => {};
+    ctx.readSettingsFromStorage = async () => ({ ...ctx.__eval("settings") });
 
     ctx.__eval(`settings = { nasEndpoint: '${NAS_A}', apiKey: 'ka' };`);
     const aCheck = ctx.checkConnection();
@@ -135,7 +135,7 @@ describe('a stale connection check cannot paint the wrong profile', () => {
     const { ctx } = makeCtx();
     const painted = [];
     ctx.setConnectionState = (state) => { painted.push(state); };
-    ctx.loadSettingsFromStorage = async () => {};
+    ctx.readSettingsFromStorage = async () => ({ ...ctx.__eval("settings") });
     ctx.shortHost = (h) => h;
 
     ctx.__eval(`settings = { nasEndpoint: '${NAS_A}', apiKey: 'ka' };`);
@@ -157,16 +157,13 @@ describe('a late storage read cannot revert the current NAS', () => {
     ctx.setConnectionState = (state, label) => { painted.push({ state, label }); };
 
     let releaseA = null;
-    ctx.loadSettingsFromStorage = () => new Promise((resolve) => {
+    ctx.readSettingsFromStorage = () => new Promise((resolve) => {
       if (!releaseA) {
-        // First (stale) invocation: hold its read open.
-        releaseA = () => {
-          ctx.__eval(`settings = { nasEndpoint: '${NAS_A}', apiKey: 'ka' };`);
-          resolve();
-        };
+        // First (stale) invocation: hold its read open, then answer with A.
+        releaseA = () => resolve({ nasEndpoint: NAS_A, apiKey: 'ka' });
         return;
       }
-      resolve();
+      resolve({ nasEndpoint: NAS_B, apiKey: 'kb' });
     });
 
     ctx.__eval(`settings = { nasEndpoint: '${NAS_A}', apiKey: 'ka' };`);
@@ -182,7 +179,11 @@ describe('a late storage read cannot revert the current NAS', () => {
     releaseA();
     await stale;
 
-    // It must not paint, and must not leave A as the effective NAS.
+    // It must not paint...
     expect(painted.length).toBe(afterNewest);
+    // ...and must not leave A as the effective NAS, which is what the next
+    // jobs poll would read.
+    expect(ctx.__eval('settings.nasEndpoint')).toBe(NAS_B);
+    expect(ctx.__eval('currentNasTarget().scope')).toBe(NAS_B);
   });
 });
