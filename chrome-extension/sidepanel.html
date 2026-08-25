@@ -171,6 +171,14 @@
                      title="Comma-separated host suffixes (e.g. 'cdn.example.com'). Bypasses the cross-site gate for browser-side mode. SECURITY: only add CDNs you trust — they receive cookies + CORS-relax.">
             </div>
           </details>
+          <!-- Shown only while browser mode is actually holding a detected
+               stream back. The rule is invisible otherwise, and a disabled
+               send button with a tooltip is not where someone learns it. -->
+          <div id="playFirstHint" class="play-first-hint" hidden>
+            <span class="play-first-hint-icon" aria-hidden="true">▶</span>
+            <span id="playFirstHintText" class="play-first-hint-text"></span>
+          </div>
+
           <div id="detectedUrlsList" class="grid">
             <div class="empty-state">
               <p id="detectedEmptyTitle">No videos detected yet</p>

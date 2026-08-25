@@ -1175,6 +1175,28 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 }
 .update-banner-dismiss:hover { background: var(--glass-bg-hi); color: var(--text); }
 
+/* ==== Play-first hint ==== */
+.play-first-hint {
+  display: flex; align-items: flex-start; gap: 8px;
+  margin: 0 12px 8px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-mid);
+  flex-shrink: 0;
+}
+/* Without this the display above beats the attribute and the hint never goes
+   away — the defect this stylesheet's other elements are all guarded against. */
+.play-first-hint[hidden] { display: none; }
+.play-first-hint-icon {
+  color: var(--warn);
+  flex-shrink: 0;
+  line-height: 1.4;
+}
+.play-first-hint-text { min-width: 0; }
+
 /* ==== First-run coach strip ==== */
 /* Mirrors .update-banner. The [hidden] guard is mandatory: the display below
    would otherwise beat the attribute and pin the strip on screen. */

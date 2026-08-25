@@ -1316,9 +1316,16 @@ function urlInfoRequiresPlayFirst(urlInfo) {
   if (urlInfo.directDash) return false;
   const fmt = (urlInfo.detectedFormat || classifyVideoType(urlInfo.url) || '').toUpperCase();
   if (fmt !== 'M3U8' && fmt !== 'MPD') return false;
-  if (urlInfo.playbackObserved) return false;
-  const isNowPlaying = !!urlInfo.isNowPlaying || !!urlInfo.isLive;
-  return !isNowPlaying;
+  // Only observed playback lifts the gate.
+  //
+  // It used to also lift for isNowPlaying — a click-match heuristic — and for
+  // isLive. Neither is evidence a token was minted. The gate exists precisely
+  // because IP- and cookie-bound CDN tokens are issued when the page's player
+  // starts, so unlocking on "the user clicked something that looks like this"
+  // let a send go out against a URL that was never made fetchable. isLive is a
+  // property of the stream, not of playback, and a live manifest needs the
+  // same token as any other.
+  return !urlInfo.playbackObserved;
 }
 
 function visibleDetectedUrls() {
@@ -1377,6 +1384,20 @@ function renderDetectedUrls(opts) {
 
   // Grid density
   listElement.classList.toggle('dense', isMany);
+
+  // Browser mode holds streams until the page's player has started. That was
+  // only ever said in a tooltip on a disabled button, which is exactly where a
+  // user who does not know the rule will not look. Say it in the pane, and
+  // only while it is actually blocking something.
+  const playFirstHint = document.getElementById('playFirstHint');
+  if (playFirstHint) {
+    const blocked = detectedUrls.some((u) => urlInfoRequiresPlayFirst(u));
+    playFirstHint.hidden = !blocked;
+    if (blocked) {
+      const text = document.getElementById('playFirstHintText');
+      if (text) text.textContent = t('url.playFirst.tooltip');
+    }
+  }
 
   // Section count suffix
   const visible = visibleDetectedUrls();
