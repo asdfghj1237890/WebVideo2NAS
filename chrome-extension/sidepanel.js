@@ -910,11 +910,34 @@ function connectionReasonFromError(error) {
 // short enough that a dead NAS surfaces as an error instead of silence.
 const NAS_JOBS_TIMEOUT_MS = 10_000;
 
+// Bounds the *headers* only. fetch() resolves as soon as the response head
+// arrives, so the timer is cleared before any body is read. Fine for callers
+// that only look at response.ok / status; anyone reading a body must use
+// fetchJsonWithTimeout below.
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Bounds headers *and* body under one controller. A NAS or proxy that answers
+// 200 and then stalls the stream would otherwise hang the caller forever:
+// fetchWithTimeout has already cleared its timer by the time .json() is
+// awaited, so nothing is left to abort the read. The jobs poll runs every 2s,
+// so a single stalled body would sit there while new requests stacked up
+// behind it and the list never updated again.
+async function fetchJsonWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    // Still inside the timer: an abort rejects the body read too.
+    const data = response.ok ? await response.json() : null;
+    return { response, data };
   } finally {
     clearTimeout(timer);
   }
@@ -1742,12 +1765,13 @@ async function loadRecentJobs() {
   if (!settings.nasEndpoint || !settings.apiKey) return;
 
   try {
-    const response = await fetchWithTimeout(`${settings.nasEndpoint}/api/jobs?limit=20`, {
-      headers: { 'Authorization': `Bearer ${settings.apiKey}` }
-    }, NAS_JOBS_TIMEOUT_MS);
+    const { response, data: apiJobs } = await fetchJsonWithTimeout(
+      `${settings.nasEndpoint}/api/jobs?limit=20`,
+      { headers: { 'Authorization': `Bearer ${settings.apiKey}` } },
+      NAS_JOBS_TIMEOUT_MS,
+    );
 
     if (response.ok) {
-      const apiJobs = await response.json();
       // Ignore an older overlapping poll that completed after a newer one.
       if (requestSeq !== loadRecentJobsSeq) return;
       // A transfer may advance while the API request is in flight. Merge the
