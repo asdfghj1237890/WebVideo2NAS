@@ -1768,6 +1768,32 @@ async function sendToNAS(url, pageUrl) {
 }
 
 // ---------- Jobs ----------
+
+// Single-flight guard for the periodic poll.
+//
+// Every loadRecentJobs() call bumps loadRecentJobsSeq, and the response checks
+// that sequence to discard an older overlapping poll. Driving that from an
+// unconditional 2s interval turned it against itself: a NAS answering slower
+// than the interval had its in-flight request superseded by the very next
+// tick, so each response arrived to find the sequence moved on and was dropped
+// as stale. The list then stopped updating entirely — the slower the NAS, the
+// more certainly nothing rendered — while the 10s bound let roughly five
+// requests pile up at once and add to the load.
+//
+// A tick that lands while a request is still out is now skipped. Explicit
+// callers (the refresh button, a profile change, post-cancel) keep calling
+// loadRecentJobs directly: those genuinely mean "replace what is in flight",
+// which is what the sequence check is for.
+let recentJobsInFlight = null;
+
+function pollRecentJobs() {
+  if (recentJobsInFlight) return recentJobsInFlight;
+  recentJobsInFlight = loadRecentJobs()
+    .catch(() => { /* failures surface through the connection chip */ })
+    .finally(() => { recentJobsInFlight = null; });
+  return recentJobsInFlight;
+}
+
 async function loadRecentJobs() {
   const requestSeq = ++loadRecentJobsSeq;
   await mergePersistedBrowserTransferSnapshots();
@@ -2569,5 +2595,5 @@ function containsIpAddress(url) {
 // Auto-refresh jobs every 2 seconds. Detected URLs use a slower poll so a
 // segment-derived LIVE badge also expires after playback pauses; push updates
 // from background.js still make active playback appear immediately.
-setInterval(loadRecentJobs, 2000);
+setInterval(pollRecentJobs, 2000);
 setInterval(loadDetectedUrls, 5000);
