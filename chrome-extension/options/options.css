@@ -390,14 +390,25 @@ input:focus-visible, select:focus-visible { outline: none; }
 .kv .comment-inline {
   color: var(--text-faint);
   margin-left: 4px;
-  flex-shrink: 0;
+  /* Was flex-shrink: 0. An unshrinkable help string left .kv-edit only the
+     remainder of the row, which fell below the width of its own quotes and
+     input — and the input then painted on top of this text. The hint is
+     read-once help, so let it be the side that gives way. */
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   transition: color 320ms;
 }
 
 /* Inline-edited string value: "" + input + " */
 .kv-edit {
   display: inline-flex; align-items: center; flex: 1;
-  min-width: 0;
+  /* flex-basis 0 + min-width 0 let this grow into whatever the comment left
+     over — as little as 19px — while the quotes and the input inside kept
+     their own widths and spilled out of the box. Floor it at
+     quote + the input's own minimum + quote so that can never happen. */
+  min-width: 108px;
 }
 .kv-edit .quote { color: var(--text-faint); flex-shrink: 0; }
 .kv-edit .input {
@@ -751,6 +762,9 @@ input:focus-visible, select:focus-visible { outline: none; }
   }
   .kv .key { width: 196px; }
   .kv .comment-inline { margin-left: 7px; }
+  /* Quotes render at 17px here, so the wrapper floor has to clear
+     quote + input minimum + quote at this size too. */
+  .kv-edit { min-width: 112px; }
   .kv-edit .input {
     min-width: 90px;
     font-size: 17px;

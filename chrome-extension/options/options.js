@@ -51,7 +51,23 @@ function tHtml(key, vars) { return i18n ? i18n.tHtml(key, vars) : t(key, vars); 
 
 // ---------- DOM helpers ----------
 function $(id) { return document.getElementById(id); }
-function setText(id, text) { const el = $(id); if (el) el.textContent = text; }
+function setText(id, text) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = text;
+  // Inline help ellipsises in a narrow window (see .comment-inline in
+  // options.css); keep the full string reachable on hover.
+  if (el.classList.contains('comment-inline')) el.title = text;
+}
+
+// Mirror every inline help comment into its own title attribute. Run once the
+// static strings are localized, so hints that get truncated stay readable.
+function syncCommentTitles(root) {
+  (root || document).querySelectorAll('.comment-inline').forEach(el => {
+    const text = el.textContent.trim();
+    if (text) el.title = text;
+  });
+}
 
 // ---------- Theme ----------
 function applyTheme(next) {
@@ -258,6 +274,8 @@ function localizeStaticText() {
 
   // Profiles
   setText('addProfileText', t('options.profiles.addBtn') || '[profile.new] — save current as profile');
+
+  syncCommentTitles();
 }
 
 function getToggleVisibleLabel() {
@@ -390,7 +408,8 @@ function renderProfilesPane() {
                    autocomplete="off">
             <span class="quote">"</span>
           </span>
-          <span class="comment-inline" data-subdir-comment="${safeId}">${escapeHtml(subdirHelp)}</span>
+          <span class="comment-inline" data-subdir-comment="${safeId}"
+                title="${escapeHtml(subdirHelp)}">${escapeHtml(subdirHelp)}</span>
         </div>
       </div>
     `;
@@ -435,12 +454,11 @@ function validateSubdirInputUI(input) {
   input.classList.toggle('input-error', !!err);
   const comment = document.querySelector(`[data-subdir-comment="${input.dataset.pid}"]`);
   if (comment) {
-    if (err) {
-      comment.textContent = '# ⚠ ' + err;
-    } else {
-      comment.textContent = t('options.profiles.subdirHelp')
-        || '# subfolder under /downloads (blank = root)';
-    }
+    const text = err
+      ? '# ⚠ ' + err
+      : (t('options.profiles.subdirHelp') || '# subfolder under /downloads (blank = root)');
+    comment.textContent = text;
+    comment.title = text;
   }
 }
 
@@ -653,6 +671,7 @@ async function testConnection() {
       note.textContent = version
         ? `# 200 OK · v${version} · ${ms}ms RTT`
         : `# 200 OK · ${ms}ms RTT`;
+      note.title = note.textContent;
       const noteSlot = $('lastPingNote');
       if (noteSlot) {
         noteSlot.textContent = '';
