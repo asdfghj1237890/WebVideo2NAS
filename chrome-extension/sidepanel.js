@@ -424,13 +424,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateTrustedCdnCount();
   applyModeBadge();
 
-  checkConnection();
-  loadDetectedUrls();
-  await loadRecentJobs();
-
+  // Wire everything the user needs when the NAS is unreachable *before* the
+  // first network wait. The coach strip exists for exactly the user whose NAS
+  // is not answering yet, so gating its handlers behind a jobs fetch inverted
+  // the feature: the worse the connection, the less likely the guidance
+  // appeared. A hung /api/jobs used to stall DOMContentLoaded here, leaving
+  // the strip hidden with no dismiss or settings handler attached — and
+  // onboardingDone defaults to true, so nothing later could reveal it either.
   setupEventListeners();
   initUpdateBanner();
   initOnboardingCoach();
+
+  checkConnection();
+  loadDetectedUrls();
+  // Not awaited: the list renders empty until it lands, and the poll retries.
+  loadRecentJobs().catch(() => { /* surfaced by the connection chip */ });
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message && message.action === 'detectedUrlsUpdated') {
