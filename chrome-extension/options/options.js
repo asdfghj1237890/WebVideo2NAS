@@ -189,8 +189,12 @@ function refreshOnboardingStatus() {
     badge.hidden = onboardingDone || allDone;
   }
 
-  const doneBtn = $('onbDoneBtn');
-  if (doneBtn) doneBtn.disabled = onboardingDone;
+  // Once onboarding is done this control has nothing left to do — its only
+  // job is to end something that has already ended. Showing it greyed out next
+  // to a hint describing an action you cannot take reads as a broken button
+  // rather than a finished checklist, which the four ticks already say.
+  const doneRow = $('onbDoneRow');
+  if (doneRow) doneRow.hidden = onboardingDone;
 }
 
 // Mirror of the side panel's handler: the same flag, the same reason. If the

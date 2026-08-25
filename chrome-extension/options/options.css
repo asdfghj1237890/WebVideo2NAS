@@ -196,6 +196,11 @@ input:focus-visible, select:focus-visible { outline: none; }
   flex-shrink: 0;
 }
 .nav-item.active .nav-count { color: var(--accent); border-color: var(--accent-dim); }
+/* The display above beats the `hidden` attribute, so a badge stayed on screen
+   with whatever text it last had: a "!" for an onboarding already finished, and
+   an empty pill on a fresh install with no hidden-mode tasks. The side panel
+   carries this guard on every element it hides; this stylesheet had none. */
+.nav-item .nav-count[hidden] { display: none; }
 
 .sidebar-fill { flex: 1; }
 .sidebar-footer {
@@ -331,6 +336,7 @@ input:focus-visible, select:focus-visible { outline: none; }
   min-height: 26px;
   padding-left: 10px;
 }
+.onb-actions[hidden] { display: none; }
 /* Status marker on each [step.N] head. 'manual' means this step is tracked by
    the side-panel strip, not here — the options page cannot observe it. */
 .onb-status {

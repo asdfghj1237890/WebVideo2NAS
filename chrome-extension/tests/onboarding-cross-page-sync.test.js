@@ -64,7 +64,7 @@ function loadSidePanel() {
 }
 
 function loadOptions() {
-  const dom = makeDomStub(['onbNavTodo', 'onbDoneBtn', 'onbStatus1', 'onbStatus2', 'onbStatus3', 'onbStatus4']);
+  const dom = makeDomStub(['onbNavTodo', 'onbDoneRow', 'onbDoneBtn', 'onbStatus1', 'onbStatus2', 'onbStatus3', 'onbStatus4']);
   const ctx = loadScriptIntoContext('options/options.js', {
     chrome: {
       runtime: { getManifest: () => ({ version: '0.0.0' }), openOptionsPage: () => {}, lastError: null },
@@ -128,7 +128,9 @@ describe('options page picks up a flag written by the side panel', () => {
     // The sidebar "!" badge is hidden once onboarding is done, whatever the
     // individual step states say.
     expect(dom.elements.get('onbNavTodo').hidden).toBe(true);
-    expect(dom.elements.get('onbDoneBtn').disabled).toBe(true);
+    // The dismiss control is hidden rather than greyed once there is nothing
+    // left to dismiss.
+    expect(dom.elements.get('onbDoneRow').hidden).toBe(true);
   });
 
   it('ignores changes in the sync area and unrelated local keys', () => {
