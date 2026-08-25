@@ -1436,7 +1436,19 @@ function renderDetectedUrls(opts) {
     const title = deriveTitle(urlInfo, index);
     const tone = thumbColorForUrl(url, urlInfo.detectedFormat);
     const top = topQualityLabel(urlInfo);
-    const isNowPlaying = !!urlInfo.isNowPlaying || !!urlInfo.isLive;
+    // Two different facts, and they had been sharing one badge that said LIVE.
+    //
+    // isLive means the manifest has no ENDLIST — an actual live stream.
+    // isNowPlaying is a click-match heuristic with a ten-minute window: the
+    // user clicked something whose URL resembles this one. It is not evidence
+    // that anything is playing, so a 7-second VOD ad on a page still showing
+    // its age gate was being labelled LIVE.
+    //
+    // playbackObserved is the real signal — media segments actually seen —
+    // and background.js sets it with a comment about keeping LIVE responsive,
+    // which is what this was always meant to read.
+    const isLiveStream = !!urlInfo.isLive;
+    const isPlayingNow = !isLiveStream && !!urlInfo.playbackObserved;
 
     // Browser-side play-first gate: keep the candidate visible, but
     // lock sending until the page's player has started and issued the
@@ -1466,10 +1478,10 @@ function renderDetectedUrls(opts) {
             ${thumbnail ? `<img class="thumb-img" src="${escapeHtml(thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
             <span class="thumb-label">${escapeHtml(videoType)}</span>
             ${top ? `<span class="thumb-quality">${escapeHtml(top)}</span>` : ''}
-            ${isNowPlaying ? `
+            ${(isLiveStream || isPlayingNow) ? `
               <span class="thumb-live">
                 <span class="live-dot"></span>
-                <span class="live-text">LIVE</span>
+                <span class="live-text">${isLiveStream ? 'LIVE' : 'PLAYING'}</span>
               </span>
             ` : ''}
             ${isMany && requiresPlayFirst ? `
