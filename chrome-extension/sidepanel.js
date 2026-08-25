@@ -363,6 +363,18 @@ async function initOnboardingCoach() {
   refreshOnboardingCoach();
 }
 
+// The flag is shared with the options page, and both pages are routinely open
+// at once: install opens options, and step 3 sends the user to this panel. A
+// value read only at init means dismissing onboarding in one page leaves the
+// other still coaching, which is exactly what the dismiss button promises not
+// to do. Named rather than inlined in the listener so a test can drive it.
+function applyOnboardingFlagChange(areaName, changes) {
+  if (areaName !== 'local' || !changes || !changes.onboardingCompleted) return false;
+  onboardingDone = !!changes.onboardingCompleted.newValue;
+  refreshOnboardingCoach();
+  return true;
+}
+
 async function finishOnboarding() {
   onboardingDone = true;
   const el = document.getElementById('onbCoach');
@@ -798,6 +810,7 @@ function setupEventListeners() {
     if (areaName === 'local' && changes.detectedUrls) {
       loadDetectedUrls();
     }
+    applyOnboardingFlagChange(areaName, changes);
     if (areaName === 'sync') {
       const needsUiUpdate = !!changes.uiLanguage;
       const needsConnUpdate = !!changes.nasEndpoint || !!changes.apiKey;

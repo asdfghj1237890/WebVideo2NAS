@@ -158,6 +158,16 @@ function refreshOnboardingStatus() {
   if (doneBtn) doneBtn.disabled = onboardingDone;
 }
 
+// Mirror of the side panel's handler: the same flag, the same reason. If the
+// user finishes onboarding from the panel, this page must stop showing the
+// checklist as outstanding while it sits open in another tab.
+function applyOnboardingFlagChange(areaName, changes) {
+  if (areaName !== 'local' || !changes || !changes.onboardingCompleted) return false;
+  onboardingDone = !!changes.onboardingCompleted.newValue;
+  refreshOnboardingStatus();
+  return true;
+}
+
 async function completeOnboarding() {
   onboardingDone = true;
   refreshOnboardingStatus();
@@ -1029,6 +1039,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (areaName === 'local' && changes.avTaskHistory) {
       renderHiddenModeHistory(changes.avTaskHistory.newValue || []);
     }
+    applyOnboardingFlagChange(areaName, changes);
     if (areaName === 'sync') {
       if (changes.uiLanguage) {
         const newVal = changes.uiLanguage.newValue || '';
