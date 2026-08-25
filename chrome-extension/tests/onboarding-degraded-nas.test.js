@@ -62,7 +62,7 @@ function makeHarness({ storedLocal = {}, syncSettings = {} } = {}) {
     body: { appendChild() {}, classList: makeElement('body').classList },
   };
 
-  let fetchCalls = 0;
+  const fetchArgs = [];
   const chrome = {
     storage: {
       sync: { get: async () => ({ ...syncSettings }), set: async () => {} },
@@ -99,11 +99,11 @@ function makeHarness({ storedLocal = {}, syncSettings = {} } = {}) {
     navigator: { clipboard: { writeText: async () => {} }, language: 'en' },
     // A NAS that accepts the connection and then says nothing. Never settles,
     // so any `await` on it hangs forever.
-    fetch: () => { fetchCalls += 1; return new Promise(() => {}); },
+    fetch: (url, options) => { fetchArgs.push({ url, options }); return new Promise(() => {}); },
     AbortController: class { constructor() { this.signal = {}; } abort() {} },
   });
 
-  return { ctx, getEl, run: () => domReady && domReady(), fetchCalls: () => fetchCalls };
+  return { ctx, getEl, run: () => domReady && domReady(), fetchArgs };
 }
 
 const settle = async () => {
@@ -147,7 +147,7 @@ describe('onboarding survives an unreachable NAS', () => {
     });
     h.run();
     await settle();
-    expect(h.fetchCalls()).toBeGreaterThan(0);
+    expect(h.fetchArgs.length).toBeGreaterThan(0);
   });
 
   it('stays quiet for a user who already finished onboarding', async () => {
@@ -159,5 +159,37 @@ describe('onboarding survives an unreachable NAS', () => {
     await settle();
 
     expect(h.getEl('onbCoach').hidden).toBe(true);
+  });
+});
+
+describe('NAS requests made during init are bounded', () => {
+  // /api/health always had a 5s bound; the job endpoints did not, so an
+  // unresponsive NAS left them outstanding for as long as the socket stayed
+  // open. Reordering init stops that from blocking onboarding, but the request
+  // itself should still give up rather than hang indefinitely.
+  it('every request carries an abort signal', async () => {
+    const h = makeHarness({
+      storedLocal: {},
+      syncSettings: { nasEndpoint: 'http://192.168.1.99:52052', apiKey: 'k' },
+    });
+    h.run();
+    await settle();
+
+    expect(h.fetchArgs.length).toBeGreaterThan(0);
+    const unbounded = h.fetchArgs.filter(({ options }) => !options || !options.signal);
+    expect(unbounded.map(({ url }) => url)).toEqual([]);
+  });
+
+  it('bounds the jobs list specifically', async () => {
+    const h = makeHarness({
+      storedLocal: {},
+      syncSettings: { nasEndpoint: 'http://192.168.1.99:52052', apiKey: 'k' },
+    });
+    h.run();
+    await settle();
+
+    const jobsCall = h.fetchArgs.find(({ url }) => String(url).includes('/api/jobs'));
+    expect(jobsCall).toBeTruthy();
+    expect(jobsCall.options.signal).toBeTruthy();
   });
 });

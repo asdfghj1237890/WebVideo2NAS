@@ -904,6 +904,12 @@ function connectionReasonFromError(error) {
   return msg;
 }
 
+// /api/health already had a 5s bound; the job endpoints did not, so an
+// unresponsive NAS left those requests outstanding for as long as the socket
+// stayed open. Longer than the health check because a job list is real work,
+// short enough that a dead NAS surfaces as an error instead of silence.
+const NAS_JOBS_TIMEOUT_MS = 10_000;
+
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1736,9 +1742,9 @@ async function loadRecentJobs() {
   if (!settings.nasEndpoint || !settings.apiKey) return;
 
   try {
-    const response = await fetch(`${settings.nasEndpoint}/api/jobs?limit=20`, {
+    const response = await fetchWithTimeout(`${settings.nasEndpoint}/api/jobs?limit=20`, {
       headers: { 'Authorization': `Bearer ${settings.apiKey}` }
-    });
+    }, NAS_JOBS_TIMEOUT_MS);
 
     if (response.ok) {
       const apiJobs = await response.json();
@@ -2230,10 +2236,10 @@ async function cancelJob(jobId) {
   }
 
   try {
-    const response = await fetch(`${settings.nasEndpoint}/api/jobs/${jobId}`, {
+    const response = await fetchWithTimeout(`${settings.nasEndpoint}/api/jobs/${jobId}`, {
       method: 'DELETE',
       headers: { 'Authorization': `Bearer ${settings.apiKey}` }
-    });
+    }, NAS_JOBS_TIMEOUT_MS);
 
     if (response.ok) {
       // DELETE is the authoritative user-cancel transition. Only after

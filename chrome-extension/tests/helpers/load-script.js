@@ -12,6 +12,9 @@ export function loadScriptIntoContext(scriptPath, context = {}) {
     URL,
     setTimeout,
     clearTimeout,
+    // Part of the browser environment the scripts under test assume, same as
+    // URL and setTimeout above. fetchWithTimeout needs it to bound a request.
+    AbortController,
     // Default: disable intervals unless test explicitly wants them
     setInterval: () => 0,
     clearInterval: () => {},
