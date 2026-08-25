@@ -4,6 +4,7 @@
 // flight ghost on send, checkbox bounce, bulk bar slide, smooth ring tween.
 
 if (typeof importScripts === 'function') {
+  importScripts('nasIdentity.js');
   importScripts('sidepanelCore.js');
 }
 const _sidepanelGlobalRoot = (typeof globalThis !== 'undefined' && globalThis)
@@ -13,6 +14,11 @@ const sidepanelCore = _sidepanelGlobalRoot.WV2NSidepanelCore
   || (typeof window !== 'undefined' && window.WV2NSidepanelCore);
 if (!sidepanelCore) {
   throw new Error('WV2NSidepanelCore failed to load');
+}
+const nasIdentity = _sidepanelGlobalRoot.WV2NNasIdentity
+  || (typeof window !== 'undefined' && window.WV2NNasIdentity);
+if (!nasIdentity) {
+  throw new Error('WV2NNasIdentity failed to load');
 }
 
 let settings = {};
@@ -470,6 +476,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 function handleBrowserJobProgress(message) {
   const idStr = String(message.jobId || '');
   if (!idStr) return;
+  // Progress is only meaningful against the NAS that produced it. Without the
+  // scope, one NAS's counters land on the other's row whenever both were
+  // restored from the same database backup.
+  const key = nasIdentity.browserJobKey(message.nasScope, idStr);
+  if (!key) return;
   const total = Number(message.total) || 0;
   const done = Number(message.done) || 0;
   const percent = total > 0 ? Math.min(100, (done / total) * 100) : 0;
@@ -477,12 +488,12 @@ function handleBrowserJobProgress(message) {
   const concurrency = Number.isInteger(Number(message.concurrency))
     ? Number(message.concurrency)
     : null;
-  const live = mergeLiveBrowserProgress(liveBrowserProgress.get(idStr), {
+  const live = mergeLiveBrowserProgress(liveBrowserProgress.get(key), {
     done, total, percent, transferTimings, concurrency,
   });
-  liveBrowserProgress.set(idStr, live);
+  liveBrowserProgress.set(key, live);
 
-  const job = jobs.find((j) => String(j.id) === idStr);
+  const job = jobs.find((j) => String(j.id) === idStr && jobKeyFor(j) === key);
   if (!job) return;
   const acceptsLiveProgress = BROWSER_LIVE_RETAIN_STATUSES.has(job.status);
   if (acceptsLiveProgress) {
@@ -619,9 +630,13 @@ async function mergePersistedBrowserTransferSnapshots() {
     const stored = await sessionStorage.get(BROWSER_TRANSFER_SNAPSHOT_KEY);
     const snapshots = stored && stored[BROWSER_TRANSFER_SNAPSHOT_KEY];
     if (!snapshots || typeof snapshots !== 'object') return;
-    for (const [jobId, snapshot] of Object.entries(snapshots)) {
+    for (const [storedKey, snapshot] of Object.entries(snapshots)) {
       if (!snapshot || typeof snapshot !== 'object') continue;
-      const idStr = String(jobId);
+      // Entries written before identity carried a NAS name none, so there is
+      // no honest way to attribute them. Dropping beats guessing the current
+      // scope and reviving the contamination this key exists to prevent.
+      if (nasIdentity.isLegacyBrowserJobKey(storedKey)) continue;
+      const idStr = storedKey;
       const snapshotTs = Number(snapshot.ts) || 0;
       const snapshotTtl = snapshot.terminal
         ? TERMINAL_BROWSER_TRANSFER_TTL_MS
@@ -630,6 +645,7 @@ async function mergePersistedBrowserTransferSnapshots() {
         continue;
       }
       const current = liveBrowserProgress.get(idStr);
+      // idStr here is the stored composite key, already NAS-qualified.
       liveBrowserProgress.set(idStr, mergeLiveBrowserProgress(current, {
         done: snapshot.done,
         total: snapshot.total,
@@ -981,7 +997,14 @@ function setConnectionState(state, label, tooltip) {
 }
 
 async function checkConnection() {
+  // Claim the generation BEFORE the first await. loadSettingsFromStorage()
+  // rewrites the shared settings object, so an older invocation whose read
+  // resolves late would revert settings to its own NAS and only then open a
+  // generation — arriving last would make it the newest and the guard would
+  // wave it through. Ordering, not the guard, is what closes that.
+  const isNewest = requestGuard.open('connection');
   await loadSettingsFromStorage();
+  if (!isNewest()) return;
 
   // Generation + target guard.
   //
@@ -995,9 +1018,10 @@ async function checkConnection() {
   // step to show by reading this chip's class, so a stale verdict advanced
   // onboarding for a NAS that had never answered.
   const target = currentNasTarget();
-  // Bump the generation even without a target, so clearing the configuration
-  // invalidates whatever is still in flight.
-  const isCurrent = requestGuard.begin('connection', target);
+  // Layer the target check onto the generation already claimed above, rather
+  // than opening a second one.
+  const isCurrent = (currentTarget) =>
+    isNewest() && sidepanelCore.sameNasTarget(target, currentTarget);
 
   if (!target) {
     setConnectionState('disconnected', t('status.notConfigured'), '');
@@ -1838,6 +1862,14 @@ let jobsTarget = null;
 // with, so a row always cancels against the NAS that actually owns it —
 // otherwise the DELETE either does nothing or, when both NAS were restored
 // from the same database backup, irreversibly cancels the wrong job.
+// A row's identity, namespaced by the NAS that owns it. Rows retained across
+// a profile switch keep their own target, so this stays correct even when the
+// list holds two NAS at once.
+function jobKeyFor(job) {
+  const target = jobTargetOf(job);
+  return target ? nasIdentity.browserJobKey(target.scope, job.id) : null;
+}
+
 function withJobTarget(job, target) {
   if (job && target) job.__nasTarget = target;
   return job;
@@ -1896,7 +1928,10 @@ async function loadRecentJobs() {
       for (const apiJob of apiJobs) {
         let job = apiJob;
         const idStr = String(job.id);
-        const live = liveBrowserProgress.get(idStr);
+        // This response came from `target`, so its rows own that NAS's
+        // progress entries and no others.
+        const live = liveBrowserProgress.get(
+          nasIdentity.browserJobKey(target.scope, idStr));
         if (live && BROWSER_LIVE_RETAIN_STATUSES.has(apiJob.status)) {
           job = mergeBrowserJobWithLive(apiJob, live, previousById.get(idStr));
         } else if (live) {
@@ -1918,7 +1953,9 @@ async function loadRecentJobs() {
       for (const previousJob of previousJobs) {
         const idStr = String(previousJob.id);
         if (apiIds.has(idStr)) continue;
-        const live = liveBrowserProgress.get(idStr);
+        // A retained row belongs to whichever NAS served it, which after a
+        // profile switch is not the one this poll asked.
+        const live = liveBrowserProgress.get(jobKeyFor(previousJob));
         if (!live) continue;
         if (now - (Number(live.updatedAt) || 0) <= LIVE_BROWSER_PROGRESS_TTL_MS
             && BROWSER_LIVE_RETAIN_STATUSES.has(previousJob.status)) {
@@ -2405,7 +2442,7 @@ async function cancelJob(jobId) {
     : null;
 
   if (resolveCancelAction(outcome, reconciled) === 'apply') {
-    await applyCancelledJob(jobId);
+    await applyCancelledJob(jobId, target);
     return;
   }
   showToast(`${detail || t('toast.failedToCancel')}`);
@@ -2414,7 +2451,7 @@ async function cancelJob(jobId) {
 // Everything that follows an accepted cancel. Shared by the direct path and
 // the reconcile path, so a cancel whose response was lost still stops the
 // browser-side upload instead of leaving it running.
-async function applyCancelledJob(jobId) {
+async function applyCancelledJob(jobId, target) {
   // DELETE is the authoritative user-cancel transition. Only once the NAS has
   // accepted it do we stop any browser-mode offscreen upload, marking the
   // resulting FAILED message as user-cancelled so background cleanup does not
@@ -2423,7 +2460,13 @@ async function applyCancelledJob(jobId) {
     await chrome.runtime.sendMessage({
       target: 'offscreen',
       type: 'CANCEL_BROWSER_JOB',
-      payload: { jobId, userCancelled: true },
+      // Scope-qualified: a bare id could abort the other NAS's upload when
+      // both were restored from the same database backup.
+      payload: {
+        jobId,
+        nasScope: target ? target.scope : undefined,
+        userCancelled: true,
+      },
     });
   } catch (_) {
     // No offscreen receiver (most jobs aren't browser-mode) — ignore.

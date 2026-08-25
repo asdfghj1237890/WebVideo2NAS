@@ -137,7 +137,16 @@
       apiKey: k,
       // Array form rather than a hand-rolled separator: no character has to
       // be assumed absent from a URL or a token.
+      //
+      // id answers "may this response be applied?" and therefore includes the
+      // credential: results fetched with a rotated key must not be attributed
+      // to the new configuration.
       id: JSON.stringify([e, k]),
+      // scope answers "which NAS owns this job?" and deliberately does NOT
+      // include the credential. Rotating a key must not orphan the progress of
+      // a job already running, and two profiles pointing at one NAS with
+      // different permissions still address the same job database.
+      scope: e,
     });
   }
 
@@ -148,20 +157,36 @@
   // Per-stream generation counters. A stream is one logical sequence of
   // requests — 'jobs', 'connection', 'detected' — where only the newest
   // response may paint.
-  //
-  // begin() returns a predicate that takes the *current* target as an
-  // argument rather than reading a global. That is deliberate: the caller has
-  // to state what "current" means, which is exactly the step that was being
-  // skipped when each of these races was written.
   function createRequestGuard() {
     const generations = new Map();
+
+    function open(stream) {
+      const next = (generations.get(stream) || 0) + 1;
+      generations.set(stream, next);
+      return function isNewest() {
+        return generations.get(stream) === next;
+      };
+    }
+
     return {
+      // Claim a generation before the target is known.
+      //
+      // Needed because some work has to happen before there is a target at
+      // all — a storage read, for instance, which rewrites the shared
+      // settings object. Guarding only the request would be too late: an
+      // older invocation whose read resolves last would rewrite settings to
+      // its own NAS and only *then* open its generation, so arriving last
+      // would make it look newest. Order the claim before the first await and
+      // that inversion cannot happen.
+      open,
+      // begin() returns a predicate that takes the *current* target as an
+      // argument rather than reading a global. That is deliberate: the caller
+      // has to state what "current" means, which is exactly the step that was
+      // being skipped when each of these races was written.
       begin(stream, target) {
-        const next = (generations.get(stream) || 0) + 1;
-        generations.set(stream, next);
+        const isNewest = open(stream);
         return function isStillCurrent(currentTarget) {
-          return generations.get(stream) === next
-            && sameNasTarget(target, currentTarget);
+          return isNewest() && sameNasTarget(target, currentTarget);
         };
       },
       // Test seam: how many requests a stream has issued.

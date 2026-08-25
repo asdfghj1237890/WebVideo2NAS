@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import { loadScriptIntoContext } from './helpers/load-script.js';
 
+// Live progress and job rows are namespaced by the NAS that owns them — see
+// nasIdentity.js. These tests all run against a single NAS.
+const NAS = 'http://nas.local';
+
 function makeChromeStub() {
   return {
     storage: {
@@ -198,10 +202,11 @@ describe('sidepanel.js helper functions', () => {
       document: makeDocumentStub(),
       window: {},
     });
-    ctx.__eval(`jobs = [{ id: 'j1', title: 'Job', status: 'failed', progress: 0 }];`);
+    ctx.__eval(`jobs = [{ id: 'j1', __nasTarget: sidepanelCore.nasTarget('http://nas.local', 'key'), title: 'Job', status: 'failed', progress: 0 }];`);
 
     ctx.handleBrowserJobProgress({
       jobId: 'j1',
+      nasScope: NAS,
       done: 8,
       total: 10,
       concurrency: 12,
@@ -214,7 +219,7 @@ describe('sidepanel.js helper functions', () => {
     expect(ctx.__eval('jobs[0].status')).toBe('failed');
     expect(ctx.__eval('jobs[0].progress')).toBe(0);
     expect(ctx.__eval('jobs[0].browserTransferTimings.cdn.failures')).toBe(1);
-    expect(ctx.__eval('liveBrowserProgress.get("j1").terminal')).toBe(true);
+    expect(ctx.__eval('liveBrowserProgress.get(JSON.stringify(["http://nas.local", "j1"])).terminal')).toBe(true);
   });
 
   it('monotonically overlays session progress through browser phases and keeps terminal metrics', async () => {
@@ -233,7 +238,7 @@ describe('sidepanel.js helper functions', () => {
     };
     const chrome = makeChromeStub();
     chrome.storage.session = {
-      get: async () => ({ wv2nasBrowserTransferSnapshots: { j1: snapshot } }),
+      get: async () => ({ wv2nasBrowserTransferSnapshots: { [JSON.stringify([NAS, 'j1'])]: snapshot } }),
     };
     const ctx = loadScriptIntoContext('sidepanel.js', {
       chrome,
@@ -264,7 +269,7 @@ describe('sidepanel.js helper functions', () => {
     expect(ctx.__eval('jobs[0].progress')).toBe(100);
     expect(ctx.__eval('jobs[0].browserConcurrency')).toBe(12);
     expect(ctx.__eval('jobs[0].browserTransferTimings.cdn.requests')).toBe(5);
-    expect(ctx.__eval('liveBrowserProgress.get("j1").terminal')).toBe(true);
+    expect(ctx.__eval('liveBrowserProgress.get(JSON.stringify(["http://nas.local", "j1"])).terminal')).toBe(true);
 
     // A newly opened sidepanel has no in-memory progress; terminal session
     // snapshots must still decorate the completed API row with diagnostics.
@@ -286,7 +291,7 @@ describe('sidepanel.js helper functions', () => {
     chrome.storage.session = {
       get: async () => ({
         wv2nasBrowserTransferSnapshots: {
-          j1: {
+          [JSON.stringify([NAS, 'j1'])]: {
             done: 2,
             total: 8,
             percent: 25,
@@ -320,7 +325,7 @@ describe('sidepanel.js helper functions', () => {
 
     expect(ctx.__eval('jobs[0].status')).toBe('failed');
     expect(ctx.__eval('jobs[0].progress')).toBe(25);
-    expect(ctx.__eval('liveBrowserProgress.get("j1").failed')).toBe(true);
+    expect(ctx.__eval('liveBrowserProgress.get(JSON.stringify(["http://nas.local", "j1"])).failed')).toBe(true);
     const failedHtml = ctx.getJobInnerHtml(ctx.__eval('jobs[0]'));
     expect(failedHtml).toContain('status-failed');
     expect(failedHtml).toContain('No error details available');
@@ -338,7 +343,7 @@ describe('sidepanel.js helper functions', () => {
     chrome.storage.session = {
       get: async () => ({
         wv2nasBrowserTransferSnapshots: {
-          j1: {
+          [JSON.stringify([NAS, 'j1'])]: {
             done: 10, total: 10, percent: 100, concurrency: 4,
             terminal: true, ts: Date.now() - 10 * 60 * 1000,
             transferTimings: {
@@ -374,14 +379,14 @@ describe('sidepanel.js helper functions', () => {
     });
     ctx.__eval(`
       settings = { nasEndpoint: 'http://nas.local', apiKey: 'key' };
-      jobs = [{ id: 'j1', title: 'Job', status: 'browser_uploading', progress: 30 }];
-      liveBrowserProgress.set('j1', { done: 3, total: 10, percent: 30, updatedAt: Date.now() });
+      jobs = [{ id: 'j1', __nasTarget: sidepanelCore.nasTarget('http://nas.local', 'key'), title: 'Job', status: 'browser_uploading', progress: 30 }];
+      liveBrowserProgress.set(JSON.stringify(["http://nas.local", "j1"]), { done: 3, total: 10, percent: 30, updatedAt: Date.now() });
     `);
 
     await ctx.loadRecentJobs();
     expect(ctx.__eval('jobs.length')).toBe(1);
     expect(ctx.__eval('jobs[0].status')).toBe('browser_uploading');
-    expect(ctx.__eval('liveBrowserProgress.has("j1")')).toBe(true);
+    expect(ctx.__eval('liveBrowserProgress.has(JSON.stringify(["http://nas.local", "j1"]))')).toBe(true);
   });
 
   it('does not let API polling renew an expired nonterminal overlay', async () => {
@@ -396,7 +401,7 @@ describe('sidepanel.js helper functions', () => {
     });
     ctx.__eval(`
       settings = { nasEndpoint: 'http://nas.local', apiKey: 'key' };
-      liveBrowserProgress.set('j1', {
+      liveBrowserProgress.set(JSON.stringify(["http://nas.local", "j1"]), {
         done: 8, total: 10, percent: 80,
         updatedAt: Date.now() - 10 * 60 * 1000,
       });
@@ -405,7 +410,7 @@ describe('sidepanel.js helper functions', () => {
     await ctx.loadRecentJobs();
     expect(ctx.__eval('jobs[0].status')).toBe('browser_pending');
     expect(ctx.__eval('jobs[0].progress')).toBe(0);
-    expect(ctx.__eval('liveBrowserProgress.has("j1")')).toBe(false);
+    expect(ctx.__eval('liveBrowserProgress.has(JSON.stringify(["http://nas.local", "j1"]))')).toBe(false);
   });
 
   it('discards an older overlapping jobs poll response', async () => {

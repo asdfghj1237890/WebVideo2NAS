@@ -1,6 +1,7 @@
 // Background Service Worker for Video Detection and Download Management
 
 if (typeof importScripts === 'function') {
+  importScripts('nasIdentity.js');
   importScripts('browserPipelineCore.js');
   importScripts('updateCheckCore.js');
 }
@@ -3499,7 +3500,11 @@ function _wv2nasTransferSnapshotPatch(msg) {
   const jobId = payload && payload.jobId;
   if (!jobId) return null;
 
-  const patch = { jobId: String(jobId), ts: Number(payload.ts) || Date.now() };
+  const patch = {
+    jobId: String(jobId),
+    nasScope: typeof payload.nasScope === 'string' ? payload.nasScope : '',
+    ts: Number(payload.ts) || Date.now(),
+  };
   const copyNumber = (targetKey, value) => {
     const parsed = Number(value);
     if (Number.isFinite(parsed) && parsed >= 0) patch[targetKey] = parsed;
@@ -3570,11 +3575,15 @@ function _wv2nasMergeTransferTimings(previous, incoming, incomingIsNewer) {
 async function _wv2nasPersistBrowserTransferSnapshot(msg) {
   const patch = _wv2nasTransferSnapshotPatch(msg);
   if (!patch) return false;
+  // An entry that names no NAS cannot be attributed later, and guessing would
+  // reintroduce exactly the contamination the composite key prevents.
+  const snapshotKey = globalThis.WV2NNasIdentity.browserJobKey(patch.nasScope, patch.jobId);
+  if (!snapshotKey) return false;
   return _wv2nasWithTransferSnapshotLock(async () => {
     const now = Date.now();
     const snapshots = await _wv2nasReadBrowserTransferSnapshots();
-    const previous = snapshots[patch.jobId] && typeof snapshots[patch.jobId] === 'object'
-      ? snapshots[patch.jobId]
+    const previous = snapshots[snapshotKey] && typeof snapshots[snapshotKey] === 'object'
+      ? snapshots[snapshotKey]
       : {};
     // Completion is sticky. A throttled PROGRESS sendMessage can arrive after
     // DONE because progress delivery is intentionally fire-and-forget; it must
@@ -3599,7 +3608,7 @@ async function _wv2nasPersistBrowserTransferSnapshot(msg) {
     const total = Number(merged.total) || 0;
     const done = Number(merged.done) || 0;
     merged.percent = total > 0 ? Math.min(100, (done / total) * 100) : 0;
-    snapshots[patch.jobId] = merged;
+    snapshots[snapshotKey] = merged;
 
     const kept = Object.entries(snapshots)
       .filter(([, snapshot]) => {
@@ -4244,6 +4253,10 @@ async function runBrowserSideJob({ nasEndpoint, apiKey, requestBody, title, page
       type: 'START_BROWSER_JOB',
       payload: {
         jobId,
+        // Job ids are unique per NAS, not globally — see nasIdentity.js. The
+        // uploader keys its job table and every message it sends by NAS + id,
+        // so it has to be told which NAS this one is for.
+        nasScope: nasEndpoint,
         nasEndpoint,
         apiKey,
         plan,
@@ -4383,6 +4396,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
       chrome.runtime.sendMessage({
         action: 'browserJobProgress',
         jobId: p.jobId,
+        nasScope: p.nasScope,
         done: p.done,
         total: p.total,
         concurrency: p.concurrency,

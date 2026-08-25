@@ -62,14 +62,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.target !== 'offscreen') return false;
 
   if (msg.type === 'START_BROWSER_JOB') {
-    const { jobId } = msg.payload;
-    if (jobs.has(jobId)) {
+    const { jobId, nasScope } = msg.payload;
+    // Job ids are unique per NAS, not globally. Two NAS restored from the same
+    // backup issue the same ids, and both can have work in flight here at once
+    // after a profile switch — so the uploader's table, and every message it
+    // sends, is keyed by NAS + id. See nasIdentity.js.
+    const jobKey = globalThis.WV2NNasIdentity.browserJobKey(nasScope, jobId);
+    if (!jobKey) {
+      sendResponse({ ok: false, error: 'job is missing its NAS scope' });
+      return false;
+    }
+    if (jobs.has(jobKey)) {
       sendResponse({ ok: false, error: 'job already running' });
       return false;
     }
     const controller = new AbortController();
     const state = { controller, userCancelled: false };
-    jobs.set(jobId, state);
+    jobs.set(jobKey, state);
 
     // Codex review #16: heartbeat ticker. Sends a liveness signal
     // every HEARTBEAT_INTERVAL_MS to the SW so the watchdog at next
@@ -79,7 +88,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.runtime.sendMessage({
         type: 'BROWSER_JOB_HEARTBEAT',
         target: 'service-worker',
-        payload: { jobId, ts: Date.now() },
+        payload: { jobId, nasScope, ts: Date.now() },
       }).catch(() => {});
     }, HEARTBEAT_INTERVAL_MS);
     // Send one immediately so a recent persisted entry is seeded
@@ -87,7 +96,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.runtime.sendMessage({
       type: 'BROWSER_JOB_HEARTBEAT',
       target: 'service-worker',
-      payload: { jobId, ts: Date.now() },
+      payload: { jobId, nasScope, ts: Date.now() },
     }).catch(() => {});
 
     // Throttled progress emitter. segmentDownloader.runJob calls
@@ -110,6 +119,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         target: 'service-worker',
         payload: {
           jobId,
+          nasScope,
           done,
           total,
           concurrency,
@@ -129,7 +139,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await deliverCompletionWhileAlive({
           type: 'BROWSER_JOB_DONE',
           target: 'service-worker',
-          payload: { jobId, summary },
+          payload: { jobId, nasScope, summary },
         });
       })
       .catch(async (err) => {
@@ -148,6 +158,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           target: 'service-worker',
           payload: {
             jobId,
+            nasScope,
             error: String(err && err.message || err),
             finalizeAttempted: !!(err && err.finalizeAttempted),
             userCancelled: !!state.userCancelled,
@@ -160,7 +171,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       })
       .finally(() => {
         clearInterval(heartbeatTimer);
-        jobs.delete(jobId);
+        jobs.delete(jobKey);
       });
 
     sendResponse({ ok: true });
@@ -168,7 +179,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'CANCEL_BROWSER_JOB') {
-    const state = jobs.get(msg.payload.jobId);
+    // Match on NAS + id. A bare id could abort the other NAS's upload when
+    // both were restored from the same database backup.
+    const cancelKey = globalThis.WV2NNasIdentity.browserJobKey(
+      msg.payload.nasScope, msg.payload.jobId);
+    const state = cancelKey ? jobs.get(cancelKey) : null;
     if (state) {
       state.userCancelled = state.userCancelled || !!msg.payload.userCancelled;
       state.controller.abort();

@@ -144,3 +144,45 @@ describe('a stale connection check cannot paint the wrong profile', () => {
     expect(painted).toContain('connected');
   });
 });
+
+describe('a late storage read cannot revert the current NAS', () => {
+  it('discards an invocation whose settings load resolves after a newer one', async () => {
+    // checkConnection awaits loadSettingsFromStorage(), which rewrites the
+    // shared settings object. An older invocation resolving last would put its
+    // own NAS back into settings and only then claim a generation — arriving
+    // last would make it look newest. The claim happens before the await, so
+    // it is already stale by the time it can touch anything.
+    const { ctx } = makeCtx();
+    const painted = [];
+    ctx.setConnectionState = (state, label) => { painted.push({ state, label }); };
+
+    let releaseA = null;
+    ctx.loadSettingsFromStorage = () => new Promise((resolve) => {
+      if (!releaseA) {
+        // First (stale) invocation: hold its read open.
+        releaseA = () => {
+          ctx.__eval(`settings = { nasEndpoint: '${NAS_A}', apiKey: 'ka' };`);
+          resolve();
+        };
+        return;
+      }
+      resolve();
+    });
+
+    ctx.__eval(`settings = { nasEndpoint: '${NAS_A}', apiKey: 'ka' };`);
+    const stale = ctx.checkConnection();
+    await new Promise((r) => setTimeout(r, 0));
+
+    // A newer check runs and completes against B.
+    ctx.__eval(`settings = { nasEndpoint: '${NAS_B}', apiKey: 'kb' };`);
+    await ctx.checkConnection();
+    const afterNewest = painted.length;
+
+    // Now the stale read finally lands, reverting settings to A.
+    releaseA();
+    await stale;
+
+    // It must not paint, and must not leave A as the effective NAS.
+    expect(painted.length).toBe(afterNewest);
+  });
+});

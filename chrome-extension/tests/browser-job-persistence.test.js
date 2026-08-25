@@ -9,6 +9,12 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { loadScriptIntoContext } from './helpers/load-script.js';
+
+// Job identity is namespaced by NAS — see nasIdentity.js. Snapshots are keyed
+// by [scope, jobId], and a message that names no NAS is deliberately not
+// persisted at all.
+const NAS = 'http://nas.example:52052';
+const KEY = (jobId) => JSON.stringify([NAS, jobId]);
 import path from 'node:path';
 
 const BACKGROUND_SCRIPT = path.resolve(__dirname, '..', 'background.js');
@@ -92,14 +98,14 @@ describe('browser transfer snapshots', () => {
     await ctx._wv2nasPersistBrowserTransferSnapshot({
       type: 'BROWSER_JOB_PROGRESS',
       payload: {
-        jobId: 'job-transfer', done: 3, total: 10, concurrency: 6, ts: Date.now(),
+        jobId: 'job-transfer', nasScope: NAS, done: 3, total: 10, concurrency: 6, ts: Date.now(),
         transferTimings: { cdn: { bytes: 30 }, nas: { bytes: 20 } },
       },
     });
     await ctx._wv2nasPersistBrowserTransferSnapshot({
       type: 'BROWSER_JOB_DONE',
       payload: {
-        jobId: 'job-transfer',
+        jobId: 'job-transfer', nasScope: NAS,
         summary: {
           totalSegments: 10,
           concurrency: 4,
@@ -109,9 +115,9 @@ describe('browser transfer snapshots', () => {
     });
 
     const snapshot = chrome.storage.session._state
-      .wv2nasBrowserTransferSnapshots['job-transfer'];
+      .wv2nasBrowserTransferSnapshots[KEY('job-transfer')];
     expect(snapshot).toMatchObject({
-      jobId: 'job-transfer', done: 10, total: 10, percent: 100,
+      jobId: 'job-transfer', nasScope: NAS, done: 10, total: 10, percent: 100,
       concurrency: 4, terminal: true, failed: false,
       transferTimings: { cdn: { bytes: 100 }, nas: { bytes: 100 } },
     });
@@ -122,17 +128,17 @@ describe('browser transfer snapshots', () => {
     const ctx = loadBackground({ chrome });
     await ctx._wv2nasPersistBrowserTransferSnapshot({
       type: 'BROWSER_JOB_PROGRESS',
-      payload: { jobId: 'job-failed', done: 2, total: 8, ts: Date.now() },
+      payload: { jobId: 'job-failed', nasScope: NAS, done: 2, total: 8, ts: Date.now() },
     });
     await ctx._wv2nasPersistBrowserTransferSnapshot({
       type: 'BROWSER_JOB_FAILED',
       payload: {
-        jobId: 'job-failed', concurrency: 5, done: 7, total: 8,
+        jobId: 'job-failed', nasScope: NAS, concurrency: 5, done: 7, total: 8,
         transferTimings: { cdn: { failures: 1 }, nas: { failures: 2 } },
       },
     });
 
-    expect(chrome.storage.session._state.wv2nasBrowserTransferSnapshots['job-failed'])
+    expect(chrome.storage.session._state.wv2nasBrowserTransferSnapshots[KEY('job-failed')])
       .toMatchObject({
         done: 7, total: 8, percent: 87.5, concurrency: 5,
         terminal: true, failed: true,
@@ -147,7 +153,7 @@ describe('browser transfer snapshots', () => {
     await ctx._wv2nasPersistBrowserTransferSnapshot({
       type: 'BROWSER_JOB_DONE',
       payload: {
-        jobId: 'job-race',
+        jobId: 'job-race', nasScope: NAS,
         summary: {
           totalSegments: 10, concurrency: 6,
           transferTimings: {
@@ -160,7 +166,7 @@ describe('browser transfer snapshots', () => {
     await ctx._wv2nasPersistBrowserTransferSnapshot({
       type: 'BROWSER_JOB_PROGRESS',
       payload: {
-        jobId: 'job-race', done: 4, total: 10, concurrency: 6, ts: now - 1000,
+        jobId: 'job-race', nasScope: NAS, done: 4, total: 10, concurrency: 6, ts: now - 1000,
         transferTimings: {
           cdn: { bytes: 40, attemptedBytes: 40, requests: 4, failures: 0, requestMs: 200, activeMs: 100, inFlight: 2 },
           nas: { bytes: 40, attemptedBytes: 40, requests: 4, failures: 0, requestMs: 220, activeMs: 120, inFlight: 2 },
@@ -168,7 +174,7 @@ describe('browser transfer snapshots', () => {
       },
     });
 
-    const snapshot = chrome.storage.session._state.wv2nasBrowserTransferSnapshots['job-race'];
+    const snapshot = chrome.storage.session._state.wv2nasBrowserTransferSnapshots[KEY('job-race')];
     expect(snapshot).toMatchObject({ terminal: true, failed: false, done: 10, percent: 100 });
     expect(snapshot.transferTimings.cdn).toMatchObject({ bytes: 100, requests: 10, inFlight: 0 });
     expect(snapshot.transferTimings.nas).toMatchObject({ bytes: 100, requests: 11, failures: 1, inFlight: 0 });
@@ -179,20 +185,20 @@ describe('browser transfer snapshots', () => {
     const ctx = loadBackground({ chrome });
     const now = Date.now();
     chrome.storage.session._state.wv2nasBrowserTransferSnapshots = {
-      expired: { jobId: 'expired', ts: now - 25 * 60 * 60 * 1000 },
+      expired: { jobId: 'expired', nasScope: NAS, ts: now - 25 * 60 * 60 * 1000 },
     };
     for (let i = 0; i < 31; i += 1) {
       await ctx._wv2nasPersistBrowserTransferSnapshot({
         type: 'BROWSER_JOB_PROGRESS',
-        payload: { jobId: `job-${i}`, done: i, total: 31, ts: now + i },
+        payload: { jobId: `job-${i}`, nasScope: NAS, done: i, total: 31, ts: now + i },
       });
     }
 
     const snapshots = chrome.storage.session._state.wv2nasBrowserTransferSnapshots;
     expect(Object.keys(snapshots)).toHaveLength(30);
     expect(snapshots.expired).toBeUndefined();
-    expect(snapshots['job-30']).toBeDefined();
-    expect(snapshots['job-0']).toBeUndefined();
+    expect(snapshots[KEY('job-30')]).toBeDefined();
+    expect(snapshots[KEY('job-0')]).toBeUndefined();
   });
 });
 
@@ -291,7 +297,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const oldStart = Date.now() - 2 * 60 * 60 * 1000; // 2 hours ago
     chrome.storage.local._state.wv2nasBrowserJobs = {
       'old-job': {
-        jobId: 'old-job', ruleIds: [10000, 15000], dnrSlot: 0,
+        jobId: 'old-job', nasScope: NAS, ruleIds: [10000, 15000], dnrSlot: 0,
         startedAt: oldStart,
         nasEndpoint: 'http://nas/', apiKey: 'k',
       },
@@ -321,7 +327,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'recent-job': {
-            jobId: 'recent-job', ruleIds: [10000], dnrSlot: 0,
+            jobId: 'recent-job', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: recentStart,
             nasEndpoint: 'http://nas/', apiKey: 'k',
           },
@@ -348,7 +354,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     fetchCalls.length = 0;
     chrome.storage.local._state.wv2nasBrowserJobs = {
       'pending-abort': {
-        jobId: 'pending-abort',
+        jobId: 'pending-abort', nasScope: NAS,
         ruleIds: [],
         dnrSlot: null,
         startedAt: recent,
@@ -385,11 +391,11 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     const recentStart = Date.now() - 1 * 60 * 1000;
     chrome.storage.local._state.wv2nasBrowserJobs = {
       'old': {
-        jobId: 'old', ruleIds: [10000], dnrSlot: 0,
+        jobId: 'old', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
         startedAt: oldStart, nasEndpoint: 'http://nas/', apiKey: 'k',
       },
       'recent': {
-        jobId: 'recent', ruleIds: [10100], dnrSlot: 1,
+        jobId: 'recent', nasScope: NAS, ruleIds: [10100], dnrSlot: 1,
         startedAt: recentStart, nasEndpoint: 'http://nas/', apiKey: 'k',
       },
     };
@@ -401,7 +407,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     expect(dnrCalls).toHaveLength(1);
     expect(dnrCalls[0]).toEqual({ removeRuleIds: [10000] });
     expect(chrome.storage.local._state.wv2nasBrowserJobs).toEqual({
-      'recent': expect.objectContaining({ jobId: 'recent' }),
+      'recent': expect.objectContaining({ jobId: 'recent', nasScope: NAS }),
     });
   });
 
@@ -451,7 +457,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'malformed-survivor': {
-            jobId: 'malformed-survivor', ruleIds: [10000],
+            jobId: 'malformed-survivor', nasScope: NAS, ruleIds: [10000],
             startedAt: recentStart,
             nasEndpoint: 'http://nas/', apiKey: 'k',
             // dnrSlot intentionally missing
@@ -481,7 +487,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'survivor-job': {
-            jobId: 'survivor-job',
+            jobId: 'survivor-job', nasScope: NAS,
             ruleIds: [10000, 15000],
             dnrSlot: 0,
             startedAt: recentStart,
@@ -510,7 +516,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     await ctx._wv2nasHandleDurableCompletion({
       target: 'service-worker',
       type: 'BROWSER_JOB_DONE',
-      payload: { jobId: 'survivor-job', summary: { totalSegments: 200 } },
+      payload: { jobId: 'survivor-job', nasScope: NAS, summary: { totalSegments: 200 } },
     });
 
     // DNR rules removed.
@@ -536,7 +542,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     await ctx._wv2nasHandleDurableCompletion({
       target: 'service-worker',
       type: 'BROWSER_JOB_DONE',
-      payload: { jobId: 'never-existed' },
+      payload: { jobId: 'never-existed', nasScope: NAS },
     });
 
     // No DNR calls, no abort calls, no errors.
@@ -550,7 +556,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'failed-job': {
-            jobId: 'failed-job',
+            jobId: 'failed-job', nasScope: NAS,
             ruleIds: [10000],
             dnrSlot: 2,
             startedAt: recentStart,
@@ -569,7 +575,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       target: 'service-worker',
       type: 'BROWSER_JOB_FAILED',
       payload: {
-        jobId: 'failed-job',
+        jobId: 'failed-job', nasScope: NAS,
         error: 'Segment 47 returned 403',
         finalizeAttempted: false,
       },
@@ -594,7 +600,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'failed-job': {
-            jobId: 'failed-job',
+            jobId: 'failed-job', nasScope: NAS,
             ruleIds: [10000],
             dnrSlot: 2,
             startedAt: recentStart,
@@ -614,7 +620,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       target: 'service-worker',
       type: 'BROWSER_JOB_FAILED',
       payload: {
-        jobId: 'failed-job',
+        jobId: 'failed-job', nasScope: NAS,
         error: 'Segment 47 returned 403',
         finalizeAttempted: false,
       },
@@ -639,7 +645,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'cancelled-job': {
-            jobId: 'cancelled-job',
+            jobId: 'cancelled-job', nasScope: NAS,
             ruleIds: [10000],
             dnrSlot: 2,
             startedAt: recentStart,
@@ -658,7 +664,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       target: 'service-worker',
       type: 'BROWSER_JOB_FAILED',
       payload: {
-        jobId: 'cancelled-job',
+        jobId: 'cancelled-job', nasScope: NAS,
         error: 'cancelled',
         finalizeAttempted: false,
         userCancelled: true,
@@ -677,7 +683,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'finalize-failed-job': {
-            jobId: 'finalize-failed-job',
+            jobId: 'finalize-failed-job', nasScope: NAS,
             ruleIds: [10000],
             dnrSlot: 3,
             startedAt: recentStart,
@@ -696,7 +702,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       target: 'service-worker',
       type: 'BROWSER_JOB_FAILED',
       payload: {
-        jobId: 'finalize-failed-job',
+        jobId: 'finalize-failed-job', nasScope: NAS,
         error: 'finalize timeout',
         finalizeAttempted: true,  // ← critical
       },
@@ -723,7 +729,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'slow-but-alive': {
-            jobId: 'slow-but-alive', ruleIds: [10000], dnrSlot: 0,
+            jobId: 'slow-but-alive', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: oldStart, lastHeartbeat: recentHeartbeat,
             nasEndpoint: 'http://nas/', apiKey: 'k',
           },
@@ -753,7 +759,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'heartbeat-died': {
-            jobId: 'heartbeat-died', ruleIds: [10000], dnrSlot: 0,
+            jobId: 'heartbeat-died', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: recentStart, lastHeartbeat: oldHeartbeat,
             nasEndpoint: 'http://nas/', apiKey: 'k',
           },
@@ -779,7 +785,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'legacy-no-heartbeat': {
-            jobId: 'legacy-no-heartbeat', ruleIds: [10000], dnrSlot: 0,
+            jobId: 'legacy-no-heartbeat', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: oldStart,  // no lastHeartbeat field
             nasEndpoint: 'http://nas/', apiKey: 'k',
           },
@@ -799,7 +805,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'tracker': {
-            jobId: 'tracker', ruleIds: [10000], dnrSlot: 0,
+            jobId: 'tracker', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: Date.now(), nasEndpoint: 'http://nas/', apiKey: 'k',
           },
         },
@@ -821,7 +827,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'done-job': {
-            jobId: 'done-job', ruleIds: [10000], dnrSlot: 0,
+            jobId: 'done-job', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: Date.now(), nasEndpoint: 'http://nas/', apiKey: 'k',
           },
         },
@@ -900,7 +906,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'lone-job': {
-            jobId: 'lone-job', ruleIds: [10000], dnrSlot: 0,
+            jobId: 'lone-job', nasScope: NAS, ruleIds: [10000], dnrSlot: 0,
             startedAt: ts, lastHeartbeat: recent,
             nasEndpoint: 'http://nas/', apiKey: 'k',
           },
@@ -915,7 +921,7 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
     await ctx._wv2nasHandleDurableCompletion({
       target: 'service-worker',
       type: 'BROWSER_JOB_DONE',
-      payload: { jobId: 'lone-job' },
+      payload: { jobId: 'lone-job', nasScope: NAS },
     });
 
     expect(ctx.__eval("_wv2nasActiveBrowserJobs.size")).toBe(0);
@@ -935,9 +941,9 @@ describe('_wv2nasRecoverStaleBrowserJobs', () => {
 
     const oldStart = Date.now() - 2 * 60 * 60 * 1000;
     chrome.storage.local._state.wv2nasBrowserJobs = {
-      'a': { jobId: 'a', ruleIds: [10000], dnrSlot: 0, startedAt: oldStart,
+      'a': { jobId: 'a', nasScope: NAS, ruleIds: [10000], dnrSlot: 0, startedAt: oldStart,
              nasEndpoint: 'http://nas/', apiKey: 'k' },
-      'b': { jobId: 'b', ruleIds: [10100], dnrSlot: 1, startedAt: oldStart,
+      'b': { jobId: 'b', nasScope: NAS, ruleIds: [10100], dnrSlot: 1, startedAt: oldStart,
              nasEndpoint: 'http://nas/', apiKey: 'k' },
     };
     dnrCalls.length = 0;
@@ -1043,7 +1049,7 @@ describe('persistence concurrency safety (Codex adversarial-review)', () => {
     const chrome = makeChromeStub({
       storageInitial: {
         wv2nasBrowserJobs: {
-          'existing': { jobId: 'existing', dnrSlot: 0 },
+          'existing': { jobId: 'existing', nasScope: NAS, dnrSlot: 0 },
         },
       },
     });
@@ -1097,7 +1103,7 @@ describe('persistence concurrency safety (Codex adversarial-review)', () => {
       storageInitial: {
         wv2nasBrowserJobs: {
           'stale': {
-            jobId: 'stale', dnrSlot: 0, startedAt: oldStart,
+            jobId: 'stale', nasScope: NAS, dnrSlot: 0, startedAt: oldStart,
             lastHeartbeat: 0, ruleIds: [],
             nasEndpoint: 'http://nas/', apiKey: 'k',
           },

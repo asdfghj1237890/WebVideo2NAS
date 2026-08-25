@@ -72,10 +72,12 @@ describe('cancelJob when the DELETE response never arrives', () => {
 
     // This is the whole point: without reconciliation the offscreen upload
     // kept running against a job the NAS had already cancelled.
+    // The payload is scope-qualified now: a bare id could abort the other
+    // NAS's upload when both were restored from the same backup.
     expect(offscreenMessages).toContainEqual({
       target: 'offscreen',
       type: 'CANCEL_BROWSER_JOB',
-      payload: { jobId: 'job-1', userCancelled: true },
+      payload: { jobId: 'job-1', nasScope: 'http://nas.example:52052', userCancelled: true },
     });
     expect(toasts.length).toBe(1);
   });

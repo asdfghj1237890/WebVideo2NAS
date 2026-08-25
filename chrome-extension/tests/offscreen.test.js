@@ -1,5 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { loadScriptIntoContext } from './helpers/load-script.js';
+
+// offscreen.html loads nasIdentity.js as a classic script before the module,
+// so globalThis carries it by the time offscreen.js runs. Mirror that here.
+function installNasIdentity() {
+  const ctx = loadScriptIntoContext('nasIdentity.js', { window: {} });
+  globalThis.WV2NNasIdentity = ctx.WV2NNasIdentity;
+}
+
+// Job ids are namespaced by NAS — see nasIdentity.js.
+const NAS = 'http://nas.example:52052';
+
 
 async function loadOffscreen({ runJobImpl, sendMessageImpl }) {
   vi.resetModules();
@@ -15,6 +27,7 @@ async function loadOffscreen({ runJobImpl, sendMessageImpl }) {
   vi.doMock('../segmentDownloader.js', () => ({
     runJob: vi.fn(runJobImpl || (async () => ({ totalSegments: 1 }))),
   }));
+  installNasIdentity();
   await import('../offscreen.js');
   return { chrome: globalThis.chrome, listeners };
 }
@@ -37,7 +50,8 @@ function sendCancel(listeners, jobId, payload = {}) {
   let response;
   for (const listener of listeners) {
     listener(
-      { type: 'CANCEL_BROWSER_JOB', target: 'offscreen', payload: { jobId, ...payload } },
+      // Cancel matches on NAS + id, so the scope has to travel with it.
+      { type: 'CANCEL_BROWSER_JOB', target: 'offscreen', payload: { jobId, nasScope: NAS, ...payload } },
       {},
       (value) => { response = value; },
     );
@@ -71,7 +85,7 @@ describe('offscreen completion delivery', () => {
     });
 
     const ack = sendStart(listeners, {
-      jobId: 'job-retry-done',
+      jobId: 'job-retry-done', nasScope: NAS,
       nasEndpoint: 'http://nas.local',
       apiKey: 'k',
       plan: { tracks: { video: { segments: [] } } },
@@ -85,7 +99,7 @@ describe('offscreen completion delivery', () => {
 
     expect(doneMessages()).toHaveLength(2);
     expect(doneMessages()[1].payload).toEqual({
-      jobId: 'job-retry-done',
+      jobId: 'job-retry-done', nasScope: NAS,
       summary: { totalSegments: 3 },
     });
   });
@@ -105,7 +119,7 @@ describe('offscreen completion delivery', () => {
     });
 
     expect(sendStart(listeners, {
-      jobId: 'job-negative-ack',
+      jobId: 'job-negative-ack', nasScope: NAS,
       nasEndpoint: 'http://nas.local',
       apiKey: 'k',
       plan: { tracks: { video: { segments: [] } } },
@@ -137,7 +151,7 @@ describe('offscreen completion delivery', () => {
     });
 
     expect(sendStart(listeners, {
-      jobId: 'job-progress-timing',
+      jobId: 'job-progress-timing', nasScope: NAS,
       nasEndpoint: 'http://nas.local',
       apiKey: 'k',
       plan: { tracks: { video: { segments: [] } } },
@@ -146,7 +160,7 @@ describe('offscreen completion delivery', () => {
     await expect(progressMessage).resolves.toMatchObject({
       type: 'BROWSER_JOB_PROGRESS',
       payload: {
-        jobId: 'job-progress-timing',
+        jobId: 'job-progress-timing', nasScope: NAS,
         done: 1,
         total: 2,
         concurrency: 12,
@@ -172,7 +186,7 @@ describe('offscreen completion delivery', () => {
     });
 
     const ack = sendStart(listeners, {
-      jobId: 'job-retry-done-long',
+      jobId: 'job-retry-done-long', nasScope: NAS,
       nasEndpoint: 'http://nas.local',
       apiKey: 'k',
       plan: { tracks: { video: { segments: [] } } },
@@ -192,7 +206,7 @@ describe('offscreen completion delivery', () => {
 
     expect(doneMessages()).toHaveLength(4);
     expect(doneMessages()[3].payload).toEqual({
-      jobId: 'job-retry-done-long',
+      jobId: 'job-retry-done-long', nasScope: NAS,
       summary: { totalSegments: 5 },
     });
     expect(heartbeatMessages().length).toBeGreaterThan(heartbeatCountAfterFailedBurst);
@@ -207,7 +221,7 @@ describe('offscreen completion delivery', () => {
     });
 
     const ack = sendStart(listeners, {
-      jobId: 'job-cancel-failed',
+      jobId: 'job-cancel-failed', nasScope: NAS,
       nasEndpoint: 'http://nas.local',
       apiKey: 'k',
       plan: { tracks: { video: { segments: [] } } },
@@ -223,7 +237,7 @@ describe('offscreen completion delivery', () => {
 
     expect(failedMessages).toHaveLength(1);
     expect(failedMessages[0].payload).toMatchObject({
-      jobId: 'job-cancel-failed',
+      jobId: 'job-cancel-failed', nasScope: NAS,
       error: 'cancelled',
       finalizeAttempted: false,
       userCancelled: true,
@@ -253,7 +267,7 @@ describe('offscreen completion delivery', () => {
     });
 
     const ack = sendStart(listeners, {
-      jobId: 'job-retry-failed',
+      jobId: 'job-retry-failed', nasScope: NAS,
       nasEndpoint: 'http://nas.local',
       apiKey: 'k',
       plan: { tracks: { video: { segments: [] } } },
@@ -267,7 +281,7 @@ describe('offscreen completion delivery', () => {
 
     expect(failedMessages).toHaveLength(2);
     expect(failedMessages[1].payload).toMatchObject({
-      jobId: 'job-retry-failed',
+      jobId: 'job-retry-failed', nasScope: NAS,
       error: 'finalize ambiguous',
       finalizeAttempted: true,
       done: 7,
