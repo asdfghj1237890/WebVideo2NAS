@@ -70,10 +70,15 @@ function selectorsFor(html, id) {
   return [`#${id}`, ...classes.map((c) => `.${c}`)];
 }
 
+// Escapes every regex metacharacter, not just the dot and hash that selectors
+// usually contain. The narrower version left backslashes alone, which would let
+// a class name alter the pattern instead of being matched by it.
+const escapeForRegex = (s) => s.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+
 // Does the stylesheet set display for any of those selectors?
 function setsDisplay(css, selectors) {
   return selectors.some((sel) => {
-    const re = new RegExp(`(^|[,{}\\s])${sel.replace(/[.#]/g, '\\$&')}[^{,]*\\{[^}]*display\\s*:`, 'm');
+    const re = new RegExp(`(^|[,{}\\s])${escapeForRegex(sel)}[^{,]*\\{[^}]*display\\s*:`, 'm');
     return re.test(css);
   });
 }
