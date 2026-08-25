@@ -68,18 +68,18 @@ describe('the tile badge only claims what is true', () => {
     // up. isNowPlaying is set by the click heuristic; nothing is playing.
     const html = renderWith({ ...base, duration: 7, isNowPlaying: true });
     expect(html).not.toContain('LIVE');
-    expect(html).not.toContain('PLAYING');
+    expect(html).not.toContain('ACTIVE');
   });
 
   it('says LIVE only for an actual live stream', () => {
     const html = renderWith({ ...base, isLive: true });
     expect(html).toContain('LIVE');
-    expect(html).not.toContain('PLAYING');
+    expect(html).not.toContain('ACTIVE');
   });
 
-  it('says PLAYING once segments have actually been seen', () => {
+  it('says ACTIVE once segments have actually been seen', () => {
     const html = renderWith({ ...base, duration: 7, playbackObserved: true });
-    expect(html).toContain('PLAYING');
+    expect(html).toContain('ACTIVE');
     expect(html).not.toContain('>LIVE<');
   });
 
@@ -88,12 +88,39 @@ describe('the tile badge only claims what is true', () => {
     // enough, and live is the more specific claim.
     const html = renderWith({ ...base, isLive: true, playbackObserved: true });
     expect(html).toContain('LIVE');
-    expect(html).not.toContain('PLAYING');
+    expect(html).not.toContain('ACTIVE');
   });
 
   it('does not let the click heuristic alone produce either label', () => {
     const html = renderWith({ ...base, duration: 7, isNowPlaying: true, playbackObserved: false });
     expect(html).not.toContain('LIVE');
+    expect(html).not.toContain('ACTIVE');
+  });
+});
+
+describe('the badge does not claim playback it cannot see', () => {
+  it('never says PLAYING, because nothing observed proves it', () => {
+    // playbackObserved is set on the FIRST matching segment request, with no
+    // threshold and no continuity requirement. A player preloading an advert
+    // behind an age gate satisfies it while the user has agreed to nothing and
+    // no video is on screen. The evidence supports "this stream is being
+    // pulled" and stops there.
+    const html = renderWith({ ...base, duration: 7, playbackObserved: true });
+    expect(html).not.toContain('PLAYING');
+  });
+
+  it('marks a preloading advert as active, which is what it is', () => {
+    // Reported as a bug when the label said PLAYING. The signal was right; the
+    // word was too strong. ACTIVE is the useful, true claim — it tells you
+    // which of several candidates the page is actually fetching.
+    const ad = {
+      ...base,
+      url: 'https://cdn.example.com/ad/welcome/720p/chunklist_b2000000.m3u8',
+      duration: 7,
+      playbackObserved: true,
+    };
+    const html = renderWith(ad);
+    expect(html).toContain('ACTIVE');
     expect(html).not.toContain('PLAYING');
   });
 });

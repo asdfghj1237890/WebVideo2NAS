@@ -1465,11 +1465,18 @@ function renderDetectedUrls(opts) {
     // that anything is playing, so a 7-second VOD ad on a page still showing
     // its age gate was being labelled LIVE.
     //
-    // playbackObserved is the real signal — media segments actually seen —
-    // and background.js sets it with a comment about keeping LIVE responsive,
-    // which is what this was always meant to read.
+    // playbackObserved is the real signal — but it means one media segment for
+    // this URL was fetched, set on the first match with no threshold and no
+    // continuity requirement. A player preloading an advert behind an age gate
+    // satisfies it while nothing is playing and the user has agreed to
+    // nothing, so labelling it PLAYING overclaimed in the same way LIVE did,
+    // one level down.
+    //
+    // What it honestly supports is "this is the stream the page is pulling",
+    // which is also what the badge is useful for: picking the right candidate
+    // out of several. ACTIVE says that and nothing more.
     const isLiveStream = !!urlInfo.isLive;
-    const isPlayingNow = !isLiveStream && !!urlInfo.playbackObserved;
+    const isStreamActive = !isLiveStream && !!urlInfo.playbackObserved;
 
     // Browser-side play-first gate: keep the candidate visible, but
     // lock sending until the page's player has started and issued the
@@ -1499,10 +1506,10 @@ function renderDetectedUrls(opts) {
             ${thumbnail ? `<img class="thumb-img" src="${escapeHtml(thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
             <span class="thumb-label">${escapeHtml(videoType)}</span>
             ${top ? `<span class="thumb-quality">${escapeHtml(top)}</span>` : ''}
-            ${(isLiveStream || isPlayingNow) ? `
+            ${(isLiveStream || isStreamActive) ? `
               <span class="thumb-live">
                 <span class="live-dot"></span>
-                <span class="live-text">${isLiveStream ? 'LIVE' : 'PLAYING'}</span>
+                <span class="live-text">${isLiveStream ? 'LIVE' : 'ACTIVE'}</span>
               </span>
             ` : ''}
             ${isMany && requiresPlayFirst ? `
