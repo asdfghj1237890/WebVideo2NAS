@@ -3,7 +3,7 @@ WebVideo2NAS - API Gateway
 FastAPI application for managing web video download jobs (M3U8 and MP4)
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, HttpUrl, model_validator
@@ -156,6 +156,7 @@ app.add_middleware(
     allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-WV2N-Active-Jobs"],
 )
 
 # Database setup
@@ -576,10 +577,12 @@ def submit_download(
 async def list_jobs(
     status: Optional[str] = None,
     limit: int = 50,
+    include_active: bool = False,
     db: Session = Depends(get_db),
-    api_key: str = Depends(verify_api_key_read)
+    api_key: str = Depends(verify_api_key_read),
+    response: Response = None,
 ):
-    """List all jobs with optional status filter"""
+    """List recent jobs, optionally including unfinished jobs of any age."""
     try:
         query = """
             SELECT j.id, j.url, j.title, j.status, j.progress, j.created_at,
@@ -594,8 +597,21 @@ async def list_jobs(
         if status:
             query += " WHERE j.status = :status"
             params["status"] = status
+        elif include_active:
+            # Apply the history limit before adding unfinished work. Sorting
+            # a truncated result on the client cannot recover an older job.
+            # Keep this in one query/snapshot so a completion cannot fall
+            # between separate active and history requests.
+            query += """
+                WHERE j.status NOT IN ('completed', 'failed', 'cancelled')
+                   OR j.id IN (
+                       SELECT id FROM jobs ORDER BY created_at DESC LIMIT :limit
+                   )
+            """
 
-        query += " ORDER BY j.created_at DESC LIMIT :limit"
+        query += " ORDER BY j.created_at DESC"
+        if status or not include_active:
+            query += " LIMIT :limit"
         params["limit"] = limit
 
         result = db.execute(text(query), params)
@@ -619,6 +635,8 @@ async def list_jobs(
                 error_message=row.error_message
             ))
 
+        if response is not None and include_active and not status:
+            response.headers["X-WV2N-Active-Jobs"] = "complete"
         return jobs
 
     except Exception as e:

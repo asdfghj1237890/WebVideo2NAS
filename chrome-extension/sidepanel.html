@@ -18,33 +18,6 @@
       <header class="wv-header">
         <div class="brand-block">
           <div class="brand">WebVideo2NAS</div>
-          <div class="status-row">
-            <div id="connectionStatus" class="conn-chip checking" title="">
-              <span id="statusIcon" class="conn-dot" aria-hidden="true"></span>
-              <span id="statusText" class="conn-text">Checking...</span>
-            </div>
-            <span id="detectedCountBadge" class="count-badge" hidden>
-              <span class="pulse-dot" aria-hidden="true"></span>
-              <span id="detectedCountText">0 on page</span>
-            </span>
-            <!-- Browser-side mode indicator. Visible only when
-                 settings.useBrowserSide !== false (the default). Tells
-                 the user that HLS/DASH downloads will fetch segments
-                 in the browser session and stream them to NAS, which
-                 is what enables IP/cookie-bound CDN tokens to work
-                 but also why play-first is required. -->
-            <span id="modeBadge" class="mode-badge" hidden
-                  title="HLS/DASH downloads run in this browser's session and stream to NAS. Required for IP-bound / cookie-bound CDN tokens; disable in extension options for legacy NAS-direct downloads.">
-              <span class="mode-badge-icon" aria-hidden="true">
-                <svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor"
-                     stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="6" cy="6" r="4.5"/>
-                  <path d="M1.5 6h9M6 1.5c1.7 1.6 1.7 7.4 0 9M6 1.5c-1.7 1.6-1.7 7.4 0 9"/>
-                </svg>
-              </span>
-              <span id="modeBadgeText">BROWSER</span>
-            </span>
-          </div>
         </div>
         <div class="header-right">
           <button id="themeToggleBtn" class="icon-btn theme-toggle" type="button" title="Toggle theme">
@@ -80,6 +53,50 @@
         </div>
       </header>
 
+      <details id="destinationDetails" class="destination">
+        <summary id="destinationSummary" class="destination-summary" aria-controls="destinationContent">
+          <span id="profileCompactName" class="destination-compact-name"></span>
+          <span id="profileCompactStatus" class="destination-compact-status" data-state="checking">Checking...</span>
+          <span id="destinationToggleText" class="destination-toggle" aria-hidden="true">Expand</span>
+        </summary>
+        <div id="destinationContent" class="destination-content">
+          <div class="destination-fields-heading">
+            <label id="profileLabel" for="profileSelect">Download destination</label>
+            <button id="manageProfilesBtn" class="text-btn" type="button">Manage profiles</button>
+          </div>
+          <select id="profileSelect" class="profile-select" aria-labelledby="profileLabel" aria-describedby="profileFolder profileFeedback" disabled>
+            <option value="">Loading profiles…</option>
+          </select>
+          <div class="destination-detail">
+            <span id="profileFolder" class="profile-folder"></span>
+            <div class="status-row">
+              <div id="connectionStatus" class="conn-chip checking" title="">
+                <span id="statusIcon" class="conn-dot" aria-hidden="true"></span>
+                <span id="statusText" class="conn-text">Checking...</span>
+              </div>
+              <!-- Browser-side mode indicator. Visible only when
+                   settings.useBrowserSide !== false (the default). Tells
+                   the user that HLS/DASH downloads will fetch segments
+                   in the browser session and stream them to NAS, which
+                   is what enables IP/cookie-bound CDN tokens to work
+                   but also why play-first is required. -->
+              <span id="modeBadge" class="mode-badge" hidden
+                    title="HLS/DASH downloads run in this browser's session and stream to NAS. Required for IP-bound / cookie-bound CDN tokens; disable in extension options for legacy NAS-direct downloads.">
+                <span class="mode-badge-icon" aria-hidden="true">
+                  <svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor"
+                       stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="6" cy="6" r="4.5"/>
+                    <path d="M1.5 6h9M6 1.5c1.7 1.6 1.7 7.4 0 9M6 1.5c-1.7 1.6-1.7 7.4 0 9"/>
+                  </svg>
+                </span>
+                <span id="modeBadgeText">BROWSER</span>
+              </span>
+            </div>
+          </div>
+          <p id="profileFeedback" class="profile-feedback" role="status" aria-live="polite" hidden></p>
+        </div>
+      </details>
+
       <!-- Update reminder. The extension is sideloaded (GitHub Release zip),
            so Chrome never auto-updates it; background.js polls the GitHub
            latest-release API and this banner appears when the installed
@@ -114,6 +131,7 @@
 
       <!-- Toolbar: visible for many-mode or whenever multiple qualities exist. -->
       <div id="toolbar" class="toolbar" hidden>
+        <div id="qualityChips" class="chips" role="group"></div>
         <div class="search">
           <span class="search-icon" aria-hidden="true">
             <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
@@ -123,7 +141,6 @@
           </span>
           <input id="searchInput" class="search-input" type="text" placeholder="filter…" autocomplete="off">
         </div>
-        <div id="qualityChips" class="chips"></div>
       </div>
 
       <!-- Hidden-mode AV-task block: only visible when hiddenMode is on in
@@ -199,6 +216,7 @@
               </svg>
             </button>
           </div>
+          <div id="jobsUpdateNotice" class="jobs-update-notice" role="status" aria-live="polite" hidden></div>
           <div id="recentJobsList" class="jobs">
             <div class="empty-state">
               <p id="jobsEmptyTitle">No recent downloads on NAS</p>

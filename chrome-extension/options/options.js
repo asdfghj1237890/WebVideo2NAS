@@ -46,6 +46,36 @@ function activeProfile() {
   return profiles.find(p => p.id === activeProfileId) || null;
 }
 
+// Side-panel switching must also update an already-open settings page. Keep
+// unsaved connection edits, but move the discard baseline to the current NAS.
+function applyExternalProfileChanges(changes) {
+  const connectionChanged = changes.nasEndpoint || changes.apiKey;
+  const wasDirty = connectionChanged && isDirty();
+  if (changes.nasProfiles) {
+    profiles = Array.isArray(changes.nasProfiles.newValue) ? changes.nasProfiles.newValue.slice() : [];
+  }
+  if (changes.activeProfileId) activeProfileId = changes.activeProfileId.newValue || null;
+  if (connectionChanged) {
+    if (changes.nasEndpoint) savedSnapshot.nasEndpoint = changes.nasEndpoint.newValue || '';
+    if (changes.apiKey) savedSnapshot.apiKey = changes.apiKey.newValue || '';
+    if (!wasDirty) {
+      $('nasEndpoint').value = savedSnapshot.nasEndpoint;
+      $('apiKey').value = savedSnapshot.apiKey;
+    }
+    refreshDirtyIndicator();
+    setText('pingHost', savedSnapshot.nasEndpoint ? shortProfileHost(savedSnapshot.nasEndpoint) : '');
+    setPingState('pingRow', 'idle', t('options.ping.idle'));
+    setPingState('lastPingRow', 'idle', t('options.ping.idle'));
+    setText('lastPingNote', '');
+    refreshOnboardingStatus();
+  }
+  if (changes.nasProfiles || changes.activeProfileId) renderProfilesPane();
+}
+
+function shortProfileHost(endpoint) {
+  try { return new URL(endpoint).host; } catch (_) { return endpoint; }
+}
+
 let i18n = null;
 function t(key, vars) { return i18n ? i18n.t(key, vars) : key; }
 function tHtml(key, vars) { return i18n ? i18n.tHtml(key, vars) : t(key, vars); }
@@ -1100,6 +1130,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     applyOnboardingFlagChange(areaName, changes);
     if (areaName === 'sync') {
+      applyExternalProfileChanges(changes);
       if (changes.uiLanguage) {
         const newVal = changes.uiLanguage.newValue || '';
         const normalized = newVal === 'zh' ? 'zh-TW' : newVal;

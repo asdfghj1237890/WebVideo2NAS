@@ -22,6 +22,7 @@ if (!nasIdentity) {
 }
 
 let settings = {};
+let profileSwitchPending = false;
 let detectedUrls = [];
 let deepHits = [];
 let jobs = [];
@@ -140,7 +141,8 @@ function tHtml(key, vars) {
 // Guarding the paint was never enough — the mutation had to be gated too.
 async function readSettingsFromStorage() {
   return chrome.storage.sync.get([
-    'nasEndpoint', 'apiKey', 'uiLanguage', 'uiTheme', 'jobSort',
+    'nasEndpoint', 'apiKey', 'nasOutputSubdir', 'nasProfiles', 'activeProfileId',
+    'uiLanguage', 'uiTheme', 'jobSort',
     'hiddenMode', 'hiddenModeUrlTemplate',
     'trustedCdnSuffixes',
     // useBrowserSide drives the play-first lock, the bulk-skip
@@ -165,11 +167,152 @@ function applySettingsSnapshot(snapshot) {
     jobSort = 'failed';
   }
   applyHiddenModeVisibility();
+  renderProfileSwitcher();
   return settings;
 }
 
 async function loadSettingsFromStorage() {
   return applySettingsSnapshot(await readSettingsFromStorage());
+}
+
+// connection.toml can be edited without updating a saved profile. Do not
+// label custom credentials or a different output folder as that saved NAS.
+function profileMatchesSettings(profile, snapshot) {
+  return profile && profile.id === snapshot.activeProfileId
+    && (profile.endpoint || '') === (snapshot.nasEndpoint || '')
+    && (profile.apiKey || '') === (snapshot.apiKey || '')
+    && (profile.subdir || '') === (snapshot.nasOutputSubdir || '');
+}
+
+function renderProfileSwitcher() {
+  const select = document.getElementById('profileSelect');
+  if (!select) return;
+  const profiles = Array.isArray(settings.nasProfiles)
+    ? settings.nasProfiles.filter(p => p && typeof p.id === 'string' && p.id) : [];
+  const active = profiles.find(p => profileMatchesSettings(p, settings));
+  const options = profiles.map(p => {
+    const option = document.createElement('option');
+    option.value = p.id;
+    option.textContent = p.name || shortHost(p.endpoint || '') || p.id;
+    return option;
+  });
+  if (!active) {
+    const current = document.createElement('option');
+    current.value = '';
+    current.textContent = t(settings.nasEndpoint ? 'profile.custom' : 'profile.empty');
+    current.disabled = true;
+    options.unshift(current);
+  }
+  select.replaceChildren(...options);
+  select.value = active ? active.id : '';
+  select.disabled = profileSwitchPending || profiles.length === 0;
+  select.setAttribute('aria-busy', String(profileSwitchPending));
+  select.title = select.selectedOptions[0]?.textContent || '';
+  const label = document.getElementById('profileLabel');
+  if (label) label.textContent = t('profile.label');
+  const manage = document.getElementById('manageProfilesBtn');
+  if (manage) manage.textContent = t(profiles.length ? 'profile.manage' : 'profile.add');
+  const folder = document.getElementById('profileFolder');
+  if (folder) {
+    folder.textContent = settings.nasEndpoint
+      ? t('profile.folder', { path: '/downloads' + (settings.nasOutputSubdir ? '/' + settings.nasOutputSubdir : '') })
+      : t('profile.setupHint');
+    folder.title = folder.textContent;
+  }
+  renderDestinationSummary();
+}
+
+function renderDestinationSummary() {
+  const details = document.getElementById('destinationDetails');
+  const summary = document.getElementById('destinationSummary');
+  if (details && summary) summary.title = t(details.open ? 'profile.collapse' : 'profile.expand');
+  const toggleText = document.getElementById('destinationToggleText');
+  if (details && toggleText) toggleText.textContent = t(details.open ? 'profile.collapseShort' : 'profile.expandShort');
+  const name = document.getElementById('profileCompactName');
+  const select = document.getElementById('profileSelect');
+  if (name && select) {
+    name.textContent = select.selectedOptions[0]?.textContent || '';
+    name.title = name.textContent;
+  }
+  const compactStatus = document.getElementById('profileCompactStatus');
+  const connection = document.getElementById('connectionStatus');
+  if (compactStatus && connection) {
+    const state = ['connected', 'disconnected', 'checking'].find(s => connection.classList.contains(s)) || 'checking';
+    compactStatus.dataset.state = state;
+    compactStatus.textContent = t(`status.${state}`);
+    compactStatus.title = connection.title || '';
+  }
+}
+
+// This preference belongs to the local panel layout, not to a NAS profile.
+function initDestinationDisclosure() {
+  const details = document.getElementById('destinationDetails');
+  if (!details) return Promise.resolve();
+  const key = 'destinationCollapsed';
+  let collapsed = !details.open;
+  let userChanged = false;
+  let saveQueue = Promise.resolve();
+  const initiallyOpen = details.open;
+  details.addEventListener('toggle', () => {
+    renderDestinationSummary();
+    if (collapsed === !details.open) return;
+    collapsed = !details.open;
+    userChanged = true;
+    const value = collapsed;
+    // Serialize rapid toggles so an older write cannot win on reopening.
+    saveQueue = saveQueue.then(() => chrome.storage.local.set({ [key]: value }))
+      .catch(() => { /* The current panel still works when storage is unavailable. */ });
+  });
+  return chrome.storage.local.get(key).then(stored => {
+    // A slow startup read must not undo a click that already changed the UI.
+    if (userChanged || details.open !== initiallyOpen) return;
+    collapsed = stored[key] !== false;
+    details.open = !collapsed;
+    renderDestinationSummary();
+  }).catch(() => { /* Default to the current expanded/collapsed state. */ });
+}
+
+function setProfileFeedback(message, isError = false) {
+  const feedback = document.getElementById('profileFeedback');
+  if (!feedback) return;
+  feedback.textContent = message;
+  feedback.hidden = !message;
+  feedback.classList.toggle('error', isError);
+}
+
+async function switchProfile(profileId) {
+  if (profileSwitchPending || !profileId) return false;
+  profileSwitchPending = true;
+  // Keep showing the actual destination until storage confirms the change.
+  renderProfileSwitcher();
+  setProfileFeedback(t('profile.switching'));
+  try {
+    // Another options page may have edited or removed this profile since
+    // the dropdown was populated. Resolve its current data before writing.
+    const snapshot = await readSettingsFromStorage();
+    const profile = Array.isArray(snapshot.nasProfiles)
+      ? snapshot.nasProfiles.find(p => p && p.id === profileId) : null;
+    if (!profile) throw new Error('profile unavailable');
+    if (!profileMatchesSettings(profile, snapshot)) {
+      // Same atomic mirror contract as the options page, consumed by the SW.
+      await chrome.storage.sync.set({
+        nasEndpoint: profile.endpoint || '',
+        apiKey: profile.apiKey || '',
+        nasOutputSubdir: profile.subdir || '',
+        activeProfileId: profile.id,
+      });
+    }
+    setProfileFeedback(t('profile.switched', { name: profile.name || shortHost(profile.endpoint || '') }));
+    return true;
+  } catch (_) {
+    setProfileFeedback(t('profile.failed'), true);
+    return false;
+  } finally {
+    profileSwitchPending = false;
+    renderProfileSwitcher();
+    // Reconcile deleted profiles and failed writes through the guarded read.
+    checkConnection().catch(() => {});
+  }
 }
 
 
@@ -291,6 +434,7 @@ function applyUiLanguage() {
 }
 
 function localizeStaticText() {
+  renderProfileSwitcher();
   const refreshBtn = document.getElementById('refreshBtn');
   if (refreshBtn) refreshBtn.setAttribute('title', t('btn.refresh.title'));
   const settingsBtn = document.getElementById('settingsBtn');
@@ -520,6 +664,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // the strip hidden with no dismiss or settings handler attached — and
   // onboardingDone defaults to true, so nothing later could reveal it either.
   setupEventListeners();
+  initDestinationDisclosure();
   initUpdateBanner();
   initOnboardingCoach();
 
@@ -581,15 +726,18 @@ function handleBrowserJobProgress(message) {
   itemEl.dataset.status = job.status;
   itemEl.dataset.progress = String(job.progress);
   const needsTransferRender = !!browserTransferMeta(job)
-    && !itemEl.querySelector('[data-browser-transfer]');
+    !== !!itemEl.querySelector('[data-browser-transfer]');
   if (shouldFullRender(oldStatus, job.status) || needsTransferRender) {
     itemEl.innerHTML = getJobInnerHtml(job);
     bindJobEvents(itemEl, job);
   } else {
     updateJobElement(itemEl, job);
   }
-  if (isActiveStatus(job.status)) startTween(itemEl, idStr, job.progress);
-  else stopTween(idStr);
+  if (isActiveStatus(job.status) && !jobProgressIsStale(job)) startTween(itemEl, key, job.progress);
+  else {
+    stopTween(key);
+    if (isActiveStatus(job.status)) applyRing(itemEl, key, job.progress);
+  }
 }
 
 function normalizeBrowserTransferTimings(value) {
@@ -799,12 +947,20 @@ function browserTransferMeta(job) {
   });
   const cdnLabel = t('job.transfer.stage.cdn');
   const nasLabel = t('job.transfer.stage.nas');
+  const stages = [['cdn', cdnLabel], ['nas', nasLabel]].map(([key, label]) => ({
+    label,
+    // No timing sample is unknown, rather than a measured zero rate.
+    rate: timings[key].activeMs > 0 ? `${compactTransferRate(timings[key].mbPerSecond)} MB/s` : '—',
+    elapsed: `${toSeconds(timings[key].activeMs)}s`,
+  }));
   return {
+    stages,
     // Keep the two wall clocks visible instead of hiding them in the hover /
     // expanded diagnostics. `activeMs` measures elapsed wall time with at
     // least one request in that stage, so parallel requests are not summed.
     label: `${cdnLabel} ${compactTransferRate(timings.cdn.mbPerSecond)} MB/s · ${toSeconds(timings.cdn.activeMs)}s | ${nasLabel} ${compactTransferRate(timings.nas.mbPerSecond)} MB/s · ${toSeconds(timings.nas.activeMs)}s`,
     title: [
+      t('job.transfer.averageHint'),
       stageTitle('cdn', timings.cdn),
       stageTitle('nas', timings.nas),
       concurrency > 0 ? t('job.transfer.concurrency', { concurrency }) : null,
@@ -813,8 +969,20 @@ function browserTransferMeta(job) {
   };
 }
 
+function transferSummaryHtml(transfer) {
+  return `<span class="job-transfer-heading">${escapeHtml(t('job.transfer.average'))}</span>`
+    + transfer.stages.map(stage => `<span class="job-transfer-stage">
+      <span>${escapeHtml(stage.label)}</span>
+      <span class="job-transfer-reading"><strong>${escapeHtml(stage.rate)}</strong><span>${escapeHtml(stage.elapsed)}</span></span>
+    </span>`).join('');
+}
+
 function setupEventListeners() {
   document.getElementById('settingsBtn').addEventListener('click', openSettings);
+  document.getElementById('manageProfilesBtn')?.addEventListener('click', openSettings);
+  document.getElementById('profileSelect')?.addEventListener('change', (event) => {
+    switchProfile(event.target.value);
+  });
   document.getElementById('refreshBtn').addEventListener('click', () => {
     checkConnection();
     loadDetectedUrls();
@@ -919,7 +1087,17 @@ function setupEventListeners() {
     if (areaName === 'sync') {
       const needsUiUpdate = !!changes.uiLanguage;
       const needsConnUpdate = !!changes.nasEndpoint || !!changes.apiKey;
+      const needsProfileUpdate = needsConnUpdate || !!changes.nasProfiles
+        || !!changes.activeProfileId || !!changes.nasOutputSubdir;
       const needsThemeUpdate = !!changes.uiTheme;
+
+      if (needsProfileUpdate) {
+        if (!profileSwitchPending) setProfileFeedback('');
+        for (const key of ['nasEndpoint', 'apiKey', 'nasOutputSubdir', 'nasProfiles', 'activeProfileId']) {
+          if (changes[key]) settings[key] = changes[key].newValue;
+        }
+        renderProfileSwitcher();
+      }
 
       if (needsUiUpdate) {
         settings.uiLanguage = changes.uiLanguage.newValue || '';
@@ -950,7 +1128,7 @@ function setupEventListeners() {
         if (changes.apiKey) settings.apiKey = changes.apiKey.newValue || '';
       }
 
-      if (needsUiUpdate || needsConnUpdate) {
+      if (needsUiUpdate || needsProfileUpdate) {
         checkConnection();
         loadRecentJobs();
       }
@@ -1051,6 +1229,14 @@ async function fetchJsonWithTimeout(url, options, timeoutMs) {
 }
 
 function setConnectionState(state, label, tooltip) {
+  // A successful health check does not make a failing jobs API current.
+  // Only a successful jobs response clears this error.
+  if (state === 'connected' && recentJobsState.error
+      && recentJobsState.targetId === currentNasTarget()?.id) {
+    state = 'disconnected';
+    label = t('jobs.connectionFailed');
+    tooltip = recentJobsState.error;
+  }
   const el = document.getElementById('connectionStatus');
   const txt = document.getElementById('statusText');
   if (!el || !txt) return;
@@ -1058,6 +1244,7 @@ function setConnectionState(state, label, tooltip) {
   el.classList.add(state);
   el.title = tooltip || '';
   txt.textContent = label;
+  renderDestinationSummary();
   refreshOnboardingCoach();
 }
 
@@ -1351,6 +1538,8 @@ function renderDetectedUrls(opts) {
   const listElement = document.getElementById('detectedUrlsList');
   if (!listElement) return;
   refreshOnboardingCoach();
+  // Reconcile a disappeared resolution before painting its selected chip.
+  normalizeQualityFilter();
 
   const total = detectedUrls.length;
   const isMany = total > MANY_THRESHOLD;
@@ -1450,6 +1639,8 @@ function renderDetectedUrls(opts) {
   const isNew = (url) => firstRenderDone && opts.keepPulse !== false && !prevDetectedIds.has(url);
 
   // Build tile HTML
+  const focusedTileUrl = document.activeElement?.classList?.contains('tile')
+    ? document.activeElement.dataset.url : null;
   const html = visible.map((urlInfo, index) => {
     const url = urlInfo.url;
     const hasIp = containsIpAddress(url);
@@ -1510,6 +1701,7 @@ function renderDetectedUrls(opts) {
     );
     return `
       <div class="tile${newClass}${selClass}${sentClass}${interactClass}${playFirstClass}"
+           ${isMany ? `tabindex="0" role="checkbox" aria-checked="${isSel}" aria-label="${escapeHtml(title)}"` : ''}
            data-url="${escapeHtml(url)}"
            data-page="${escapeHtml(urlInfo.pageUrl || '')}"
            style="--idx:${index}">
@@ -1606,12 +1798,20 @@ function renderDetectedUrls(opts) {
   // Tile interactions
   listElement.querySelectorAll('.tile').forEach(tile => {
     if (isMany) {
+      tile.addEventListener('keydown', (e) => {
+        if (e.target !== tile || (e.key !== ' ' && e.key !== 'Enter')) return;
+        e.preventDefault();
+        toggleSelect(tile.dataset.url, tile);
+      });
       tile.addEventListener('click', (e) => {
         // Allow clicks on internal buttons to pass through (we have none in many-mode)
         if (e.target.closest('button')) return;
         const url = tile.dataset.url;
         toggleSelect(url, tile);
       });
+      // The detection poll replaces tiles every five seconds. Keep keyboard
+      // focus on the same video so a refresh does not interrupt selection.
+      if (tile.dataset.url === focusedTileUrl) tile.focus({ preventScroll: true });
     }
   });
 
@@ -1657,6 +1857,8 @@ function renderDetectedUrls(opts) {
 function renderQualityChips() {
   const el = document.getElementById('qualityChips');
   if (!el) return;
+  el.setAttribute('aria-label', t('toolbar.quality'));
+  const focusedQuality = document.activeElement?.closest?.('#qualityChips .chip')?.dataset.q;
 
   const qualities = uniqueQualityLabels(detectedUrls);
   const all = ['all', ...qualities];
@@ -1667,7 +1869,7 @@ function renderQualityChips() {
     const active = qualityFilter === q ? ' active' : '';
     const label = q === 'all' ? t('chip.all') : q;
     const countMarkup = q === 'all' ? '' : `<span class="chip-count">${count}</span>`;
-    return `<button class="chip${active}" data-q="${escapeHtml(q)}" type="button">${escapeHtml(label)}${countMarkup}</button>`;
+    return `<button class="chip${active}" data-q="${escapeHtml(q)}" type="button" aria-pressed="${qualityFilter === q}">${escapeHtml(label)}${countMarkup}</button>`;
   }).join('');
 
   el.querySelectorAll('.chip').forEach(c => {
@@ -1675,6 +1877,7 @@ function renderQualityChips() {
       qualityFilter = c.dataset.q;
       renderDetectedUrls({ keepPulse: false });
     });
+    if (c.dataset.q === focusedQuality) c.focus({ preventScroll: true });
   });
 }
 
@@ -1686,6 +1889,7 @@ function toggleSelect(url, tileEl) {
     selected.add(url);
     if (tileEl) tileEl.classList.add('selected');
   }
+  if (tileEl) tileEl.setAttribute('aria-checked', String(selected.has(url)));
   updateBulkBar();
 }
 
@@ -1962,6 +2166,28 @@ async function sendToNAS(url, pageUrl) {
 // loadRecentJobs directly: those genuinely mean "replace what is in flight",
 // which is what opening a new generation is for.
 let recentJobsInFlight = null;
+let recentJobsState = { targetId: null, lastSuccessAt: null, error: null };
+
+function jobProgressIsStale(job) {
+  return !!recentJobsState.error && jobTargetOf(job)?.id === recentJobsState.targetId;
+}
+
+function renderJobsUpdateNotice() {
+  const failed = !!recentJobsState.error
+    && recentJobsState.targetId === currentNasTarget()?.id;
+  const notice = document.getElementById('jobsUpdateNotice');
+  if (notice) {
+    notice.hidden = !failed;
+    if (failed) {
+      const time = recentJobsState.lastSuccessAt == null ? ''
+        : new Date(recentJobsState.lastSuccessAt).toLocaleTimeString();
+      notice.textContent = t(time ? 'jobs.stale' : 'jobs.unavailable', { time });
+      notice.title = recentJobsState.error;
+    }
+  }
+  const list = document.getElementById('recentJobsList');
+  if (list) list.classList.toggle('jobs-stale', failed);
+}
 
 // The NAS that served the most recent jobs list. Only a fallback for a row
 // that somehow carries no target of its own.
@@ -2021,19 +2247,34 @@ async function loadRecentJobs() {
   const target = currentNasTarget();
   const isCurrent = requestGuard.begin('jobs', target);
   await mergePersistedBrowserTransferSnapshots();
-  if (!target) return;
+  if (!target) {
+    // A configuration removed during this await must not clear a newer NAS.
+    if (currentNasTarget()) return;
+    recentJobsState = { targetId: null, lastSuccessAt: null, error: null };
+    jobs = [];
+    jobsTarget = null;
+    renderJobs();
+    return;
+  }
   if (!isCurrent(currentNasTarget())) return;
+  if (recentJobsState.targetId !== target.id) {
+    recentJobsState = { targetId: target.id, lastSuccessAt: null, error: null };
+    renderJobsUpdateNotice();
+  }
 
   try {
     const { response, data: apiJobs } = await fetchJsonWithTimeout(
-      `${target.endpoint}/api/jobs?limit=20`,
+      `${target.endpoint}/api/jobs?limit=20&include_active=true`,
       { headers: { 'Authorization': `Bearer ${target.apiKey}` } },
       NAS_JOBS_TIMEOUT_MS,
     );
 
-    if (response.ok) {
-      // Newest poll only, and only while it still describes the current NAS.
-      if (!isCurrent(currentNasTarget())) return;
+    if (!response.ok) throw new Error(connectionReasonFromResponse(response));
+    if (!Array.isArray(apiJobs) || apiJobs.some(job => !job || job.id == null || typeof job.status !== 'string')) {
+      throw new Error(t('jobs.invalidResponse'));
+    }
+    // Newest poll only, and only while it still describes the current NAS.
+    if (isCurrent(currentNasTarget())) {
       jobsTarget = target;
       // A transfer may advance while the API request is in flight. Merge the
       // SW-persisted snapshot again so this poll cannot paint an older value.
@@ -2081,13 +2322,14 @@ async function loadRecentJobs() {
         mergedJobs.push(withJobTarget(job, target));
       }
 
-      // The API row can briefly be absent while create/finalize commits, or
-      // because limit=20 races a busy queue. Preserve an already-rendered
-      // active browser row until the live snapshot expires instead of
-      // pruning it on one poll.
+      // Older servers may still truncate active rows. Retain their live
+      // overlays briefly, but trust a complete active snapshot: an absent
+      // row on this NAS is no longer unfinished (possibly outside history).
+      const completeActiveSnapshot = response.headers?.get('X-WV2N-Active-Jobs') === 'complete';
       for (const previousJob of previousJobs) {
         const previousKey = jobKeyFor(previousJob) || String(previousJob.id);
         if (apiKeys.has(previousKey)) continue;
+        if (completeActiveSnapshot && jobTargetOf(previousJob)?.scope === target.scope) continue;
         // A retained row belongs to whichever NAS served it, which after a
         // profile switch is not the one this poll asked.
         const live = liveBrowserProgress.get(jobKeyFor(previousJob));
@@ -2112,10 +2354,20 @@ async function loadRecentJobs() {
         }
       }
       jobs = mergedJobs;
+      recentJobsState = { targetId: target.id, lastSuccessAt: Date.now(), error: null };
       renderJobs();
+      // This authenticated response is newer connectivity evidence than an
+      // outstanding health check (including its pending settings read).
+      requestGuard.open('connection');
+      setConnectionState('connected', shortHost(target.endpoint), `${target.endpoint}\n/api/jobs: OK`);
     }
   } catch (error) {
     console.error('Failed to load jobs:', error);
+    if (!isCurrent(currentNasTarget())) return;
+    recentJobsState.error = connectionReasonFromError(error) || t('jobs.connectionFailed');
+    renderJobs();
+    requestGuard.open('connection');
+    setConnectionState('disconnected', t('jobs.connectionFailed'), recentJobsState.error);
   }
 }
 
@@ -2123,6 +2375,7 @@ function renderJobs() {
   const listElement = document.getElementById('recentJobsList');
   if (!listElement) return;
   refreshOnboardingCoach();
+  renderJobsUpdateNotice();
 
   // Apply sort mode (time keeps NAS order; active/failed groups by status rank).
   const sortedJobs = sortJobs(jobs, jobSort);
@@ -2134,13 +2387,13 @@ function renderJobs() {
     if (!listElement.querySelector('.empty-state')) {
       listElement.innerHTML = `
         <div class="empty-state">
-          <p>${escapeHtml(t('empty.noJobs.short'))}</p>
+          <p>${escapeHtml(t(recentJobsState.error ? 'jobs.unavailable.short' : 'empty.noJobs.short'))}</p>
         </div>
       `;
     } else {
       // Update existing empty-state translation (in case language changed)
       const p = listElement.querySelector('.empty-state p');
-      if (p) p.textContent = t('empty.noJobs.short');
+      if (p) p.textContent = t(recentJobsState.error ? 'jobs.unavailable.short' : 'empty.noJobs.short');
     }
     // Stop tweens on missing jobs
     for (const id of Array.from(jobTweens.keys())) {
@@ -2174,15 +2427,19 @@ function renderJobs() {
       bindJobEvents(itemEl, job);
       // Initialize tween state to current progress (no animation on first paint)
       if (isActiveStatus(job.status)) {
-        jobTweens.set(jobId, { shown: Number(job.progress) || 0, raf: 0 });
-        applyRing(itemEl, jobId, Number(job.progress) || 0);
+        // A sort/language change can replace the node while its RAF is live.
+        stopTween(jobKey);
+        jobTweens.set(jobKey, { shown: Number(job.progress) || 0, raf: 0 });
+        applyRing(itemEl, jobKey, Number(job.progress) || 0);
       }
     } else {
       const oldStatus = itemEl.dataset.status;
       itemEl.dataset.status = job.status;
       itemEl.dataset.progress = job.progress;
 
-      if (shouldFullRender(oldStatus, job.status)) {
+      const needsTransferRender = !!browserTransferMeta(job)
+        !== !!itemEl.querySelector('[data-browser-transfer]');
+      if (shouldFullRender(oldStatus, job.status) || needsTransferRender) {
         itemEl.innerHTML = getJobInnerHtml(job);
         bindJobEvents(itemEl, job);
       } else {
@@ -2197,10 +2454,11 @@ function renderJobs() {
       }
 
       // Smoothly tween the ring/bar to the new value
-      if (isActiveStatus(job.status)) {
+      if (isActiveStatus(job.status) && !jobProgressIsStale(job)) {
         startTween(itemEl, jobKey, Number(job.progress) || 0);
       } else {
         stopTween(jobKey);
+        if (isActiveStatus(job.status)) applyRing(itemEl, jobKey, Number(job.progress) || 0);
       }
     }
   });
@@ -2298,7 +2556,7 @@ function getJobInnerHtml(job) {
         ${job.size ? `<span class="meta-sep"> · </span><span>${escapeHtml(String(job.size))}</span>` : ''}
         ${job.when ? `<span class="meta-sep"> · </span><span>${escapeHtml(String(job.when))}</span>` : ''}
       </div>
-      ${browserTransfer ? `<details class="job-transfer" data-browser-transfer><summary data-transfer-label title="${escapeHtml(browserTransfer.title)}" aria-label="${escapeHtml(browserTransfer.title)}">${escapeHtml(browserTransfer.label)}</summary><div class="job-transfer-detail" data-transfer-detail>${escapeHtml(browserTransfer.title)}</div></details>` : ''}
+      ${browserTransfer ? `<details class="job-transfer" data-browser-transfer><summary data-transfer-label title="${escapeHtml(browserTransfer.title)}">${transferSummaryHtml(browserTransfer)}</summary><div class="job-transfer-detail" data-transfer-detail>${escapeHtml(browserTransfer.title)}</div></details>` : ''}
       ${showProgress ? `
         <div class="job-bar" data-job-bar>
           <div class="job-bar-fill" data-bar-fill style="width:${Number(job.progress)||0}%; background:${ringStrokeForStatus(job.status)}"></div>
@@ -2425,9 +2683,9 @@ function updateJobElement(el, job) {
     const transferLabel = transferEl.querySelector('[data-transfer-label]');
     const transferDetail = transferEl.querySelector('[data-transfer-detail]');
     if (transferLabel) {
-      transferLabel.textContent = transfer.label;
+      const html = transferSummaryHtml(transfer);
+      if (transferLabel.innerHTML !== html) transferLabel.innerHTML = html;
       transferLabel.title = transfer.title;
-      transferLabel.setAttribute('aria-label', transfer.title);
     }
     if (transferDetail) transferDetail.textContent = transfer.title;
   }
@@ -2450,6 +2708,7 @@ function updateJobElement(el, job) {
 function startTween(el, jobId, target) {
   const state = jobTweens.get(jobId) || { shown: target, raf: 0 };
   if (state.raf) cancelAnimationFrame(state.raf);
+  state.raf = 0;
   const from = state.shown;
   const to = target;
   if (from === to) {
