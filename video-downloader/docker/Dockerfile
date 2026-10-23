@@ -25,7 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # source-only edits. --require-hashes blocks supply-chain swaps even if a
 # version is republished on PyPI; regenerate via tests/recompile_requirements.sh.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --require-hashes -r requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade pip==26.2.2 \
+    && python -m pip install --no-cache-dir --require-hashes -r requirements.txt
 
 # Application source. Each role lives in its own subdir so the existing test
 # layout (api/tests, worker/tests) keeps working unchanged.
